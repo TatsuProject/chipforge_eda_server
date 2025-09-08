@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+    
+  verilator-api:
+    build:
+      context: ./verilator-api  
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./shared:/shared
+      - /tmp:/tmp                          # already here
+      - /home/hassan/Documents/EDA_server/results:/app/results   # <-- add this
+    environment:
+      - SERVICE_NAME=verilator-simulation
+
+  eda-gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      - verilator-api  
+    volumes:
+      - /home/hassan/Documents/EDA_server/results:/app/results
+      - ./shared:/shared
+      - /tmp:/tmp         # <-- match with verilator-api
+    env_file:
+      - .env
+    environment:
+      - VERILATOR_URL=http://verilator-api:8001
+      # EDA_API_KEY comes from .env
+

@@ -1,0 +1,68 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables & secrets
+*.env
+.env.*
+.envrc
+
+# Results, test artifacts, and shared data
+results/
+shared/
+test_designs/
+unzipped/
+
+# Logs
+*.log
+*.out
+*.err
+
+# Distribution / packaging
+build/
+dist/
+downloads/
+.eggs/
+*.egg-info/
+*.egg
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+*.hypothesis/
+.pytest_cache/
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Docker & Compose
+*.pid
+*.pid.lock
+*.pidfile
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Build tracking files
+.last_build_*

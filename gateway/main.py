@@ -61,32 +61,26 @@ class VerilogEvaluationResponse(BaseModel):
 # -------------------------------
 # Evaluate endpoint
 # -------------------------------
+
 @app.post("/evaluate", response_model=VerilogEvaluationResponse)
 async def evaluate_verilog_design(
     design_zip: UploadFile = File(..., description="Zip containing miner sources + verilator.f"),
+    top_module: str = Form(..., description="Top module name (testbench top)"),
+    evaluator_py: UploadFile = File(..., description="Evaluator script (Evaluator.py)"),
+    evaluator_zip: UploadFile = File(..., description="Evaluator data (Evaluator.zip)"),
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Evaluate design using local evaluator files.
+    Forward design + evaluator to Verilator API.
+    For now: Only functionality score comes from Verilator/Evaluator.
     """
     results: Dict[str, Any] = {}
     try:
-        # Load evaluator files from server's local directory
-        evaluator_py_path = "/app/evaluator/evaluator.py"
-        evaluator_zip_path = "/app/evaluator/evaluator.zip"
-        top_module_path = "/app/evaluator/evaluator.txt"
-        
-        # Read top module name from file
-        with open(top_module_path, 'r') as f:
-            top_module = f.read().strip()
-
-        # top_module="tb_top"
-        
         async with httpx.AsyncClient(timeout=900.0) as client:
             files = {
                 "design_zip": (design_zip.filename, await design_zip.read(), "application/zip"),
-                "evaluator_py": ("miniRISC_evaluator.py", open(evaluator_py_path, 'rb').read(), "application/x-python"),
-                "evaluator_zip": ("miniRISC_evaluator.zip", open(evaluator_zip_path, 'rb').read(), "application/zip"),
+                "evaluator_py": (evaluator_py.filename, await evaluator_py.read(), "application/x-python"),
+                "evaluator_zip": (evaluator_zip.filename, await evaluator_zip.read(), "application/zip"),
             }
             data = {"top_module": top_module}
 
@@ -173,7 +167,6 @@ async def evaluate_verilog_design(
             results_zip_path=None,
             error_message=f"Evaluation failed: {str(e)}"
         )
-
 
 # -------------------------------
 # Health

@@ -1,19 +1,52 @@
 version: '3.8'
 
 services:
-    
   verilator-api:
     build:
-      context: ./verilator-api  
+      context: ./verilator-api
       dockerfile: Dockerfile
     ports:
       - "8001:8001"
     volumes:
       - ./shared:/shared
-      - /tmp:/tmp                          # already here
-      - /home/hassan/Documents/EDA_server/results:/app/results   # <-- add this
+      - /tmp:/tmp
+      - ./results:/app/results                # unified results path
     environment:
       - SERVICE_NAME=verilator-simulation
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  openlane-api:
+    build:
+      context: ./openlane-api
+      dockerfile: Dockerfile
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./shared:/shared
+      - ./results:/app/results                # unified results path
+      # Optional for local debug (not required if using POST /run_openlane):
+      # - ./test_designs/rv32i:/openlane/designs/rv32i
+    environment:
+      - SERVICE_NAME=openlane-implementation
+      - PDK_ROOT=/openlane/pdks
+      - PDK=sky130A
+      - STD_CELL_LIBRARY=sky130_fd_sc_hd
+      - PDKPATH=/openlane/pdks/sky130A
+    # Remove these unless you truly run docker-in-docker:
+    # privileged: true
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   eda-gateway:
     build:
@@ -22,14 +55,22 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - verilator-api  
+      - verilator-api
+      - openlane-api
     volumes:
-      - /home/hassan/Documents/EDA_server/results:/app/results
+      - ./results:/app/results                # unified results path
       - ./shared:/shared
-      - /tmp:/tmp         # <-- match with verilator-api
-    env_file:
-      - .env
+      - /tmp:/tmp
     environment:
       - VERILATOR_URL=http://verilator-api:8001
+      - OPENLANE_URL=http://openlane-api:8003
       # EDA_API_KEY comes from .env
 
+# Named volumes not needed if you standardize on ./results (remove clutter)
+# volumes:
+#   openlane_designs:
+#     driver: local
+#   openlane_runs:
+#     driver: local
+#   openlane_results:
+#     driver: local

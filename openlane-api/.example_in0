@@ -1,0 +1,9 @@
+{
+  "verilog_code": "module my_and(input clk, input a, input b, output reg y); always @(posedge clk) y <= a & b; endmodule",
+  "top_module": "my_and",
+  "target_utilization": 0.5,
+  "target_frequency_mhz": 100.0,
+  "pdk": "sky130A",
+  "implementation_options": {}
+}
+

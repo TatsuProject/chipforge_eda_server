@@ -1,23 +1,15 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
-import tempfile
-import subprocess
 from pathlib import Path
-import zipfile
-import json
-import shutil
+import tempfile, subprocess, zipfile, shutil, json
 
-app = FastAPI(title="Verilator API (Evaluator-driven)", version="3.4.0")
+app = FastAPI(title="ChipForge Verilator API", version="4.0.0")
 
-# Permanent place for results
 RESULTS_DIR = Path("/app/results")
-RESULTS_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# -------------------------------
-# Response Model
-# -------------------------------
 class EvalResponse(BaseModel):
     success: bool
     results: Optional[Dict[str, Any]] = None
@@ -26,89 +18,101 @@ class EvalResponse(BaseModel):
     results_zip_path: Optional[str] = None
 
 
-# -------------------------------
-# Simulate + Evaluate
-# -------------------------------
+def _write_upload_to(path: Path, data: bytes):
+    path.write_bytes(data)
+
+
+def _unzip(zippath: Path, dest: Path):
+    with zipfile.ZipFile(zippath, "r") as zf:
+        zf.extractall(dest)
+
+
+def _find_run_py(root: Path) -> Optional[Path]:
+    # accept run.py anywhere inside the bundle (root or subdir like verilator/run.py)
+    for p in root.rglob("run.py"):
+        if p.is_file():
+            return p
+    return None
+
+
 @app.post("/simulate_and_evaluate", response_model=EvalResponse)
 async def simulate_and_evaluate(
-    design_zip: UploadFile = File(..., description="Miner design (zip with verilator.f + tb + rtl)"),
-    top_module: str = Form(..., description="Top module name (testbench top)"),
-    evaluator_py: UploadFile = File(..., description="Evaluator script (Evaluator.py)"),
-    evaluator_zip: Optional[UploadFile] = File(None, description="Evaluator resources (Makefiles, tests/, scripts/)")
+    design_zip: UploadFile = File(..., description="Miner design (zip with rtl.f + rtl/...)"),
+    verilator_bundle: UploadFile = File(..., description="Evaluator's Verilator bundle (run.py, tb_files.f, Makefile, Regression.mk, tests/, scripts/, top_module.txt)")
 ):
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workdir = Path(tmpdir)
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
 
-            # --- Save design.zip ---
-            design_zip_path = workdir / "design.zip"
-            with open(design_zip_path, "wb") as f:
-                f.write(await design_zip.read())
-            with zipfile.ZipFile(design_zip_path, "r") as zf:
-                zf.extractall(workdir / "design")
+            # ---- stash uploads once (avoid double .read()) ----
+            design_bytes = await design_zip.read()
+            bundle_bytes = await verilator_bundle.read()
 
-            # --- Save Evaluator.py ---
-            evaluator_path = workdir / "Evaluator.py"
-            with open(evaluator_path, "wb") as f:
-                f.write(await evaluator_py.read())
+            # ---- prepare dirs ----
+            design_dir = tmp / "design"
+            bundle_dir = tmp / "bundle"
+            design_dir.mkdir(parents=True, exist_ok=True)
+            bundle_dir.mkdir(parents=True, exist_ok=True)
 
-            # --- Save evaluator.zip if provided ---
-            resources_dir = None
-            if evaluator_zip:
-                evaluator_zip_path = workdir / "evaluator.zip"
-                with open(evaluator_zip_path, "wb") as f:
-                    f.write(await evaluator_zip.read())
-                resources_dir = workdir / "evaluator_resources"
-                with zipfile.ZipFile(evaluator_zip_path, "r") as zf:
-                    zf.extractall(resources_dir)
+            # ---- unpack inputs ----
+            dz = tmp / "design.zip"
+            bz = tmp / "verilator_bundle.zip"
+            _write_upload_to(dz, design_bytes)
+            _write_upload_to(bz, bundle_bytes)
+            _unzip(dz, design_dir)
+            _unzip(bz, bundle_dir)
 
-            # --- Run Evaluator.py ---
+            # ---- locate run.py inside bundle ----
+            run_py = _find_run_py(bundle_dir)
+            if not run_py:
+                return EvalResponse(
+                    success=False,
+                    error_message="verilator_bundle is missing run.py (looked recursively)."
+                )
+
+            # ---- invoke run.py ----
+            # run.py is responsible for copying/merging resources into design_dir,
+            # creating verilator.f, running make/Regression, and emitting JSON on stdout.
             cmd = [
-                "python3", str(evaluator_path),
-                "--design", str(workdir / "design"),
-                "--top", top_module,
+                "python3", str(run_py),
+                "--design", str(design_dir),
+                "--resources", str(bundle_dir)
             ]
-            if resources_dir:
-                cmd += ["--resources", str(resources_dir)]
+            proc = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, timeout=3600)
 
-            result = subprocess.run(
-                cmd,
-                cwd=workdir,
-                capture_output=True,
-                text=True,
-                timeout=900
-            )
-
-            if result.returncode != 0:
+            if proc.returncode != 0:
                 return EvalResponse(
                     success=False,
-                    error_message="Evaluator.py failed",
-                    evaluator_log=result.stdout + "\n" + result.stderr,
+                    error_message="run.py failed",
+                    evaluator_log=(proc.stdout or "") + "\n" + (proc.stderr or "")
                 )
 
-            # --- Parse JSON output ---
+            # ---- parse run.py stdout as JSON ----
             try:
-                eval_json = json.loads(result.stdout)
-            except Exception:
+                payload = json.loads((proc.stdout or "").strip())
+            except Exception as e:
                 return EvalResponse(
                     success=False,
-                    error_message="Evaluator.py did not return valid JSON",
-                    evaluator_log=result.stdout + "\n" + result.stderr,
+                    error_message=f"run.py did not return valid JSON: {e}",
+                    evaluator_log=(proc.stdout or "") + "\n" + (proc.stderr or "")
                 )
 
-            # --- If results.zip exists → copy to /app/results ---
+            # ---- copy results.zip if run.py created it ----
             results_zip_path = None
-            if "details" in eval_json and "results_zip" in eval_json["details"]:
-                rz = Path(eval_json["details"]["results_zip"])
-                if rz.exists():
+            details = payload.get("details", {})
+            rz = details.get("results_zip")
+            if rz:
+                rz_path = Path(rz)
+                if rz_path.exists():
                     final_zip = RESULTS_DIR / "results.zip"
-                    shutil.copy(rz, final_zip)
+                    shutil.copy(rz_path, final_zip)
                     results_zip_path = str(final_zip)
-                    eval_json["details"]["results_zip"] = results_zip_path
+                    # rewrite in payload for convenience
+                    details["results_zip"] = results_zip_path
 
             return EvalResponse(
                 success=True,
-                results=eval_json,
+                results=payload,
                 results_zip_path=results_zip_path
             )
 
@@ -116,20 +120,14 @@ async def simulate_and_evaluate(
         return EvalResponse(success=False, error_message=str(e))
 
 
-# -------------------------------
-# Download results.zip
-# -------------------------------
 @app.get("/download_results")
 async def download_results():
-    zip_path = RESULTS_DIR / "results.zip"
-    if not zip_path.exists():
+    z = RESULTS_DIR / "results.zip"
+    if not z.exists():
         return {"error": "No results.zip found"}
-    return FileResponse(zip_path, filename="results.zip")
+    return FileResponse(z, filename="results.zip")
 
 
-# -------------------------------
-# Health
-# -------------------------------
 @app.get("/health")
-async def health_check():
-    return {"status": "healthy", "version": "3.4.0"}
+async def health():
+    return {"status": "healthy", "version": "4.1.0"}

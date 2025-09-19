@@ -1,15 +1,13 @@
 # ChipForge EDA Tools Server
 
-A production-ready, containerized solution for evaluating hardware designs described in Verilog/SystemVerilog using Verilator. Built for ChipForge-SN84, it enables automated simulation and validation workflows. This guide helps validators and miners quickly set up, test, and operate the server from both the terminal and the GUI.
+A production-ready, containerized solution for evaluating hardware designs described in Verilog/SystemVerilog using Verilator and OpenLane. Built for ChipForge-SN84, it enables automated simulation and validation workflows. This guide helps validators and miners quickly set up, test, and operate the server from both the terminal and the GUI.
 
 ---
 
 ## Features
-- Integrated EDA Tool: Verilator (simulation), accessible via a unified API gateway.
-- Evaluation Metrics: Functionality and simulation performance scored and reported.
-- Evaluation Matrix (Coming Soon): Extended analysis for area, power, and advanced performance metrics.
-- Security: API key authentication and input validation.
-- File Management: Direct upload, automatic parsing, ZIP archival.
+- Integrated EDA Tools: Verilator (simulation) and OpenLane (area, performance, and soon power evaluation)
+- Evaluation Metrics: Functionality, area, performance, and (coming soon) power
+- File Management: Direct upload, automatic parsing, ZIP archival
 
 ---
 
@@ -30,8 +28,13 @@ chipforge_eda_server/
 │       ├── evaluator.txt
 │       └── evaluator.zip
 ├── test_designs/
-│   └── adder.zip
+│   ├── adder.zip
+│   └── adder_evaluator.zip
 ├── verilator-api/
+│   ├── Dockerfile
+│   ├── main.py
+│   └── requirements.txt
+├── openlane-api/
 │   ├── Dockerfile
 │   ├── main.py
 │   └── requirements.txt
@@ -48,56 +51,55 @@ chipforge_eda_server/
    git clone https://github.com/TatsuProject/chipforge_eda_server
    cd chipforge_eda_server
    cp .env.example .env
-   # Edit .env and set EDA_API_KEY (required for authentication)
+   # Edit .env if needed
    ```
-   > ⚠️ **Note:** The `.env` file is required for security. Without a valid `EDA_API_KEY`, the gateway will reject requests.
+
+3. **Build Docker Images**:
+   ```fish
+   make build
+   # If this fails (sometimes due to internet speed), just run 'make build' again until it succeeds
+   ```
+
+4. **Run Test from Terminal**:
+   ```fish
+   make test
+   # This will build, start all services, and run the validator script (example_usage.py)
+   ```
 
 ---
 
-## Terminal Usage
-
-- **One-step test:**
+## Step-by-Step Usage (Manual Control)
+- Build Docker images:
   ```fish
-  make test
-  # This will build the Docker images, start all services, and run the validator script (example_usage.py)
+  make build
   ```
-  This is the recommended way for quick validation from the terminal.
-
-- **Step-by-step control:**
-  - Build Docker images:
-    ```fish
-    make build
-    ```
-  - Start all services (if already built):
-    ```fish
-    make up
-    ```
-  - Build and start all services together:
-    ```fish
-    make start
-    ```
-  - Run the validator script (if services are already running):
-    ```fish
-    python3 example_usage.py
-    ```
-  - Check health:
-    ```fish
-    make health
-    ```
-  - View logs:
-    ```fish
-    make logs
-    ```
+- Start all services (if already built):
+  ```fish
+  make up
+  ```
+- Build and start all services together:
+  ```fish
+  make start
+  ```
+- Run the validator script (if services are already running):
+  ```fish
+  python3 example_usage.py
+  ```
+- Check health:
+  ```fish
+  make health
+  ```
+- View logs:
+  ```fish
+  make logs
+  ```
 
 ---
 
 ## GUI Usage
-
 - After running `make start`, open your browser and go to [http://localhost:8080/docs](http://localhost:8080/docs)
-- You will see a GUI similar to the first image above.
-- Click the green "Authorize" button (top right). Enter your API key (same as in `.env`) in the popup and click "Authorize".
-- For `/evaluate`, click "Browse..." and select your design ZIP (e.g., `test_designs/adder.zip` as shown in the third image).
-- Click "Execute" to run the evaluation and see results below.
+- In the GUI, for `/evaluate`, click "Browse..." and select both your design ZIP (`test_designs/adder.zip`) and evaluator ZIP (`test_designs/adder_evaluator.zip`)
+- Click "Execute" to run the evaluation and see results below
 
 ---
 
@@ -117,10 +119,10 @@ chipforge_eda_server/
 ---
 
 ## API Usage
-- **Authentication**:  `x-api-key: <your-eda-api-key>` (set in `.env`)
 - **Gateway Docs**: [http://localhost:8080/docs](http://localhost:8080/docs)
-- **Main Evaluation Endpoint**:  `POST /evaluate` with ZIP file
+- **Main Evaluation Endpoint**:  `POST /evaluate` with ZIP files
 - **Verilator API**: Accessible at [http://localhost:8001](http://localhost:8001)
+- **OpenLane API**: Accessible at [http://localhost:8003](http://localhost:8003)
 
 ---
 
@@ -130,13 +132,15 @@ chipforge_eda_server/
 # example_usage.py (run with: make test)
 import os
 import requests
-API_KEY = os.getenv("EDA_API_KEY", "test-key")
 BASE_URL = os.getenv("EDA_BASE_URL", "http://localhost:8080")
-zip_path = "test_designs/adder.zip"
-with open(zip_path, "rb") as f:
-    files = {"file": (os.path.basename(zip_path), f, "application/zip")}
-    headers = {"x-api-key": API_KEY}
-    resp = requests.post(f"{BASE_URL}/validate", files=files, headers=headers)
+design_zip = "test_designs/adder.zip"
+evaluator_zip = "test_designs/adder_evaluator.zip"
+with open(design_zip, "rb") as d, open(evaluator_zip, "rb") as e:
+    files = {
+        "design_zip": (os.path.basename(design_zip), d, "application/zip"),
+        "evaluator_zip": (os.path.basename(evaluator_zip), e, "application/zip")
+    }
+    resp = requests.post(f"{BASE_URL}/evaluate", files=files)
     print(resp.json() if resp.ok else resp.text)
 ```
 
@@ -148,21 +152,16 @@ with open(zip_path, "rb") as f:
 
 ---
 
-## Monitoring & Security
+## Monitoring & Troubleshooting
 - Health: `/health`, `/metrics`, `/status`
 - Logging: JSON, ELK stack, Sentry
-- Security: API keys, RBAC, TLS, input validation
-
----
-
-## Troubleshooting
 - Use `make logs`, and check `.env` for issues.
 - See docs for common errors and solutions.
 
 ---
 
 ## 🙏 Acknowledgments
-- Verilator and all contributors.
+- Verilator, OpenLane, and all contributors.
 
 ---
 

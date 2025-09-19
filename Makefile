@@ -1,43 +1,65 @@
 .PHONY: build up down logs clean test
 
-# --- Build Targets ---
-build: 
+
+# Build all services
+build:
 	docker compose build
 
-build-gateway:
-	docker compose build eda-gateway
-
-build-verilator:
-	docker compose build verilator-api
-
-# --- Run/Stop Targets ---
-up:        # Start all services
+# Start all services
+up:
 	docker compose up -d
-down:      # Stop all services
+
+# Stop all services  
+down:
 	docker compose down
-logs:      # View logs
+
+# View logs
+logs:
 	docker compose logs -f
-clean:     # Clean up everything
+
+# Clean up everything
+clean:
 	docker compose down -v
 	docker system prune -f
 
-# --- Validator & Health Targets ---
-test: start    # Run validator from terminal
-	sleep 1  # Wait for services to be up
-	python3 example_usage.py
-health:    # Health check for gateway
-	curl http://localhost:8080/health
+# Test the services
+test:
+	python example_usage.py
 
-# --- Development Targets ---
+# Fast development: restart only openlane-api after changes
+restart-openlane: build-openlane
+	docker compose up -d openlane-api
+	@echo "OpenLane API restarted at: http://localhost:8003"
+	@echo "Documentation: http://localhost:8003/docs"
+
+# Fast development: restart only gateway after changes
 restart-gateway: build-gateway
 	docker compose up -d eda-gateway
 	@echo "Gateway restarted at: http://localhost:8080"
 	@echo "Documentation: http://localhost:8080/docs"
 
-# --- Quick Start ---
+# Individual service commands
+
+build-verilator:
+	docker compose build verilator-api
+
+build-openlane:
+	docker compose build openlane-api
+
+build-gateway:
+	docker compose build eda-gateway
+
+# Health check
+health:
+	curl http://localhost:8080/health
+
+# Quick start (build + run)
 start: build up
 	@echo "EDA Tools API Gateway starting..."
 	@echo "Services will be available at:"
 	@echo "  Gateway: http://localhost:8080"
+	@echo "  Yosys: http://localhost:8000" 
 	@echo "  Verilator: http://localhost:8001"
+	@echo "  Icarus: http://localhost:8002"
 	@echo "  Documentation: http://localhost:8080/docs"
+

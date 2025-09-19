@@ -1,4 +1,4 @@
-import zipfile, tempfile, json, requests, shutil
+import zipfile, tempfile, json, aiohttp, asyncio, aiofiles
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -70,6 +70,16 @@ def compute_weighted_score(func_0_1, area_um2, ips, weights, targets):
     }
 
 
+async def make_http_request(session: aiohttp.ClientSession, url: str, files_data: dict):
+    """Make async HTTP request with multipart files"""
+    data = aiohttp.FormData()
+    for field_name, file_path in files_data.items():
+        data.add_field(field_name, open(file_path, 'rb'), filename=file_path.name)
+    
+    async with session.post(url, data=data) as response:
+        return await response.json()
+
+
 # -------------------------------
 # Endpoint
 # -------------------------------
@@ -82,13 +92,16 @@ async def evaluate(
         with tempfile.TemporaryDirectory() as tmpd:
             work = Path(tmpd)
 
-            # save zips
+            # save zips using aiofiles
             design_path = work / "design.zip"
-            design_path.write_bytes(await design_zip.read())
+            async with aiofiles.open(design_path, 'wb') as f:
+                await f.write(await design_zip.read())
+            
             eval_path = work / "evaluator.zip"
-            eval_path.write_bytes(await evaluator_zip.read())
+            async with aiofiles.open(eval_path, 'wb') as f:
+                await f.write(await evaluator_zip.read())
 
-            # extract evaluator
+            # extract evaluator (keep sync - zipfile operations are fast)
             eval_dir = work / "evaluator"
             eval_dir.mkdir()
             _unzip(eval_path, eval_dir)
@@ -115,42 +128,52 @@ async def evaluate(
                 weights = cfg.get("weights", {})
                 targets = cfg.get("targets", {})
 
-            # ---- verilator ----
-            v_resp = requests.post(
-                VERILATOR_API,
-                files={
-                    "design_zip": open(design_path, "rb"),
-                    "verilator_bundle": open(verilator_bundle, "rb")
-                }
-            )
-            v_json = v_resp.json()
-
-            func_score = 0.0
-            ipc, fmax_mhz, ips = None, None, None
-            if v_json.get("success"):
-                v_res = v_json.get("results", {})
-                func_score = v_res.get("functionality_score", 0.0)
-                ipc        = v_res.get("details", {}).get("ipc")
-                fmax_mhz   = None  # Fmax will come from OpenLane
-                ipc_cycles = v_res.get("details", {}).get("ipc_cycles")
-                ipc_instr  = v_res.get("details", {}).get("ipc_instructions")
-                # IPS will be computed later once fmax_mhz is known
-
-            # ---- openlane ----
-            area_um2, fmax_mhz = None, None
-            o_json = {"skipped": True}
-            if weights.get("area", 0) > 0 or weights.get("performance", 0) > 0:
-                o_resp = requests.post(
-                    OPENLANE_API,
-                    files={
-                        "design_zip": open(design_path, "rb"),
-                        "openlane_bundle": open(openlane_bundle, "rb")
-                    }
+            # Use aiohttp session for parallel requests
+            timeout = aiohttp.ClientTimeout(total=600)  # 10 minute timeout
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                
+                # Always call Verilator
+                verilator_task = make_http_request(
+                    session, 
+                    VERILATOR_API, 
+                    {"design_zip": design_path, "verilator_bundle": verilator_bundle}
                 )
-                o_json = o_resp.json()
-                if o_json.get("success"):
-                    area_um2 = o_json.get("results", {}).get("area_um2")
-                    fmax_mhz = o_json.get("results", {}).get("fmax_mhz")
+                
+                # Conditionally call OpenLane
+                tasks = [verilator_task]
+                run_openlane = weights.get("area", 0) > 0 or weights.get("performance", 0) > 0
+                
+                if run_openlane:
+                    openlane_task = make_http_request(
+                        session,
+                        OPENLANE_API,
+                        {"design_zip": design_path, "openlane_bundle": openlane_bundle}
+                    )
+                    tasks.append(openlane_task)
+                
+                # Execute requests in parallel
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process Verilator results
+                v_json = results[0] if not isinstance(results[0], Exception) else {"success": False, "error": str(results[0])}
+                
+                func_score = 0.0
+                ipc, fmax_mhz, ips = None, None, None
+                if v_json.get("success"):
+                    v_res = v_json.get("results", {})
+                    func_score = v_res.get("functionality_score", 0.0)
+                    ipc        = v_res.get("details", {}).get("ipc")
+                    fmax_mhz   = None  # Fmax will come from OpenLane
+                
+                # Process OpenLane results
+                area_um2, fmax_mhz = None, None
+                if run_openlane and len(results) > 1:
+                    o_json = results[1] if not isinstance(results[1], Exception) else {"success": False, "error": str(results[1])}
+                    if o_json.get("success"):
+                        area_um2 = o_json.get("results", {}).get("area_um2")
+                        fmax_mhz = o_json.get("results", {}).get("fmax_mhz")
+                else:
+                    o_json = {"skipped": True}
 
             # ---- compute IPS ----
             if ipc and fmax_mhz:

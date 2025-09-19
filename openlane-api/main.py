@@ -1,4 +1,6 @@
-import json, zipfile, tempfile, shutil, subprocess
+# openlane-api/main.py
+
+import json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -35,6 +37,29 @@ def _find_run_py(bundle_dir: Path) -> Optional[Path]:
             return p
     return None
 
+async def _run_subprocess(cmd, cwd, timeout=3600):
+    """Run subprocess asynchronously"""
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        return_code = process.returncode
+        
+        return {
+            'returncode': return_code,
+            'stdout': stdout.decode('utf-8') if stdout else '',
+            'stderr': stderr.decode('utf-8') if stderr else ''
+        }
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
 @app.post("/run_openlane", response_model=RunResponse)
 async def run_openlane(
     design_zip: UploadFile = File(..., description="Miner design.zip (rtl/, rtl.f, etc.)"),
@@ -49,15 +74,22 @@ async def run_openlane(
             for d in (design_dir, bundle_dir, out_dir):
                 d.mkdir(parents=True, exist_ok=True)
 
-            # --- Save & extract design.zip ---
+            # --- Save & extract design.zip and bundle asynchronously ---
             dz = work / "design.zip"
-            dz.write_bytes(await design_zip.read())
+            bz = work / "openlane_bundle.zip"
+            
+            # Read and write files in parallel
+            design_bytes = await design_zip.read()
+            bundle_bytes = await openlane_bundle.read()
+            
+            async with aiofiles.open(dz, 'wb') as f:
+                await f.write(design_bytes)
+            async with aiofiles.open(bz, 'wb') as f:
+                await f.write(bundle_bytes)
+            
+            # Extract zips (keep sync - zipfile operations are fast)
             with zipfile.ZipFile(dz, "r") as zf:
                 zf.extractall(design_dir)
-
-            # --- Save & extract openlane_bundle ---
-            bz = work / "openlane_bundle.zip"
-            bz.write_bytes(await openlane_bundle.read())
             with zipfile.ZipFile(bz, "r") as zf:
                 zf.extractall(bundle_dir)
 
@@ -66,24 +98,25 @@ async def run_openlane(
             if not run_py:
                 return RunResponse(success=False, error_message="run.py missing from bundle")
 
-            # --- Execute run.py ---
+            # --- Execute run.py asynchronously ---
             cmd = [
                 "python3", str(run_py),
                 "--design", str(design_dir),
                 "--out", str(out_dir),
             ]
-            run = subprocess.run(cmd, cwd=work, capture_output=True, text=True, timeout=3600)
+            
+            run = await _run_subprocess(cmd, work, timeout=3600)
 
-            if run.returncode != 0:
+            if run['returncode'] != 0:
                 return RunResponse(
                     success=False,
                     error_message="run.py failed",
-                    logs=(run.stdout or "") + "\n" + (run.stderr or "")
+                    logs=run['stdout'] + "\n" + run['stderr']
                 )
 
             # --- Parse stdout JSON ---
             try:
-                result_obj = json.loads(run.stdout.strip())
+                result_obj = json.loads(run['stdout'].strip())
             except Exception:
                 res_json = out_dir / "results.json"
                 if res_json.exists():
@@ -92,7 +125,7 @@ async def run_openlane(
                     return RunResponse(
                         success=False,
                         error_message="run.py did not return valid JSON",
-                        logs=(run.stdout or "") + "\n" + (run.stderr or "")
+                        logs=run['stdout'] + "\n" + run['stderr']
                     )
 
             # --- Zip results folder ---
@@ -105,7 +138,7 @@ async def run_openlane(
                 success=True,
                 results=result_obj,
                 results_zip_path=str(final_zip),
-                logs=run.stderr
+                logs=run['stderr']
             )
 
     except Exception as e:

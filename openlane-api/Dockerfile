@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir \
     pydantic==1.8.2 \
     python-multipart==0.0.5 \
     requests \
-    volare
+    volare \
+    aiofiles
 
 # Install PDK (Sky130) at build time and create alias "sky130A"
 RUN volare enable --pdk sky130 --pdk-root /openlane/pdks && \

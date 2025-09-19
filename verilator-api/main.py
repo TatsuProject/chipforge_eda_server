@@ -1,9 +1,11 @@
+# verilator-api/main.py
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from pathlib import Path
-import tempfile, subprocess, zipfile, shutil, json
+import tempfile, subprocess, zipfile, shutil, json, asyncio, aiofiles
 
 app = FastAPI(title="ChipForge Verilator API", version="4.0.0")
 
@@ -18,8 +20,9 @@ class EvalResponse(BaseModel):
     results_zip_path: Optional[str] = None
 
 
-def _write_upload_to(path: Path, data: bytes):
-    path.write_bytes(data)
+async def _write_upload_to(path: Path, data: bytes):
+    async with aiofiles.open(path, 'wb') as f:
+        await f.write(data)
 
 
 def _unzip(zippath: Path, dest: Path):
@@ -33,6 +36,30 @@ def _find_run_py(root: Path) -> Optional[Path]:
         if p.is_file():
             return p
     return None
+
+
+async def _run_subprocess(cmd, cwd, timeout=3600):
+    """Run subprocess asynchronously"""
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        return_code = process.returncode
+        
+        return {
+            'returncode': return_code,
+            'stdout': stdout.decode('utf-8') if stdout else '',
+            'stderr': stderr.decode('utf-8') if stderr else ''
+        }
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise subprocess.TimeoutExpired(cmd, timeout)
 
 
 @app.post("/simulate_and_evaluate", response_model=EvalResponse)
@@ -54,11 +81,17 @@ async def simulate_and_evaluate(
             design_dir.mkdir(parents=True, exist_ok=True)
             bundle_dir.mkdir(parents=True, exist_ok=True)
 
-            # ---- unpack inputs ----
+            # ---- unpack inputs using async file writes ----
             dz = tmp / "design.zip"
             bz = tmp / "verilator_bundle.zip"
-            _write_upload_to(dz, design_bytes)
-            _write_upload_to(bz, bundle_bytes)
+            
+            # Write files asynchronously in parallel
+            await asyncio.gather(
+                _write_upload_to(dz, design_bytes),
+                _write_upload_to(bz, bundle_bytes)
+            )
+            
+            # Unzip operations (keep sync as they're fast)
             _unzip(dz, design_dir)
             _unzip(bz, bundle_dir)
 
@@ -70,31 +103,30 @@ async def simulate_and_evaluate(
                     error_message="verilator_bundle is missing run.py (looked recursively)."
                 )
 
-            # ---- invoke run.py ----
-            # run.py is responsible for copying/merging resources into design_dir,
-            # creating verilator.f, running make/Regression, and emitting JSON on stdout.
+            # ---- invoke run.py asynchronously ----
             cmd = [
                 "python3", str(run_py),
                 "--design", str(design_dir),
                 "--resources", str(bundle_dir)
             ]
-            proc = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, timeout=3600)
+            
+            proc = await _run_subprocess(cmd, tmp, timeout=3600)
 
-            if proc.returncode != 0:
+            if proc['returncode'] != 0:
                 return EvalResponse(
                     success=False,
                     error_message="run.py failed",
-                    evaluator_log=(proc.stdout or "") + "\n" + (proc.stderr or "")
+                    evaluator_log=proc['stdout'] + "\n" + proc['stderr']
                 )
 
             # ---- parse run.py stdout as JSON ----
             try:
-                payload = json.loads((proc.stdout or "").strip())
+                payload = json.loads((proc['stdout'] or "").strip())
             except Exception as e:
                 return EvalResponse(
                     success=False,
                     error_message=f"run.py did not return valid JSON: {e}",
-                    evaluator_log=(proc.stdout or "") + "\n" + (proc.stderr or "")
+                    evaluator_log=proc['stdout'] + "\n" + proc['stderr']
                 )
 
             # ---- copy results.zip if run.py created it ----

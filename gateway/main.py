@@ -129,7 +129,7 @@ async def evaluate(
                 targets = cfg.get("targets", {})
 
             # Use aiohttp session for parallel requests
-            timeout = aiohttp.ClientTimeout(total=600)  # 10 minute timeout
+            timeout = aiohttp.ClientTimeout(total=1800)  # 30 minute timeout
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 
                 # Always call Verilator

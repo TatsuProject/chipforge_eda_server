@@ -1,6 +1,6 @@
 import zipfile, tempfile, json, aiohttp, asyncio, aiofiles
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import secrets
 app = FastAPI(title="ChipForge EDA Tools Gateway", version="5.0.0")
@@ -107,7 +107,7 @@ async def make_http_request(session: aiohttp.ClientSession, url: str, files_data
 async def evaluate(
     design_zip: UploadFile = File(..., description="This is miner's submission"),
     evaluator_zip: UploadFile = File(..., description="Testcases downloaded when the challenge started"),
-    submission_id: str = None
+    submission_id: str = Form(None)
 ):
     try:
         with tempfile.TemporaryDirectory() as tmpd:

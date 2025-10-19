@@ -2,7 +2,7 @@ import zipfile, tempfile, json, aiohttp, asyncio, aiofiles
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
-
+import secrets
 app = FastAPI(title="ChipForge EDA Tools Gateway", version="5.0.0")
 
 # Service URLs (must match docker-compose ports)
@@ -23,6 +23,21 @@ def _rezip(src_dir: Path, out_zip: Path):
             if p.is_file():
                 zf.write(p, arcname=p.relative_to(src_dir))
     return out_zip
+
+
+def generate_submission_id(length: int = 32) -> str:
+    """
+    Generate a unique submission ID
+    
+    Args:
+        length: Length of the hex string (default 32 characters)
+    
+    Returns:
+        Hex string submission ID
+    """
+    id_length_bytes = length // 2  # Convert hex chars to bytes
+    submission_id = secrets.token_hex(id_length_bytes)
+    return submission_id
 
 
 def compute_weighted_score(func_0_1, area_um2, ips, weights, targets):
@@ -73,8 +88,13 @@ def compute_weighted_score(func_0_1, area_um2, ips, weights, targets):
 async def make_http_request(session: aiohttp.ClientSession, url: str, files_data: dict):
     """Make async HTTP request with multipart files"""
     data = aiohttp.FormData()
-    for field_name, file_path in files_data.items():
-        data.add_field(field_name, open(file_path, 'rb'), filename=file_path.name)
+    for field_name, value in files_data.items():
+        if field_name == "submission_id":
+            # Add submission_id as a form field, not a file
+            data.add_field(field_name, value)
+        else:
+            # Add file fields
+            data.add_field(field_name, open(value, 'rb'), filename=value.name)
     
     async with session.post(url, data=data) as response:
         return await response.json()
@@ -85,11 +105,14 @@ async def make_http_request(session: aiohttp.ClientSession, url: str, files_data
 # -------------------------------
 @app.post("/evaluate")
 async def evaluate(
-    design_zip: UploadFile = File(...),
-    evaluator_zip: UploadFile = File(...)
+    design_zip: UploadFile = File(..., description="This is miner's submission"),
+    evaluator_zip: UploadFile = File(..., description="Testcases downloaded when the challenge started"),
+    submission_id: str = None
 ):
     try:
         with tempfile.TemporaryDirectory() as tmpd:
+            if not submission_id:
+                submission_id = generate_submission_id(length=32)
             work = Path(tmpd)
 
             # save zips using aiofiles
@@ -129,6 +152,17 @@ async def evaluate(
                 targets = cfg.get("targets", {})
 
             # Use aiohttp session for parallel requests
+            submission_files = {
+                "design_zip": design_path,
+                "verilator_bundle": verilator_bundle,
+                "submission_id": submission_id
+            }
+            
+            openlane_files = {
+                "design_zip": design_path,
+                "openlane_bundle": openlane_bundle,
+                "submission_id": submission_id
+            }
             timeout = aiohttp.ClientTimeout(total=1800)  # 30 minute timeout
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 
@@ -136,9 +170,9 @@ async def evaluate(
                 verilator_task = make_http_request(
                     session, 
                     VERILATOR_API, 
-                    {"design_zip": design_path, "verilator_bundle": verilator_bundle}
+                    submission_files
                 )
-                
+
                 # Conditionally call OpenLane
                 tasks = [verilator_task]
                 run_openlane = weights.get("area", 0) > 0 or weights.get("performance", 0) > 0
@@ -147,7 +181,7 @@ async def evaluate(
                     openlane_task = make_http_request(
                         session,
                         OPENLANE_API,
-                        {"design_zip": design_path, "openlane_bundle": openlane_bundle}
+                        openlane_files
                     )
                     tasks.append(openlane_task)
                 
@@ -190,6 +224,7 @@ async def evaluate(
 
             return {
                 "success": True,
+                "submission_id": submission_id,
                 "verilator_results": v_json,
                 "openlane_results": o_json,
                 "weights": weights,
@@ -198,4 +233,8 @@ async def evaluate(
             }
 
     except Exception as e:
-        return {"success": False, "error_message": str(e)}
+        return {
+            "success": False, 
+            "submission_id": submission_id if 'submission_id' in locals() else "",
+            "error_message": str(e)
+        }

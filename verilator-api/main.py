@@ -1,6 +1,6 @@
 # verilator-api/main.py
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -65,7 +65,8 @@ async def _run_subprocess(cmd, cwd, timeout=3600):
 @app.post("/simulate_and_evaluate", response_model=EvalResponse)
 async def simulate_and_evaluate(
     design_zip: UploadFile = File(..., description="Miner design (zip with rtl.f + rtl/...)"),
-    verilator_bundle: UploadFile = File(..., description="Evaluator's Verilator bundle (run.py, tb_files.f, Makefile, Regression.mk, tests/, scripts/, top_module.txt)")
+    verilator_bundle: UploadFile = File(..., description="Evaluator's Verilator bundle (run.py, tb_files.f, Makefile, Regression.mk, tests/, scripts/, top_module.txt)"),
+    submission_id: str = Form(None)
 ):
     try:
         with tempfile.TemporaryDirectory() as tmpd:
@@ -136,7 +137,7 @@ async def simulate_and_evaluate(
             if rz:
                 rz_path = Path(rz)
                 if rz_path.exists():
-                    final_zip = RESULTS_DIR / "results.zip"
+                    final_zip = RESULTS_DIR / f"{submission_id}_verilator.zip"
                     shutil.copy(rz_path, final_zip)
                     results_zip_path = str(final_zip)
                     # rewrite in payload for convenience

@@ -33,7 +33,7 @@ def pick_test_files(test_dir: str):
     eval_candidates = [z for z in zips if "eval" in os.path.basename(z).lower()]
     if not eval_candidates:
         # fallback: any name containing 'evaluator'
-        eval_candidates = [z for z in zips if "evaluator" in os.path.basename(z).lower()]
+        eval_candidates = [z for z in zips if "evaluator" in os.path.basename(z).lower() or "testcases" in os.path.basename(z).lower()]
     if not eval_candidates:
         raise FileNotFoundError(
             f"No evaluator zip found in {test_dir}. Expected a file like '*evaluator*.zip'."

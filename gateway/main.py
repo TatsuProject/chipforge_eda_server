@@ -163,7 +163,7 @@ async def evaluate(
                 "openlane_bundle": openlane_bundle,
                 "submission_id": submission_id
             }
-            timeout = aiohttp.ClientTimeout(total=1800)  # 30 minute timeout
+            timeout = aiohttp.ClientTimeout(total=2700)  # 45 minute timeout
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 
                 # Always call Verilator

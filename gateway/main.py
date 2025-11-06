@@ -26,24 +26,26 @@ def _rezip(src_dir: Path, out_zip: Path):
 
 
 def compute_weighted_score(func_0_1, area_um2, ips, weights, targets):
-    func_threshold = float(targets.get("func_threshold", 0.90))
-    area_ref  = float(targets.get("area_target_um2", 1.0))
-    perf_ref  = float(targets.get("perf_target_ips", 1.0))
-    ratio_cap = float(targets.get("ratio_cap", 2.0))
+    func_threshold     = float(targets.get("func_threshold", 0.90))
+    overall_threshold  = float(targets.get("overall_threshold", 0.0))  # renamed and added
+    area_ref           = float(targets.get("area_target_um2", 1.0))
+    perf_ref           = float(targets.get("perf_target_ips", 1.0))
+    ratio_cap          = float(targets.get("ratio_cap", 2.0))
 
     w_functionality = float(weights.get("functionality", 0.5))
-    w_area         = float(weights.get("area", 0.25))
-    w_perf         = float(weights.get("performance", 0.25))
+    w_area          = float(weights.get("area", 0.25))
+    w_perf          = float(weights.get("performance", 0.25))
 
-    # --- Gate ---
+    # --- Functionality Gate ---
     func_raw = max(0.0, min(1.0, func_0_1))
     if func_raw < func_threshold:
         return {
-            "func_score": round(func_raw * 100, 2),
-            "area_score": 0.0,
-            "perf_score": 0.0,
-            "overall": 0.0,
-            "functional_gate": False
+            "func_score"     : round(func_raw * 100, 2),
+            "area_score"     : 0.0,
+            "perf_score"     : 0.0,
+            "overall"        : 0.0,
+            "functional_gate": False,
+            "overall_gate"   : False
         }
 
     # --- Components ---
@@ -61,12 +63,25 @@ def compute_weighted_score(func_0_1, area_um2, ips, weights, targets):
         w_perf * perf_component
     ) / total_w
 
+    # --- Overall Gate ---
+    if overall < overall_threshold:
+        return {
+            "func_score"     : round(func_raw * 100, 2),
+            "area_score"     : round(area_component * 100, 2),
+            "perf_score"     : round(perf_component * 100, 2),
+            "overall"        : 0.0,
+            "functional_gate": True,
+            "overall_gate"   : False
+        }
+
+    # --- Success ---
     return {
-        "func_score": round(func_raw * 100, 2),
-        "area_score": round(area_component * 100, 2),
-        "perf_score": round(perf_component * 100, 2),
-        "overall": round(overall * 100, 2),
-        "functional_gate": True
+        "func_score"     : round(func_raw * 100, 2),
+        "area_score"     : round(area_component * 100, 2),
+        "perf_score"     : round(perf_component * 100, 2),
+        "overall"        : round(overall * 100, 2),
+        "functional_gate": True,
+        "overall_gate"   : True
     }
 
 

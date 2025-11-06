@@ -4,7 +4,7 @@ import json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -63,7 +63,8 @@ async def _run_subprocess(cmd, cwd, timeout=3600):
 @app.post("/run_openlane", response_model=RunResponse)
 async def run_openlane(
     design_zip: UploadFile = File(..., description="Miner design.zip (rtl/, rtl.f, etc.)"),
-    openlane_bundle: UploadFile = File(..., description="Bundle with flow.tcl, config.json, constraints.sdc, run.py")
+    openlane_bundle: UploadFile = File(..., description="Bundle with flow.tcl, config.json, constraints.sdc, run.py"),
+    submission_id: str = Form(None)
 ):
     try:
         with tempfile.TemporaryDirectory() as tmpd:
@@ -131,7 +132,7 @@ async def run_openlane(
             # --- Zip results folder ---
             out_zip = work / "results.zip"
             _safe_zip_dir(out_dir, out_zip)
-            final_zip = RESULTS_DIR / "results.zip"
+            final_zip = RESULTS_DIR / f"{submission_id}_openlane.zip"
             shutil.copy(out_zip, final_zip)
 
             return RunResponse(

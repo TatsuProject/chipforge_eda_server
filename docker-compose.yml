@@ -5,6 +5,7 @@ services:
     build:
       context: ./verilator-api
       dockerfile: Dockerfile
+    restart: unless-stopped
     ports:
       - "8001:8001"
     volumes:
@@ -24,6 +25,7 @@ services:
     build:
       context: ./openlane-api
       dockerfile: Dockerfile
+    restart: unless-stopped
     ports:
       - "8003:8003"
     volumes:
@@ -52,6 +54,7 @@ services:
     build:
       context: ./gateway
       dockerfile: Dockerfile
+    restart: unless-stopped
     ports:
       - "8080:8080"
     depends_on:

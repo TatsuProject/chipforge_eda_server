@@ -40,65 +40,74 @@ def generate_submission_id(length: int = 32) -> str:
     return submission_id
 
 
-def compute_weighted_score(func_0_1, area_um2, ips, weights, targets):
-    func_threshold     = float(targets.get("func_threshold", 0.90))
-    overall_threshold  = float(targets.get("overall_threshold", 0.0))  # renamed and added
-    area_ref           = float(targets.get("area_target_um2", 1.0))
-    perf_ref           = float(targets.get("perf_target_ips", 1.0))
-    ratio_cap          = float(targets.get("ratio_cap", 2.0))
-
+def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets):
+    """
+    Compute weighted score with functionality, area, performance, and power.
+    
+    Args:
+        func_0_1: Functionality score (0.0 to 1.0)
+        area_um2: Area in square micrometers
+        ips: Instructions per second
+        power_mw: Power in milliwatts
+        weights: Dict with weights for each metric
+        targets: Dict with target values and thresholds
+    
+    Returns:
+        Dict with individual scores, overall score, and gate flags
+    """
+    # Extract thresholds and targets
+    func_threshold    = float(targets.get("func_threshold", 0.90))
+    overall_threshold = float(targets.get("overall_threshold", 0.0))
+    area_ref          = float(targets.get("area_target_um2", 1.0))
+    perf_ref          = float(targets.get("perf_target_ips", 1.0))
+    power_ref         = float(targets.get("power_target_mw", 1.0))
+    ratio_cap         = float(targets.get("ratio_cap", 2.0))
+    
+    # Extract weights
     w_functionality = float(weights.get("functionality", 0.5))
     w_area          = float(weights.get("area", 0.25))
     w_perf          = float(weights.get("performance", 0.25))
+    w_power         = float(weights.get("power", 0.0))
 
-    # --- Functionality Gate ---
-    func_raw = max(0.0, min(1.0, func_0_1))
-    if func_raw < func_threshold:
-        return {
-            "func_score"     : round(func_raw * 100, 2),
-            "area_score"     : 0.0,
-            "perf_score"     : 0.0,
-            "overall"        : 0.0,
-            "functional_gate": False,
-            "overall_gate"   : False
-        }
-
-    # --- Components ---
-    func_component = (func_raw - func_threshold) / (1 - func_threshold) if func_threshold < 1 else 1.0
+    # --- Calculate component scores ---
+    # Functionality: direct score (no threshold subtraction for scoring)
+    func_component = func_0_1
+    
+    # Area: smaller is better (inverted ratio)
     area_component = min(area_ref / area_um2, ratio_cap) if area_um2 and area_ref > 0 else 0.0
+    
+    # Performance: higher is better
     perf_component = min(ips / perf_ref, ratio_cap) if ips and perf_ref > 0 else 0.0
+    
+    # Power: lower is better (inverted ratio)
+    power_component = min(power_ref / power_mw, ratio_cap) if power_mw and power_ref > 0 else 0.0
 
-    total_w = w_functionality + w_area + w_perf
+    # --- Calculate weighted overall score ---
+    total_w = w_functionality + w_area + w_perf + w_power
     if total_w <= 0:
         total_w = 1.0
 
     overall = (
         w_functionality * func_component +
         w_area * area_component +
-        w_perf * perf_component
+        w_perf * perf_component +
+        w_power * power_component
     ) / total_w
 
-    # --- Overall Gate ---
-    if overall < overall_threshold:
-        return {
-            "func_score"     : round(func_raw * 100, 2),
-            "area_score"     : round(area_component * 100, 2),
-            "perf_score"     : round(perf_component * 100, 2),
-            "overall"        : 0.0,
-            "functional_gate": True,
-            "overall_gate"   : False
-        }
+    # --- Gates: check if thresholds are met (for flags only, not for zeroing scores) ---
+    func_gate    = func_0_1 >= func_threshold
+    overall_gate = overall >= overall_threshold
 
-    # --- Success ---
+    # --- Return all scores and flags ---
     return {
-        "func_score"     : round(func_raw * 100, 2),
-        "area_score"     : round(area_component * 100, 2),
-        "perf_score"     : round(perf_component * 100, 2),
-        "overall"        : round(overall * 100, 2),
-        "functional_gate": True,
-        "overall_gate"   : True
+        "func_score": round(func_0_1 * 100, 2),
+        "area_score": round(area_component * 100, 2),
+        "perf_score": round(perf_component * 100, 2),
+        "power_score": round(power_component * 100, 2),
+        "overall": round(overall * 100, 2),
+        "functional_gate": func_gate,
+        "overall_gate": overall_gate
     }
-
 
 async def make_http_request(session: aiohttp.ClientSession, url: str, files_data: dict):
     """Make async HTTP request with multipart files"""
@@ -221,6 +230,7 @@ async def evaluate(
                     if o_json.get("success"):
                         area_um2 = o_json.get("results", {}).get("area_um2")
                         fmax_mhz = o_json.get("results", {}).get("fmax_mhz")
+                        power_mw = o_json.get("results", {}).get("power_mw") # added for power
                 else:
                     o_json = {"skipped": True}
 
@@ -233,6 +243,7 @@ async def evaluate(
                 func_0_1=func_score,
                 area_um2=area_um2,
                 ips=ips,
+                power_mw=power_mw,  # added for power
                 weights=weights,
                 targets=targets
             )

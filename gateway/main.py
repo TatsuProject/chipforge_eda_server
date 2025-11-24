@@ -224,7 +224,7 @@ async def evaluate(
                     fmax_mhz   = None  # Fmax will come from OpenLane
                 
                 # Process OpenLane results
-                area_um2, fmax_mhz = None, None
+                area_um2, fmax_mhz, power_mw = None, None, None
                 if run_openlane and len(results) > 1:
                     o_json = results[1] if not isinstance(results[1], Exception) else {"success": False, "error": str(results[1])}
                     if o_json.get("success"):

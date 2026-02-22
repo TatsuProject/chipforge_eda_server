@@ -21,6 +21,26 @@ services:
       retries: 2
       start_period: 30s
 
+  riscv-iss-api:
+    build:
+      context: ./riscv-iss-api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./shared:/shared
+      - /tmp:/tmp
+      - ./results:/app/results
+    environment:
+      - SERVICE_NAME=riscv-iss-simulation
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 300s
+      timeout: 20s
+      retries: 2
+      start_period: 30s
+
   openlane-api:
     build:
       context: ./openlane-api
@@ -59,6 +79,7 @@ services:
       - "8080:8080"
     depends_on:
       - verilator-api
+      - riscv-iss-api
       - openlane-api
     volumes:
       - ./results:/app/results                # unified results path
@@ -66,6 +87,7 @@ services:
       - /tmp:/tmp
     environment:
       - VERILATOR_URL=http://verilator-api:8001
+      - RISCV_ISS_URL=http://riscv-iss-api:8002
       - OPENLANE_URL=http://openlane-api:8003
       # EDA_API_KEY comes from .env
 

@@ -90,6 +90,17 @@ async def simulate_iss(
             design_bytes = await design_zip.read()
             bundle_bytes = await iss_bundle.read()
 
+            if len(design_bytes) == 0:
+                return EvalResponse(
+                    success=False,
+                    error_message="design_zip is empty (0 bytes). Upload a valid zip containing your .S file."
+                )
+            if len(bundle_bytes) == 0:
+                return EvalResponse(
+                    success=False,
+                    error_message="iss_bundle is empty (0 bytes)."
+                )
+
             # ---- prepare dirs ----
             design_dir = tmp / "design"
             bundle_dir = tmp / "bundle"
@@ -105,8 +116,21 @@ async def simulate_iss(
                 _write_upload_to(bz, bundle_bytes)
             )
 
-            _unzip(dz, design_dir)
-            _unzip(bz, bundle_dir)
+            try:
+                _unzip(dz, design_dir)
+            except zipfile.BadZipFile:
+                return EvalResponse(
+                    success=False,
+                    error_message="design_zip is not a valid zip file. Make sure you're uploading a .zip archive."
+                )
+
+            try:
+                _unzip(bz, bundle_dir)
+            except zipfile.BadZipFile:
+                return EvalResponse(
+                    success=False,
+                    error_message="iss_bundle is not a valid zip file."
+                )
 
             # ---- ensure binaries are executable after zip extraction ----
             _make_binaries_executable(bundle_dir)
@@ -130,11 +154,30 @@ async def simulate_iss(
 
             proc = await _run_subprocess(cmd, tmp, timeout=3600)
 
+            # Always capture stderr as evaluator_log for debugging
+            evaluator_log = (proc['stderr'] or '').strip() or None
+
             if proc['returncode'] != 0:
+                # run.py crashed — try to extract error_message from its JSON stdout
+                error_msg = "Evaluator run.py exited with error"
+                try:
+                    payload = json.loads((proc['stdout'] or "").strip())
+                    if payload.get('error_message'):
+                        error_msg = payload['error_message']
+                    # Even on non-zero exit, if we got valid JSON, return it
+                    return EvalResponse(
+                        success=False,
+                        results=payload,
+                        error_message=error_msg,
+                        evaluator_log=evaluator_log
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
                 return EvalResponse(
                     success=False,
-                    error_message="run.py failed",
-                    evaluator_log=proc['stdout'] + "\n" + proc['stderr']
+                    error_message=error_msg,
+                    evaluator_log=evaluator_log
                 )
 
             # ---- parse run.py stdout as JSON ----
@@ -143,9 +186,15 @@ async def simulate_iss(
             except Exception as e:
                 return EvalResponse(
                     success=False,
-                    error_message=f"run.py did not return valid JSON: {e}",
-                    evaluator_log=proc['stdout'] + "\n" + proc['stderr']
+                    error_message=f"Evaluator did not return valid JSON: {e}",
+                    evaluator_log=evaluator_log
                 )
+
+            # ---- forward run.py's error_message if it reported failure ----
+            # run.py returned exit code 0 but may have success=False in its JSON
+            # (e.g., miner's .S file failed validation). This is normal — forward it.
+            api_success = payload.get('success', False)
+            error_message = payload.get('error_message') if not api_success else None
 
             # ---- copy results.zip if run.py created it ----
             results_zip_path = None
@@ -160,13 +209,20 @@ async def simulate_iss(
                     details["results_zip"] = results_zip_path
 
             return EvalResponse(
-                success=True,
+                success=api_success,
                 results=payload,
+                error_message=error_message,
+                evaluator_log=evaluator_log,
                 results_zip_path=results_zip_path
             )
 
+    except subprocess.TimeoutExpired:
+        return EvalResponse(
+            success=False,
+            error_message="Evaluation timed out (exceeded 60 minutes). Your test may contain an infinite loop."
+        )
     except Exception as e:
-        return EvalResponse(success=False, error_message=str(e))
+        return EvalResponse(success=False, error_message=f"Internal server error: {str(e)}")
 
 
 @app.get("/health")

@@ -143,7 +143,13 @@ async def evaluate(
             # extract evaluator
             eval_dir = work / "evaluator"
             eval_dir.mkdir()
-            _unzip(eval_path, eval_dir)
+            try:
+                _unzip(eval_path, eval_dir)
+            except zipfile.BadZipFile:
+                return JSONResponse(
+                    {"success": False, "error_message": "evaluator_zip is not a valid zip file."},
+                    status_code=400
+                )
 
             gateway_dir = eval_dir / "gateway"
 
@@ -217,7 +223,12 @@ async def evaluate(
                 svc_results = {}
                 for key, result in zip(task_keys, raw_results):
                     if isinstance(result, Exception):
-                        svc_results[key] = {"success": False, "error": str(result)}
+                        err_str = str(result)
+                        if "Cannot connect" in err_str or "Connection refused" in err_str:
+                            err_str = f"Backend service '{key}' is not reachable. It may be down or still starting up."
+                        elif "TimeoutError" in type(result).__name__:
+                            err_str = f"Backend service '{key}' timed out after 45 minutes."
+                        svc_results[key] = {"success": False, "error_message": err_str}
                     else:
                         svc_results[key] = result
 
@@ -256,14 +267,27 @@ async def evaluate(
                 targets=targets
             )
 
+            # ---- collect errors from failed services ----
+            service_errors = []
+            for svc_name, svc_res in svc_results.items():
+                if not svc_res.get("success"):
+                    err = svc_res.get("error_message") or svc_res.get("error") or "unknown error"
+                    service_errors.append(f"{svc_name}: {err}")
+
             # ---- build response ----
+            all_succeeded = all(
+                svc_res.get("success", False) for svc_res in svc_results.values()
+            )
             response = {
-                "success": True,
+                "success": all_succeeded or func_score > 0,
                 "submission_id": submission_id,
                 "weights": weights,
                 "targets": targets,
                 "final_score": score
             }
+
+            if service_errors:
+                response["service_errors"] = service_errors
 
             # Include per-service results with backward-compatible field names
             if "verilator" in svc_results:
@@ -281,9 +305,15 @@ async def evaluate(
 
             return response
 
+    except zipfile.BadZipFile:
+        return {
+            "success": False,
+            "submission_id": submission_id if 'submission_id' in locals() else "",
+            "error_message": "One of the uploaded files is not a valid zip archive."
+        }
     except Exception as e:
         return {
             "success": False,
             "submission_id": submission_id if 'submission_id' in locals() else "",
-            "error_message": str(e)
+            "error_message": f"Internal gateway error: {str(e)}"
         }

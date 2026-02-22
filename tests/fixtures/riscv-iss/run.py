@@ -92,20 +92,36 @@ def run_cmd(cmd, cwd=None, timeout=600, capture=True, env=None):
 # ---------------------------------------------------------------------------
 
 def find_s_file(design_dir):
-    """Find .S assembly file in miner's submission directory."""
+    """Find .S assembly file in miner's submission directory.
+
+    Returns (path, error_detail) — error_detail is None on success,
+    or a string listing what was found instead.
+    """
     design_path = Path(design_dir)
 
     s_files = list(design_path.glob("*.S")) + list(design_path.glob("*.s"))
     s_files += list(design_path.glob("*/*.S")) + list(design_path.glob("*/*.s"))
 
     if not s_files:
-        return None
+        # List what IS in the submission so miner knows what went wrong
+        all_files = [str(p.relative_to(design_path)) for p in design_path.rglob("*") if p.is_file()]
+        if all_files:
+            file_list = ", ".join(all_files[:20])
+            if len(all_files) > 20:
+                file_list += f" ... and {len(all_files) - 20} more"
+            detail = (f"No .S or .s assembly file found in submission. "
+                      f"Files found: [{file_list}]. "
+                      f"Your design.zip must contain a .S assembly file (e.g., test.S, bug.S).")
+        else:
+            detail = ("Submission directory is empty. "
+                      "Your design.zip must contain a .S assembly file (e.g., test.S, bug.S).")
+        return None, detail
 
     for f in s_files:
         if f.stem.lower().startswith(('test', 'bug', 'exploit', 'submission')):
-            return f
+            return f, None
 
-    return s_files[0]
+    return s_files[0], None
 
 
 def validate_s_file(s_file):
@@ -117,24 +133,32 @@ def validate_s_file(s_file):
 
     file_size = s_path.stat().st_size
     if file_size > MAX_S_FILE_SIZE:
-        return False, f"File too large: {file_size} bytes (max {MAX_S_FILE_SIZE})"
+        return False, (f"File too large: {file_size:,} bytes (max {MAX_S_FILE_SIZE // 1024} KB). "
+                       f"Reduce your assembly file size.")
     if file_size == 0:
-        return False, "File is empty"
+        return False, "Assembly file is empty (0 bytes). Submit a valid .S file with RISC-V instructions."
 
     try:
         content = s_path.read_text()
+    except UnicodeDecodeError:
+        return False, ("File is not valid text/UTF-8. "
+                       "Submit a plain-text .S assembly file, not a binary or compiled ELF.")
     except Exception as e:
         return False, f"Cannot read file: {e}"
 
     for directive in ['#include', '.include']:
         if directive in content:
-            return False, f"File contains '{directive}' - submissions must be self-contained"
+            return False, (f"File contains '{directive}' directive. "
+                           f"Submissions must be self-contained — all code in a single .S file, "
+                           f"no external includes.")
 
     if '_start' not in content:
-        return False, "File must define '_start' label as entry point"
+        return False, ("Missing '_start' entry point. Your .S file must define a '_start' label. "
+                       "Example:\n  .globl _start\n_start:\n  <your code>")
 
     if '.text' not in content:
-        return False, "File must have a .text section"
+        return False, ("Missing '.text' section. Your .S file must have a .text section. "
+                       "Example:\n  .section .text.init\n  .align 2\n  .globl _start\n_start:")
 
     return True, None
 
@@ -160,13 +184,21 @@ def compile_s_to_elf(s_file, link_ld, output_dir, stem_suffix=""):
     ]
 
     result = run_cmd(cmd, timeout=COMPILE_TIMEOUT)
-    if result is None or result.returncode != 0:
-        err_msg = result.stderr[:1000] if result else "Compilation timed out"
-        log(f"Compilation failed: {err_msg}")
-        return None, err_msg
+    if result is None:
+        return None, (f"Compilation timed out after {COMPILE_TIMEOUT}s. "
+                      f"Your assembly file may be too large or contain recursive macros.")
+    if result.returncode != 0:
+        # Clean up GCC error: strip the full path prefix to show only the filename
+        raw_err = (result.stderr or "").strip()
+        # Replace absolute paths with just the filename for readability
+        clean_err = raw_err.replace(str(s_file), s_path.name)
+        if len(clean_err) > 2000:
+            clean_err = clean_err[:2000] + "\n... (truncated)"
+        log(f"Compilation failed: {clean_err}")
+        return None, f"GCC compilation failed:\n{clean_err}"
 
     if not elf_path.exists():
-        return None, "ELF file not created"
+        return None, "Compilation produced no output (ELF file not created)."
 
     return str(elf_path), None
 
@@ -646,7 +678,9 @@ def evaluate(design_dir, resources_dir, output_dir):
         'functionality_score': 0.0,
         'bug_found': False,
         'bug_fingerprint': None,
+        'error_message': None,
         'details': {
+            'step': None,
             'spike_instructions': 0,
             'coral_instructions': 0,
             'real_mismatches': 0,
@@ -658,6 +692,13 @@ def evaluate(design_dir, resources_dir, output_dir):
             'errors': [],
         }
     }
+
+    def fail_at_step(step, error_message):
+        """Record failure at a specific pipeline step."""
+        results['details']['step'] = step
+        results['error_message'] = error_message
+        results['details']['errors'].append(error_message)
+        log(f"ERROR at {step}: {error_message}")
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -677,34 +718,34 @@ def evaluate(design_dir, resources_dir, output_dir):
 
     # ---- STEP 1: Find and validate .S file ----
     log("\n[STEP 1] Validating submission...")
+    results['details']['step'] = 'validation'
 
-    s_file = find_s_file(design_dir)
+    s_file, find_err = find_s_file(design_dir)
     if s_file is None:
-        results['details']['errors'].append("No .S assembly file found in submission")
-        log("ERROR: No .S file found")
+        fail_at_step('validation', find_err)
         return results
 
     log(f"Found .S file: {s_file}")
 
     valid, err_msg = validate_s_file(s_file)
     if not valid:
-        results['details']['errors'].append(f"Validation failed: {err_msg}")
-        log(f"ERROR: {err_msg}")
+        fail_at_step('validation', err_msg)
         return results
 
     log("Validation passed")
 
     # ---- STEP 2: Compile ----
     log("\n[STEP 2] Compiling .S to ELF...")
+    results['details']['step'] = 'compilation'
 
     if not link_ld.exists():
-        results['details']['errors'].append("Linker script not found")
+        fail_at_step('compilation', "Evaluator linker script not found (internal error — contact challenge maintainer).")
         return results
 
     # Compile for Coral (linked at 0x0)
     elf_path, compile_err = compile_s_to_elf(s_file, link_ld, output_dir)
     if elf_path is None:
-        results['details']['errors'].append(f"Compilation failed: {compile_err}")
+        fail_at_step('compilation', compile_err)
         return results
 
     results['details']['compilation_success'] = True
@@ -713,18 +754,18 @@ def evaluate(design_dir, resources_dir, output_dir):
     # Compile for Spike (linked at 0x80000000)
     spike_elf = None
     if link_spike_ld.exists():
-        spike_elf, _ = compile_s_to_elf(s_file, link_spike_ld, output_dir,
+        spike_elf, spike_compile_err = compile_s_to_elf(s_file, link_spike_ld, output_dir,
                                          stem_suffix="_spike")
         if spike_elf:
             log(f"Compiled (Spike): {spike_elf}")
         else:
-            log("WARNING: Spike ELF compilation failed, skipping Spike")
+            log(f"WARNING: Spike ELF compilation failed: {spike_compile_err}")
 
     # Convert Coral ELF to memory images
     log("Converting ELF to memory images...")
     imem_path, dmem_path = elf_to_mem(elf_path, output_dir)
     if imem_path is None:
-        results['details']['errors'].append("Memory image conversion failed")
+        fail_at_step('compilation', "Failed to convert ELF to memory images (objcopy failed).")
         return results
 
     log(f"ITCM: {imem_path}")
@@ -732,21 +773,24 @@ def evaluate(design_dir, resources_dir, output_dir):
 
     # ---- STEP 3: Run Spike ----
     log("\n[STEP 3] Running Spike (reference simulator)...")
+    results['details']['step'] = 'spike_simulation'
 
     if spike_elf is None:
-        results['details']['errors'].append("No Spike ELF available")
+        fail_at_step('spike_simulation', "No Spike ELF available (Spike compilation failed).")
         results['success'] = True
         return results
 
     spike_log = run_spike(spike_elf, output_dir)
     if spike_log is None:
-        results['details']['errors'].append("Spike execution failed")
+        fail_at_step('spike_simulation',
+                     "Spike produced no output. Your test may contain an infinite loop "
+                     "or illegal instructions that crash Spike before producing a trace.")
         results['success'] = True
         return results
 
     spike_csv, spike_count = convert_spike_trace(spike_log, output_dir, scripts_dir)
     if spike_csv is None:
-        results['details']['errors'].append("Spike trace conversion failed")
+        fail_at_step('spike_simulation', "Spike trace conversion failed (internal error).")
         results['success'] = True
         return results
 
@@ -754,16 +798,27 @@ def evaluate(design_dir, resources_dir, output_dir):
     log(f"Spike trace: {spike_count} instructions")
 
     if spike_count == 0:
-        results['details']['errors'].append("Spike produced zero instructions")
+        fail_at_step('spike_simulation',
+                     "Spike executed 0 instructions after bootrom filter. "
+                     "Your test may not reach any instructions at the expected entry point, "
+                     "or it may crash immediately on startup.")
         results['success'] = True
         return results
 
     # ---- STEP 4: Run Coral ----
     log("\n[STEP 4] Running Coral (DUT simulation)...")
+    results['details']['step'] = 'coral_simulation'
+
+    # Check that Coral binary exists before trying to run it
+    if not Path(coral_bin).exists():
+        fail_at_step('coral_simulation',
+                     f"Coral binary (Vtb_top) not found. "
+                     f"Checked: {CORAL_BIN} and {resources_coral}. "
+                     f"This is an evaluator configuration issue — contact challenge maintainer.")
+        return results
 
     coral_log = run_coral(imem_path, dmem_path, output_dir, coral_bin=coral_bin)
     if coral_log is None:
-        results['details']['errors'].append("Coral simulation failed (no output)")
         results['details']['coral_instructions'] = 0
 
         if spike_count > 5:
@@ -772,12 +827,18 @@ def evaluate(design_dir, resources_dir, output_dir):
             results['functionality_score'] = 1.0
             results['bug_fingerprint'] = "CRASH:no_output:no_output"
             results['details']['classification'] = "CORAL_CRASH"
+            results['details']['step'] = 'classification'
+            results['error_message'] = None  # Not an error — it's a valid bug find
             log("BUG FOUND: Coral crashed while Spike completed normally")
+        else:
+            fail_at_step('coral_simulation',
+                         "Coral simulation produced no trace output. "
+                         "The Coral binary may have crashed or timed out.")
         return results
 
     coral_csv, coral_count = convert_coral_trace(coral_log, output_dir, scripts_dir)
     if coral_csv is None:
-        results['details']['errors'].append("Coral trace conversion failed")
+        fail_at_step('coral_simulation', "Coral trace conversion failed (internal error).")
         results['success'] = True
         return results
 
@@ -796,6 +857,7 @@ def evaluate(design_dir, resources_dir, output_dir):
 
     # ---- STEP 5: Compare traces ----
     log("\n[STEP 5] Comparing traces...")
+    results['details']['step'] = 'trace_comparison'
 
     comparison = compare_traces(spike_csv, coral_csv, scripts_dir)
 
@@ -810,6 +872,7 @@ def evaluate(design_dir, resources_dir, output_dir):
 
     # ---- STEP 6: Classify ----
     log("\n[STEP 6] Classifying result...")
+    results['details']['step'] = 'classification'
 
     bug_found, fingerprint, classification = classify_result(
         comparison, spike_count, coral_count, spike_csv, coral_csv,
@@ -817,10 +880,12 @@ def evaluate(design_dir, resources_dir, output_dir):
     )
 
     results['success'] = True
+    results['error_message'] = None  # Clear any earlier partial errors
     results['bug_found'] = bug_found
     results['functionality_score'] = 1.0 if bug_found else 0.0
     results['bug_fingerprint'] = fingerprint
     results['details']['classification'] = classification
+    results['details']['step'] = 'complete'
 
     if bug_found:
         pc, inst = extract_first_mismatch(spike_csv, coral_csv)
@@ -865,14 +930,16 @@ def main():
     if not Path(args.design).exists():
         print(json.dumps({
             'success': False, 'functionality_score': 0.0, 'bug_found': False,
-            'details': {'errors': [f"Design directory not found: {args.design}"]}
+            'error_message': f"Design directory not found: {args.design}",
+            'details': {'step': 'setup', 'errors': [f"Design directory not found: {args.design}"]}
         }))
         sys.exit(1)
 
     if not Path(args.resources).exists():
         print(json.dumps({
             'success': False, 'functionality_score': 0.0, 'bug_found': False,
-            'details': {'errors': [f"Resources directory not found: {args.resources}"]}
+            'error_message': f"Resources directory not found: {args.resources}",
+            'details': {'step': 'setup', 'errors': [f"Resources directory not found: {args.resources}"]}
         }))
         sys.exit(1)
 

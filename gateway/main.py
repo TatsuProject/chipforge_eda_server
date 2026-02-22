@@ -121,8 +121,8 @@ def _infer_services(weights):
 # -------------------------------
 @app.post("/evaluate")
 async def evaluate(
-    design_zip: UploadFile = File(..., description="This is miner's submission"),
-    evaluator_zip: UploadFile = File(..., description="Testcases downloaded when the challenge started"),
+    design_zip: UploadFile = File(..., description="Miner's submission (zip with RTL files or .S assembly)"),
+    evaluator_zip: UploadFile = File(..., description="Challenge evaluator bundle (provided by the validator)"),
     submission_id: str = Form(None)
 ):
     try:

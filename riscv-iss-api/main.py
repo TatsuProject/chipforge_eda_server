@@ -1,11 +1,10 @@
 # riscv-iss-api/main.py
 
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from pathlib import Path
-import tempfile, subprocess, zipfile, shutil, json, asyncio, os, stat
+import tempfile, subprocess, zipfile, shutil, json, asyncio, os, stat, secrets
 import aiofiles
 
 app = FastAPI(title="ChipForge RISC-V ISS API", version="1.0.0")
@@ -33,7 +32,10 @@ def _unzip(zippath: Path, dest: Path):
 
 
 def _find_run_py(root: Path) -> Optional[Path]:
-    """Find run.py inside the bundle (root or subdir like riscv-iss/run.py)."""
+    """Find run.py inside the bundle. Prefer root-level, then search recursively."""
+    direct = root / "run.py"
+    if direct.is_file():
+        return direct
     for p in root.rglob("run.py"):
         if p.is_file():
             return p
@@ -60,10 +62,8 @@ async def _run_subprocess(cmd, cwd, timeout=3600):
 
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        return_code = process.returncode
-
         return {
-            'returncode': return_code,
+            'returncode': process.returncode,
             'stdout': stdout.decode('utf-8') if stdout else '',
             'stderr': stderr.decode('utf-8') if stderr else ''
         }
@@ -80,10 +80,13 @@ async def simulate_iss(
     submission_id: str = Form(None)
 ):
     try:
+        if not submission_id:
+            submission_id = secrets.token_hex(16)
+
         with tempfile.TemporaryDirectory() as tmpd:
             tmp = Path(tmpd)
 
-            # ---- stash uploads once (avoid double .read()) ----
+            # ---- stash uploads once ----
             design_bytes = await design_zip.read()
             bundle_bytes = await iss_bundle.read()
 
@@ -93,7 +96,7 @@ async def simulate_iss(
             design_dir.mkdir(parents=True, exist_ok=True)
             bundle_dir.mkdir(parents=True, exist_ok=True)
 
-            # ---- unpack inputs using async file writes ----
+            # ---- unpack inputs ----
             dz = tmp / "design.zip"
             bz = tmp / "iss_bundle.zip"
 
@@ -116,11 +119,13 @@ async def simulate_iss(
                     error_message="iss_bundle is missing run.py (looked recursively)."
                 )
 
-            # ---- invoke run.py asynchronously ----
+            # ---- invoke run.py ----
+            # Use run_py.parent as resources dir so scripts/ and common/ resolve correctly
+            resources_dir = run_py.parent
             cmd = [
                 "python3", str(run_py),
                 "--design", str(design_dir),
-                "--resources", str(bundle_dir)
+                "--resources", str(resources_dir)
             ]
 
             proc = await _run_subprocess(cmd, tmp, timeout=3600)
@@ -162,14 +167,6 @@ async def simulate_iss(
 
     except Exception as e:
         return EvalResponse(success=False, error_message=str(e))
-
-
-@app.get("/download_results")
-async def download_results():
-    z = RESULTS_DIR / "results.zip"
-    if not z.exists():
-        return {"error": "No results.zip found"}
-    return FileResponse(z, filename="results.zip")
 
 
 @app.get("/health")

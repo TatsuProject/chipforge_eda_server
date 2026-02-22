@@ -1,14 +1,14 @@
-import zipfile, tempfile, json, aiohttp, asyncio, aiofiles
+import os, zipfile, tempfile, json, aiohttp, asyncio, aiofiles
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import secrets
 app = FastAPI(title="ChipForge EDA Tools Gateway", version="6.0.0")
 
-# Service URLs (must match docker-compose ports)
-VERILATOR_API  = "http://verilator-api:8001/simulate_and_evaluate"
-RISCV_ISS_API  = "http://riscv-iss-api:8002/simulate_iss"
-OPENLANE_API   = "http://openlane-api:8003/run_openlane"
+# Service URLs (configurable via env vars, defaults match docker-compose)
+VERILATOR_API  = os.getenv("VERILATOR_URL", "http://verilator-api:8001") + "/simulate_and_evaluate"
+RISCV_ISS_API  = os.getenv("RISCV_ISS_URL", "http://riscv-iss-api:8002") + "/simulate_iss"
+OPENLANE_API   = os.getenv("OPENLANE_URL", "http://openlane-api:8003") + "/run_openlane"
 
 # Map service name -> (evaluator subdir, API URL, bundle form-field name)
 SERVICE_CONFIG = {
@@ -91,14 +91,21 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets):
 async def make_http_request(session: aiohttp.ClientSession, url: str, files_data: dict):
     """Make async HTTP request with multipart files."""
     data = aiohttp.FormData()
-    for field_name, value in files_data.items():
-        if field_name == "submission_id":
-            data.add_field(field_name, value)
-        else:
-            data.add_field(field_name, open(value, 'rb'), filename=value.name)
+    opened_files = []
+    try:
+        for field_name, value in files_data.items():
+            if field_name == "submission_id":
+                data.add_field(field_name, value)
+            else:
+                fh = open(value, 'rb')
+                opened_files.append(fh)
+                data.add_field(field_name, fh, filename=value.name)
 
-    async with session.post(url, data=data) as response:
-        return await response.json()
+        async with session.post(url, data=data) as response:
+            return await response.json()
+    finally:
+        for fh in opened_files:
+            fh.close()
 
 
 def _infer_services(weights):
@@ -154,6 +161,12 @@ async def evaluate(
             # Backward compat: infer from weights if no explicit services list
             if services is None:
                 services = _infer_services(weights)
+
+            if not services:
+                return JSONResponse(
+                    {"success": False, "error_message": "No services configured in config.json"},
+                    status_code=400
+                )
 
             # ---- validate that required service directories exist ----
             missing = []

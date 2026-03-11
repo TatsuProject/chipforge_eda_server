@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11.9-slim
 
 # Install system dependencies (for Verilator build + runtime)
 RUN apt-get update && apt-get install -y \
@@ -41,7 +41,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ----------------------------
 # Copy application code
 # ----------------------------
-COPY . /app
+COPY . .
 
 EXPOSE 8001
 

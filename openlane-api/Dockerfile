@@ -1,9 +1,7 @@
 # Pull ChipForge openlane image as base
+# TODO: pin to a specific tag (e.g. logicx101/openlane:2024.xx) once you identify
+#       the tag in use, to prevent cache-busting from upstream updates.
 FROM logicx101/openlane:latest
-
-# RUN apt-get update && apt-get install -y build-essential \
-#     && rm -rf /var/lib/apt/lists/*
-
 
 # Install Python dependencies for FastAPI service
 RUN pip install --no-cache-dir \
@@ -25,14 +23,13 @@ ENV PDK_ROOT=/openlane/pdks \
     STD_CELL_LIBRARY=sky130_fd_sc_hd \
     PDKPATH=/openlane/pdks/sky130A
 
-# Set working directory
 WORKDIR /app
 
-# Copy application code into container
-COPY . /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose API port
+COPY . .
+
 EXPOSE 8003
 
-# Default command: run FastAPI app
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"]

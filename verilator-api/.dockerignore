@@ -1,0 +1,12 @@
+# Never copy the Dockerfile itself into the image
+Dockerfile
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Misc
+*.log
+.env

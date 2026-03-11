@@ -1,0 +1,24 @@
+# Results and test artifacts - never needed in any build context
+results/
+test/
+practical_tests/
+
+# Test and performance scripts at root
+example_usage.py
+parallel_performance_test.py
+parallel_performance_results_coral_npu.csv
+verilator_build.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Misc
+*.log
+*.csv
+.env
+.git/
+.gitignore
+README.md

@@ -10,8 +10,9 @@ services:
       - "8001:8001"
     volumes:
       - ./shared:/shared
-      - /tmp:/tmp
       - ./results:/app/results                # unified results path
+    tmpfs:
+      - /tmp:size=20g,mode=1777               # isolated, size-capped /tmp — never touches host disk
     environment:
       - SERVICE_NAME=verilator-simulation
     healthcheck:
@@ -63,7 +64,8 @@ services:
     volumes:
       - ./results:/app/results                # unified results path
       - ./shared:/shared
-      - /tmp:/tmp
+    tmpfs:
+      - /tmp:size=20g,mode=1777               # isolated, size-capped /tmp — never touches host disk
     environment:
       - VERILATOR_URL=http://verilator-api:8001
       - OPENLANE_URL=http://openlane-api:8003

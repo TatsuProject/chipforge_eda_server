@@ -106,7 +106,15 @@ async def run_openlane(
                 "--out", str(out_dir),
             ]
             
+            # Snapshot /tmp before run.py executes so we can clean up anything it creates outside work
+            tmp_before = set(Path("/tmp").iterdir())
+
             run = await _run_subprocess(cmd, work, timeout=3600)
+
+            # Clean up any stray directories/files run.py created directly in /tmp
+            for p in Path("/tmp").iterdir():
+                if p not in tmp_before and p != work:
+                    shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
 
             if run['returncode'] != 0:
                 return RunResponse(

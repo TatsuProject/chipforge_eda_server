@@ -111,15 +111,7 @@ async def simulate_and_evaluate(
                 "--resources", str(bundle_dir)
             ]
             
-            # Snapshot /tmp before run.py executes so we can clean up anything it creates outside tmpd
-            tmp_before = set(Path("/tmp").iterdir())
-
             proc = await _run_subprocess(cmd, tmp, timeout=3600)
-
-            # Clean up any stray directories/files run.py created directly in /tmp (e.g. /tmp/coralnpu_eval)
-            for p in Path("/tmp").iterdir():
-                if p not in tmp_before and p != tmp:
-                    shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
 
             if proc['returncode'] != 0:
                 return EvalResponse(

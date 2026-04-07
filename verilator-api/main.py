@@ -108,7 +108,8 @@ async def simulate_and_evaluate(
             cmd = [
                 "python3", str(run_py),
                 "--design", str(design_dir),
-                "--resources", str(bundle_dir)
+                "--resources", str(bundle_dir),
+                "--out", str(tmp / "eval_out"),
             ]
             
             proc = await _run_subprocess(cmd, tmp, timeout=3600)
@@ -131,22 +132,22 @@ async def simulate_and_evaluate(
                 )
 
             # ---- copy results.zip if run.py created it ----
-            results_zip_path = None
-            details = payload.get("details", {})
-            rz = details.get("results_zip")
-            if rz:
-                rz_path = Path(rz)
-                if rz_path.exists():
-                    final_zip = RESULTS_DIR / f"{submission_id}_verilator.zip"
-                    shutil.copy(rz_path, final_zip)
-                    results_zip_path = str(final_zip)
-                    # rewrite in payload for convenience
-                    details["results_zip"] = results_zip_path
+            # results_zip_path = None
+            # details = payload.get("details", {})
+            # rz = details.get("results_zip")
+            # if rz:
+            #     rz_path = Path(rz)
+            #     if rz_path.exists():
+            #         final_zip = RESULTS_DIR / f"{submission_id}_verilator.zip"
+            #         shutil.copy(rz_path, final_zip)
+            #         results_zip_path = str(final_zip)
+            #         # rewrite in payload for convenience
+            #         details["results_zip"] = results_zip_path
 
             return EvalResponse(
                 success=True,
                 results=payload,
-                results_zip_path=results_zip_path
+                results_zip_path=None
             )
 
     except Exception as e:

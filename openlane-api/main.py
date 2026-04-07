@@ -130,10 +130,10 @@ async def run_openlane(
                     )
 
             # --- Zip results folder ---
-            out_zip = work / "results.zip"
-            _safe_zip_dir(out_dir, out_zip)
-            final_zip = RESULTS_DIR / f"{submission_id}_openlane.zip"
-            shutil.copy(out_zip, final_zip)
+            # out_zip = work / "results.zip"
+            # _safe_zip_dir(out_dir, out_zip)
+            # final_zip = RESULTS_DIR / f"{submission_id}_openlane.zip"
+            # shutil.copy(out_zip, final_zip)
 
             return RunResponse(
                 success=True,

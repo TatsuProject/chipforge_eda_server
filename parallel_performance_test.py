@@ -73,14 +73,35 @@ def evaluate_sync(api_url: str, design_zip: str, evaluator_zip: str, api_key: st
     
     end_time = time.time()
     duration = end_time - start_time
-    
-    return {
+
+    result = {
         "request_id": request_id,
         "status_code": resp.status_code,
         "duration": duration,
         "success": resp.status_code == 200,
-        "response_size": len(resp.content) if resp.content else 0
+        "response_size": len(resp.content) if resp.content else 0,
+        "func_score": None,
+        "overall_score": None,
+        "tests_passed": None,
+        "tests_total": None,
+        "eval_success": None,
     }
+
+    if resp.status_code == 200:
+        try:
+            body = resp.json()
+            result["eval_success"] = body.get("success")
+            score = body.get("final_score", {})
+            result["func_score"] = score.get("func_score")
+            result["overall_score"] = score.get("overall")
+            v = body.get("verilator_results", {}).get("results", {})
+            details = v.get("details", {})
+            result["tests_passed"] = details.get("tests_passed")
+            result["tests_total"] = details.get("tests_total")
+        except Exception:
+            pass
+
+    return result
 
 
 def run_parallel_requests(num_parallel: int, design_zip: str, evaluator_zip: str):
@@ -125,10 +146,24 @@ def run_parallel_requests(num_parallel: int, design_zip: str, evaluator_zip: str
     print(f"Time per request (wall clock): {time_per_request:.2f}s")
     print(f"Successful requests: {len(successful_requests)}/{num_parallel}")
     print(f"Failed requests: {len(failed_requests)}")
-    
+
+    for r in results:
+        if r["success"]:
+            score_str = (
+                f"func={r['func_score']}% overall={r['overall_score']}% "
+                f"tests={r['tests_passed']}/{r['tests_total']}"
+                if r["func_score"] is not None
+                else "score=N/A"
+            )
+            print(f"  Request {r['request_id']}: {score_str}")
+
     if failed_requests:
         print("Failed request status codes:", [r["status_code"] for r in failed_requests])
-    
+
+    scored = [r for r in successful_requests if r["func_score"] is not None]
+    avg_func  = sum(r["func_score"]    for r in scored) / len(scored) if scored else None
+    avg_overall = sum(r["overall_score"] for r in scored) / len(scored) if scored else None
+
     return {
         "num_parallel": num_parallel,
         "total_time": total_time,
@@ -138,7 +173,9 @@ def run_parallel_requests(num_parallel: int, design_zip: str, evaluator_zip: str
         "time_per_request": time_per_request,
         "successful_requests": len(successful_requests),
         "failed_requests": len(failed_requests),
-        "throughput": num_parallel / total_time  # requests per second
+        "throughput": num_parallel / total_time,
+        "avg_func_score": avg_func,
+        "avg_overall_score": avg_overall,
     }
 
 
@@ -146,14 +183,14 @@ def save_results_to_csv(all_results: list):
     """Save results to CSV file"""
     with open(RESULTS_FILE, 'w', newline='') as csvfile:
         fieldnames = [
-            'num_parallel', 'total_time', 'avg_request_time', 'min_request_time', 
-            'max_request_time', 'time_per_request', 'successful_requests', 
-            'failed_requests', 'throughput'
+            'num_parallel', 'total_time', 'avg_request_time', 'min_request_time',
+            'max_request_time', 'time_per_request', 'successful_requests',
+            'failed_requests', 'throughput', 'avg_func_score', 'avg_overall_score',
         ]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(all_results)
-    
+
     print(f"\nResults saved to {RESULTS_FILE}")
 
 
@@ -187,16 +224,20 @@ def find_sweet_spot(all_results: list):
 def print_summary_table(all_results: list):
     """Print a summary table of all results"""
     print(f"\n=== PERFORMANCE SUMMARY ===")
-    print("Parallel | Total Time | Time/Req | Throughput | Success | Failed")
-    print("---------|------------|----------|------------|---------|--------")
-    
-    for result in all_results:
-        print(f"{result['num_parallel']:8d} | "
-              f"{result['total_time']:9.2f}s | "
-              f"{result['time_per_request']:7.2f}s | "
-              f"{result['throughput']:9.2f}/s | "
-              f"{result['successful_requests']:7d} | "
-              f"{result['failed_requests']:6d}")
+    print("Parallel | Total Time | Time/Req | Throughput | Success | Failed | Func Score | Overall Score")
+    print("---------|------------|----------|------------|---------|--------|------------|---------------")
+
+    for r in all_results:
+        func    = f"{r['avg_func_score']:.1f}%"    if r.get('avg_func_score')    is not None else "   N/A"
+        overall = f"{r['avg_overall_score']:.1f}%"  if r.get('avg_overall_score') is not None else "    N/A"
+        print(f"{r['num_parallel']:8d} | "
+              f"{r['total_time']:9.2f}s | "
+              f"{r['time_per_request']:7.2f}s | "
+              f"{r['throughput']:9.2f}/s | "
+              f"{r['successful_requests']:7d} | "
+              f"{r['failed_requests']:6d} | "
+              f"{func:>10} | "
+              f"{overall:>13}")
 
 
 if __name__ == "__main__":

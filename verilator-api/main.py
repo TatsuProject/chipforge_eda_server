@@ -109,7 +109,6 @@ async def simulate_and_evaluate(
                 "python3", str(run_py),
                 "--design", str(design_dir),
                 "--resources", str(bundle_dir),
-                "--out", str(tmp / "eval_out"),
             ]
             
             proc = await _run_subprocess(cmd, tmp, timeout=3600)

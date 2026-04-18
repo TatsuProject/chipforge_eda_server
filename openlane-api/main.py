@@ -138,7 +138,7 @@ async def run_openlane(
             return RunResponse(
                 success=True,
                 results=result_obj,
-                results_zip_path=str(final_zip),
+                results_zip_path=None,
                 logs=run['stderr']
             )
 

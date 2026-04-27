@@ -1,6 +1,6 @@
 # openlane-api/main.py
 
-import json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles
+import json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles, uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -9,6 +9,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="ChipForge Openlane API", version="4.0.0")
+
+# Serialize OpenLane runs: synthesis is CPU-heavy and non-deterministic under
+# contention. Running one at a time gives consistent results and avoids
+# competing for the same CPU cores.
+_openlane_semaphore = asyncio.Semaphore(1)
 RESULTS_DIR = Path("/app/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -69,7 +74,8 @@ async def run_openlane(
     try:
         with tempfile.TemporaryDirectory() as tmpd:
             work = Path(tmpd)
-            design_dir = work / "design"
+            # Unique name so concurrent requests don't collide in /openlane/designs/
+            design_dir = work / f"design_{uuid.uuid4().hex[:8]}"
             bundle_dir = work / "bundle"
             out_dir    = work / "out"
             for d in (design_dir, bundle_dir, out_dir):
@@ -99,14 +105,19 @@ async def run_openlane(
             if not run_py:
                 return RunResponse(success=False, error_message="run.py missing from bundle")
 
-            # --- Execute run.py asynchronously ---
+            # --- Execute run.py asynchronously (serialized via semaphore) ---
             cmd = [
                 "python3", str(run_py),
                 "--design", str(design_dir),
                 "--out", str(out_dir),
             ]
-            
-            run = await _run_subprocess(cmd, work, timeout=3600)
+
+            openlane_design_copy = Path("/openlane/designs") / design_dir.name
+            async with _openlane_semaphore:
+                run = await _run_subprocess(cmd, work, timeout=3600)
+                # Clean up the design copy written into /openlane/designs/ by run.py
+                if openlane_design_copy.exists():
+                    shutil.rmtree(openlane_design_copy, ignore_errors=True)
 
             if run['returncode'] != 0:
                 return RunResponse(

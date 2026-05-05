@@ -1,6 +1,6 @@
 # ChipForge EDA Tools Server
 
-A production-ready, containerized solution for evaluating hardware designs described in Verilog/SystemVerilog using Verilator and OpenLane. Built for ChipForge-SN84, it enables automated simulation and validation workflows. This guide helps validators and miners quickly set up, test, and operate the server from both the terminal and the GUI.
+A production-ready, containerized solution for evaluating hardware designs described in Verilog/SystemVerilog using Verilator and OpenLane. Built for ChipForge, it enables automated simulation and validation workflows. This guide helps validators and miners quickly set up, test, and operate the server from both the terminal and the GUI.
 
 ---
 

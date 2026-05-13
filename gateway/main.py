@@ -1,4 +1,5 @@
 import zipfile, tempfile, json, aiohttp, asyncio, aiofiles
+import importlib.util
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -55,6 +56,23 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets):
     Returns:
         Dict with individual scores, overall score, and gate flags
     """
+    # Sentinel: validator returns func_0_1 = -1.0 when the design's simulated
+    # RTL does not match the synth view (e.g. `ifdef verilator hides logic from
+    # OpenLane). The design is unusable, so every score is forced to -1.0
+    # rather than letting the weighted sum land at e.g. -70 from a single
+    # negative term. -1 is out of the legitimate [0,1]*100=[0,100] range, so
+    # the UI can render it as a clear rejection signal.
+    if func_0_1 is not None and func_0_1 < 0:
+        return {
+            "func_score": -1.0,
+            "area_score": -1.0,
+            "perf_score": -1.0,
+            "power_score": -1.0,
+            "overall": -1.0,
+            "functional_gate": False,
+            "overall_gate": False,
+        }
+
     # Extract thresholds and targets
     func_threshold    = float(targets.get("func_threshold", 0.90))
     overall_threshold = float(targets.get("overall_threshold", 0.0))

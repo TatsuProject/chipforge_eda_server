@@ -31,6 +31,23 @@ RUN git clone https://github.com/verilator/verilator \
     && make install \
     && cd / && rm -rf /tmp/verilator
 
+# ----------------------------------------------------------------------------
+# RISC-V toolchain (xPack riscv-none-elf-gcc) — Challenge-15 compiles the miner's
+# kernels ON the server, inside run.py. Symlinked to riscv64-unknown-elf-* (what
+# compile.sh expects). Same recipe as feature/riscv-iss-api. Portable (no glibc skew).
+# Placed AFTER the Verilator build so that slow layer stays cached on rebuild.
+# ----------------------------------------------------------------------------
+ARG RISCV_TOOLCHAIN_URL="https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v14.2.0-3/xpack-riscv-none-elf-gcc-14.2.0-3-linux-x64.tar.gz"
+RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/riscv && cd /tmp \
+    && wget -q "${RISCV_TOOLCHAIN_URL}" -O riscv-toolchain.tar.gz \
+    && tar xzf riscv-toolchain.tar.gz -C /opt/riscv --strip-components=1 \
+    && rm riscv-toolchain.tar.gz \
+    && ln -sf /opt/riscv/bin/riscv-none-elf-gcc     /usr/local/bin/riscv64-unknown-elf-gcc \
+    && ln -sf /opt/riscv/bin/riscv-none-elf-objcopy /usr/local/bin/riscv64-unknown-elf-objcopy \
+    && ln -sf /opt/riscv/bin/riscv-none-elf-size    /usr/local/bin/riscv64-unknown-elf-size
+ENV PATH="/opt/riscv/bin:${PATH}"
+
 # ----------------------------
 # Install Python dependencies
 # ----------------------------

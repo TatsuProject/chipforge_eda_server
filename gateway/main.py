@@ -1,4 +1,4 @@
-import zipfile, tempfile, json, aiohttp, asyncio, aiofiles
+import zipfile, tempfile, json, aiohttp, asyncio, aiofiles, os
 import importlib.util
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form
@@ -174,6 +174,53 @@ async def make_http_request(session: aiohttp.ClientSession, url: str, files_data
 
 
 # -------------------------------
+# Upload-layer validation (so a miner always knows WHERE their submission failed)
+# -------------------------------
+MAX_SUBMISSION_BYTES   = int(os.environ.get("C15_MAX_SUBMISSION_MB", "300")) * 1024 * 1024  # compressed upload cap
+MAX_UNCOMPRESSED_BYTES = int(os.environ.get("C15_MAX_UNCOMPRESSED_MB", "4096")) * 1024 * 1024  # zip-bomb guard
+
+def _miner_reject(submission_id, code, category, stage, message, detail=""):
+    return JSONResponse({
+        "success": True, "submission_id": submission_id, "result": "REJECTED",
+        "functionality_score": 0.0,
+        "error": {"code": code, "category": category, "fault": "miner", "stage": stage,
+                  "message": message, "detail": (detail or "")[-1500:], "retryable": False},
+        "final_score": {"overall": 0.0, "overall_gate": False, "scored": True}})
+
+def _system_error(submission_id, code, stage, message, detail="", retryable=False):
+    return JSONResponse({
+        "success": False, "submission_id": submission_id, "result": "ERROR",
+        "error": {"code": code, "category": "system", "fault": "system", "stage": stage,
+                  "message": message, "detail": (detail or "")[-1500:], "retryable": retryable},
+        "final_score": {"overall": None, "overall_gate": False, "scored": False}})
+
+def _zip_problem(path):
+    """Structural validation of a submission zip. Returns (code, message, detail) | None (all miner-fault)."""
+    sz = path.stat().st_size
+    if sz == 0:
+        return ("SUBMISSION_EMPTY", "The submission archive is empty (0 bytes).", "")
+    if sz > MAX_SUBMISSION_BYTES:
+        return ("SUBMISSION_TOO_LARGE", f"The submission ({sz//(1024*1024)} MB) exceeds the {MAX_SUBMISSION_BYTES//(1024*1024)} MB upload limit.", "")
+    if not zipfile.is_zipfile(path):
+        return ("SUBMISSION_NOT_A_ZIP", "The submission is not a valid .zip archive (corrupt or wrong format).", "")
+    try:
+        with zipfile.ZipFile(path) as z:
+            infos = z.infolist()
+            if not infos:
+                return ("SUBMISSION_EMPTY", "The submission archive contains no files.", "")
+            total = 0
+            for zi in infos:
+                n = zi.filename
+                if n.startswith("/") or n.startswith("\\") or ".." in Path(n).parts or (len(n) > 1 and n[1] == ":"):
+                    return ("SUBMISSION_UNSAFE_PATH", f"The submission contains an unsafe path (absolute or '..'): {n}", "")
+                total += zi.file_size
+                if total > MAX_UNCOMPRESSED_BYTES:
+                    return ("SUBMISSION_TOO_LARGE", "The submission expands beyond the allowed uncompressed size (possible zip bomb).", "")
+    except zipfile.BadZipFile:
+        return ("SUBMISSION_NOT_A_ZIP", "The submission archive is corrupt and could not be read.", "")
+    return None
+
+# -------------------------------
 # Endpoint
 # -------------------------------
 @app.post("/evaluate")
@@ -197,20 +244,30 @@ async def evaluate(
             async with aiofiles.open(eval_path, 'wb') as f:
                 await f.write(await evaluator_zip.read())
 
-            # extract evaluator (keep sync - zipfile operations are fast)
+            # ---- upload-layer validation: the miner's submission zip (miner-fault) ----
+            prob = _zip_problem(design_path)
+            if prob:
+                return _miner_reject(submission_id, prob[0], "submission", "intake", prob[1], prob[2])
+
+            # ---- the evaluator bundle is OURS: a problem here is a system fault ----
+            if not zipfile.is_zipfile(eval_path):
+                return _system_error(submission_id, "EVALUATOR_BUNDLE_MALFORMED", "intake",
+                                     "The evaluator bundle is not a valid zip.")
             eval_dir = work / "evaluator"
             eval_dir.mkdir()
-            _unzip(eval_path, eval_dir)
+            try:
+                _unzip(eval_path, eval_dir)
+            except Exception as e:
+                return _system_error(submission_id, "EVALUATOR_BUNDLE_MALFORMED", "intake",
+                                     "The evaluator bundle could not be extracted.", str(e))
 
             verilator_dir = eval_dir / "verilator"
             openlane_dir  = eval_dir / "openlane"
             gateway_dir   = eval_dir / "gateway"
 
             if not verilator_dir.exists() or not openlane_dir.exists():
-                return JSONResponse(
-                    {"success": False, "error_message": "Missing verilator/ or openlane/ in evaluator.zip"},
-                    status_code=400
-                )
+                return _system_error(submission_id, "EVALUATOR_BUNDLE_MALFORMED", "intake",
+                                     "The evaluator bundle is missing verilator/ or openlane/.")
 
             verilator_bundle = work / "verilator_bundle.zip"
             openlane_bundle  = work / "openlane_bundle.zip"

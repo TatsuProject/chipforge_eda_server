@@ -365,7 +365,13 @@ async def evaluate(
 
             # ---- compute IPS ----
             if ipc and fmax_mhz:
-                ips = ipc * (fmax_mhz * 1e6)  # instr per second
+                ips = ipc * (fmax_mhz * 1e6)  # inferences per second (the AI workload — this is what is SCORED)
+
+            # ---- ISA instructions/sec: a DIAGNOSTIC only (general-purpose core throughput), NOT scored.
+            # Reported separately from inferences/sec because the two workloads differ. Free: we already
+            # have ISA instr/cycle (from the ISA gate) and fmax (from STA).
+            isa_ipc = (v_res.get("details", {}) or {}).get("isa_ipc") if isinstance(v_res, dict) else None
+            isa_ips = (isa_ipc * fmax_mhz * 1e6) if (isa_ipc and fmax_mhz) else None
 
             # ---- final score ----
             score = compute_weighted_score(
@@ -381,6 +387,8 @@ async def evaluate(
                 "success": True,
                 "submission_id": submission_id,
                 "result": "ACCEPTED" if score.get("overall_gate") else "REJECTED",
+                "diagnostics": {"inferences_per_second": ips, "isa_instructions_per_second": isa_ips,
+                                "fmax_mhz": fmax_mhz, "note": "isa_instructions_per_second is a diagnostic only, not part of the score"},
                 "verilator_results": v_json,
                 "openlane_results": o_json,
                 "weights": weights,

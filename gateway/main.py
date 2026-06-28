@@ -283,6 +283,29 @@ async def evaluate(
                 else:
                     o_json = {"skipped": True}
 
+            # ---- Challenge-15 structured error handling (opt-in: responses carry error.fault) ----
+            # A SYSTEM fault (ours: toolchain/bundle/infra) must NEVER score the miner 0 -> return ERROR,
+            # not scored, so the validator retries/alerts instead of setting weights. A MINER fault
+            # (bad submission / failed gate) -> REJECTED, score 0, with the precise reason surfaced.
+            v_res  = v_json.get("results", {}) if isinstance(v_json, dict) else {}
+            v_err  = v_res.get("error") if isinstance(v_res, dict) else None
+            o_res  = o_json.get("results", o_json) if isinstance(o_json, dict) else {}
+            o_err  = o_res.get("error") if isinstance(o_res, dict) else None
+            sys_err = next((e for e in (v_err, o_err) if e and e.get("fault") == "system"), None)
+            if v_json.get("success") is False and not v_err:
+                sys_err = sys_err or {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system",
+                                      "message": v_json.get("error") or v_json.get("error_message") or "verilator-api failed",
+                                      "retryable": True}
+            if func_score is None and not sys_err:
+                sys_err = {"code": "INTERNAL_ERROR", "category": "system", "fault": "system",
+                           "message": "evaluator returned no functionality score", "retryable": True}
+            if sys_err:
+                return {"success": False, "submission_id": submission_id, "result": "ERROR",
+                        "error": sys_err, "verilator_results": v_json, "openlane_results": o_json,
+                        "weights": weights, "targets": targets,
+                        "final_score": {"overall": None, "overall_gate": False, "scored": False}}
+            miner_err = next((e for e in (v_err, o_err) if e and e.get("fault") == "miner"), None)
+
             # ---- compute IPS ----
             if ipc and fmax_mhz:
                 ips = ipc * (fmax_mhz * 1e6)  # instr per second
@@ -297,15 +320,19 @@ async def evaluate(
                 targets=targets
             )
 
-            return {
+            resp = {
                 "success": True,
                 "submission_id": submission_id,
+                "result": "ACCEPTED" if score.get("overall_gate") else "REJECTED",
                 "verilator_results": v_json,
                 "openlane_results": o_json,
                 "weights": weights,
                 "targets": targets,
                 "final_score": score
             }
+            if miner_err and not score.get("overall_gate"):
+                resp["error"] = miner_err   # surface the precise reason (failed gate / bad accel RTL)
+            return resp
 
     except Exception as e:
         return {

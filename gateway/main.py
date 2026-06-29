@@ -364,8 +364,15 @@ async def evaluate(
             miner_err = next((e for e in (v_err, o_err) if e and e.get("fault") == "miner"), None)
 
             # ---- compute IPS ----
-            if ipc and fmax_mhz:
-                ips = ipc * (fmax_mhz * 1e6)  # inferences per second (the AI workload — this is what is SCORED)
+            # FoM-RealMacro: performance is scored at a FIXED eval clock (the cycle count is what the miner
+            # optimizes; the clock is fixed by us). fmax is a closure GATE / winner-audit concern, NOT a
+            # score term (analysis/15: "fmax demoted to a closure gate"; analysis/16: accurate fmax needs
+            # slow P&R, so per-submission area uses synthesis-only and fmax is a pre-layout estimate only).
+            if targets.get("scoring_mode") == "fom_realmacro":
+                eval_clock_mhz = float(targets.get("eval_clock_mhz", 100.0))
+                ips = ipc * (eval_clock_mhz * 1e6) if ipc else None
+            elif ipc and fmax_mhz:
+                ips = ipc * (fmax_mhz * 1e6)  # legacy (Challenge_0014 linear path): inferences/sec at fmax
 
             # ISA instructions/sec is COMPUTED in the verilator bundle (details.isa_ipc) but deliberately
             # NOT reported as a metric here — the score is the AI inferences/sec FoM. Available if needed.

@@ -364,15 +364,14 @@ async def evaluate(
             miner_err = next((e for e in (v_err, o_err) if e and e.get("fault") == "miner"), None)
 
             # ---- compute IPS ----
-            # FoM-RealMacro: performance is scored at a FIXED eval clock (the cycle count is what the miner
-            # optimizes; the clock is fixed by us). fmax is a closure GATE / winner-audit concern, NOT a
-            # score term (analysis/15: "fmax demoted to a closure gate"; analysis/16: accurate fmax needs
-            # slow P&R, so per-submission area uses synthesis-only and fmax is a pre-layout estimate only).
-            if targets.get("scoring_mode") == "fom_realmacro":
-                eval_clock_mhz = float(targets.get("eval_clock_mhz", 100.0))
-                ips = ipc * (eval_clock_mhz * 1e6) if ipc else None
-            elif ipc and fmax_mhz:
-                ips = ipc * (fmax_mhz * 1e6)  # legacy (Challenge_0014 linear path): inferences/sec at fmax
+            # inferences/sec = ipc * fmax, where ipc = 1/cycles_per_inference and fmax is the REAL achievable
+            # clock COMPUTED AT RUN TIME from the timing report: the area flow sets a nominal clock (e.g. 10 ns)
+            # purely so STA reports a slack, then fmax = 1/(nominal_period - slack). A design with positive slack
+            # closes faster than nominal; negative slack closes slower. This is the Challenge_0014 method — the
+            # clock is NOT hardcoded into the score. (NOTE: today fmax comes from a synthesis-stage STA, which is
+            # pessimistic vs post-place-and-route; accuracy/slack-source is an open decision — see analysis/17 §3b.)
+            if ipc and fmax_mhz:
+                ips = ipc * (fmax_mhz * 1e6)
 
             # ISA instructions/sec is COMPUTED in the verilator bundle (details.isa_ipc) but deliberately
             # NOT reported as a metric here — the score is the AI inferences/sec FoM. Available if needed.

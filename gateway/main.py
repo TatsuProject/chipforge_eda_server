@@ -41,7 +41,7 @@ def generate_submission_id(length: int = 32) -> str:
     return submission_id
 
 
-def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets):
+def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets, v_details=None, fmax_mhz=None):
     """
     Compute weighted score with functionality, area, performance, and power.
     
@@ -85,7 +85,18 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets):
         min_speedup = float(targets.get("min_speedup", 2.0))
         perf_ref  = float(targets.get("perf_target_ips", 1.0))
         func_gate = (func_0_1 is not None) and (func_0_1 >= func_threshold)
-        speedup   = (ips / perf_ref) if (ips and perf_ref > 0) else 0.0
+        # PERF GATE: geomean of PER-MODEL speedups, each model vs its OWN no-accel baseline.
+        # The evaluator reports cycle_speedup_geomean = geomean_m(baseline_cyc_m / measured_cyc_m);
+        # the true inferences/sec speedup = that cycle ratio x (submission_fmax / baseline_fmax)
+        # (the cycle ratio is per-model, the clock ratio is model-independent). Dividing a multi-model
+        # geomean IPS by ONE model's baseline would wrongly reject good accelerators on big models.
+        # Falls back to the single-reference ips/perf_target_ips when the evaluator doesn't report it.
+        csg = (v_details or {}).get("cycle_speedup_geomean")
+        base_fmax = float(targets.get("baseline_fmax_mhz", 0.0))
+        if csg and base_fmax > 0 and fmax_mhz:
+            speedup = float(csg) * (fmax_mhz / base_fmax)
+        else:
+            speedup = (ips / perf_ref) if (ips and perf_ref > 0) else 0.0
         perf_gate = speedup >= min_speedup
         area_total = core_area + (area_um2 or 0.0)
         passed = bool(func_gate and perf_gate and area_total > 0 and ips)
@@ -383,7 +394,9 @@ async def evaluate(
                 ips=ips,
                 power_mw=power_mw,  # added for power
                 weights=weights,
-                targets=targets
+                targets=targets,
+                v_details=v_res.get("details", {}) if isinstance(v_res, dict) else {},
+                fmax_mhz=fmax_mhz
             )
 
             resp = {

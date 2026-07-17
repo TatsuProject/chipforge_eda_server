@@ -74,14 +74,14 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets, 
         }
 
     # ---- Challenge 15 gated FoM-RealMacro scoring (opt-in via targets.scoring_mode) ----
-    # area_total = core_area_um2 (fixed locked-core floor) + area_um2 (accelerator incl. macros).
+    # area_um2 IS the WHOLE synthesized SoC (core + accelerator logic + memory macros, from the one
+    # rtl.f the design is simulated with) — the core's area is inside it, never a separate floor.
     # GATES: func must be 100% (bit-exact); perf must beat baseline by >= min_speedup. Then a
     # scale-invariant FoM = IPS^alpha / area_total^beta (perf-primary, area can't -> 0). See analysis/15.
     if str(targets.get("scoring_mode", "")) == "fom_realmacro":
         func_threshold = float(targets.get("func_threshold", 1.0))
         alpha     = float(targets.get("alpha", 0.7))
         beta      = float(targets.get("beta", 0.3))
-        core_area = float(targets.get("core_area_um2", 0.0))
         min_speedup = float(targets.get("min_speedup", 2.0))
         perf_ref  = float(targets.get("perf_target_ips", 1.0))
         func_gate = (func_0_1 is not None) and (func_0_1 >= func_threshold)
@@ -98,14 +98,13 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets, 
         else:
             speedup = (ips / perf_ref) if (ips and perf_ref > 0) else 0.0
         perf_gate = speedup >= min_speedup
-        area_total = core_area + (area_um2 or 0.0)
+        area_total = area_um2 or 0.0
         passed = bool(func_gate and perf_gate and area_total > 0 and ips)
         fom = (ips ** alpha) / (area_total ** beta) if passed else 0.0
         return {
             "func_score": round((func_0_1 or 0.0) * 100, 2),
             "area_total_um2": round(area_total, 2),
-            "accelerator_area_um2": round(area_um2 or 0.0, 2),
-            "core_area_um2": core_area,
+            "area_scope": "whole_soc: core + accelerator + memory macros, one synthesis (core area is INSIDE area_total)",
             "speedup_vs_baseline": round(speedup, 3),
             "perf_gate": perf_gate,
             "functional_gate": func_gate,

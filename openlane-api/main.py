@@ -1,6 +1,6 @@
 # openlane-api/main.py
 
-import json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles, uuid
+import os, json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles, uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -10,10 +10,53 @@ from pydantic import BaseModel
 
 app = FastAPI(title="ChipForge Openlane API", version="4.0.0")
 
-# Serialize OpenLane runs: synthesis is CPU-heavy and non-deterministic under
-# contention. Running one at a time gives consistent results and avoids
-# competing for the same CPU cores.
-_openlane_semaphore = asyncio.Semaphore(1)
+# How many synthesis runs may proceed at once.
+#
+# This was a hard 1. The collision it was guarding against had already been fixed in the same
+# change that introduced it -- each request now stages into its own uuid-named directory, so
+# concurrent runs no longer share a path -- and serialising on top of that made synthesis the
+# throughput ceiling for the whole service: N concurrent evaluations queue N synthesis runs end to
+# end, and synthesis is the long pole of an evaluation.
+#
+# What genuinely does bound it is MEMORY, not correctness. A synthesis of a real accelerator peaks
+# around 5 GB, so the limit is how many of those the host can hold at once; exceeding it gets a run
+# OOM-killed, which looks like a submission failure and is not one. Sized from the host at import,
+# overridable for a box whose memory profile differs.
+MEM_PER_RUN_MB = int(os.environ.get("OPENLANE_MEM_PER_RUN_MB", "6144"))   # 5 GB peak + headroom
+
+
+def _synthesis_lanes():
+    budget_mb = MEM_PER_RUN_MB
+    avail = None
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) // 1024
+                break
+    except OSError:
+        pass
+    for lim_p, use_p in (("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+                         ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                          "/sys/fs/cgroup/memory/memory.usage_in_bytes")):
+        try:
+            lim = int(open(lim_p).read().split()[0]); use = int(open(use_p).read().split()[0])
+            if 0 < lim < (1 << 62):                       # an "unlimited" cgroup reports a sentinel
+                free = (lim - use) // (1024 * 1024)
+                avail = free if avail is None else min(avail, free)
+        except (OSError, ValueError):
+            pass
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 2
+    by_mem = max(1, (avail // budget_mb)) if avail else 1
+    return max(1, min(4, by_mem, cpus))
+
+
+OPENLANE_LANES = int(os.environ.get("OPENLANE_LANES", "0")) or _synthesis_lanes()
+_openlane_semaphore = asyncio.Semaphore(OPENLANE_LANES)
+print(f"[openlane-api] {OPENLANE_LANES} concurrent synthesis run(s) x {MEM_PER_RUN_MB} MB each",
+      flush=True)
 RESULTS_DIR = Path("/app/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -42,11 +85,12 @@ def _find_run_py(bundle_dir: Path) -> Optional[Path]:
             return p
     return None
 
-async def _run_subprocess(cmd, cwd, timeout=3600):
+async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
     """Run subprocess asynchronously"""
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
@@ -113,8 +157,12 @@ async def run_openlane(
             ]
 
             openlane_design_copy = Path("/openlane/designs") / design_dir.name
+            # Reserving a lane is only half of it: the reservation has to be enforced inside the
+            # run, or a design that grows without bound exhausts the host and the OOM killer picks
+            # its victim by footprint rather than by blame -- letting one submission fail another.
+            env = dict(os.environ, NPUV1_SYNTH_MEM_MB=str(MEM_PER_RUN_MB))
             async with _openlane_semaphore:
-                run = await _run_subprocess(cmd, work, timeout=3600)
+                run = await _run_subprocess(cmd, work, timeout=3600, env=env)
                 # Clean up the design copy written into /openlane/designs/ by run.py
                 if openlane_design_copy.exists():
                     shutil.rmtree(openlane_design_copy, ignore_errors=True)

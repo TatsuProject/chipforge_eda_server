@@ -5,12 +5,40 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from pathlib import Path
-import tempfile, subprocess, zipfile, shutil, json, asyncio, aiofiles
+import os, tempfile, subprocess, zipfile, shutil, json, asyncio, aiofiles
 
 app = FastAPI(title="ChipForge Verilator API", version="4.0.0")
 
 RESULTS_DIR = Path("/app/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# Capacity control.
+#
+# An evaluation is not one process: the bundle's run.py fans out into a batch of simulations, and
+# it sizes that batch from the CPUs it can see. That is correct for ONE evaluation and wrong for
+# several, because each concurrent request sizes itself as though it owned the machine. Measured
+# on a 12-core host: four concurrent evaluations launched 36 simulations, everything crawled, and
+# all four failed on their own internal budget.
+#
+# The service owns the host, so the service decides. Two levers, both sized at import:
+#   * how many evaluations may run at once, and
+#   * how wide each one may fan out -- handed to run.py through the knob it already reads.
+# Their product is what actually lands on the CPUs, and it is what we keep under the core count.
+def _cpus():
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 2)
+
+
+_CPUS = _cpus()
+EVAL_LANES = int(os.environ.get("VERILATOR_EVAL_LANES", "0")) or max(1, min(4, _CPUS // 6))
+FANOUT_PER_EVAL = int(os.environ.get("VERILATOR_FANOUT", "0")) or max(1, (_CPUS - 1) // EVAL_LANES)
+_eval_semaphore = asyncio.Semaphore(EVAL_LANES)
+print(f"[verilator-api] {_CPUS} cpus -> {EVAL_LANES} concurrent evaluations x {FANOUT_PER_EVAL} "
+      f"jobs each ({EVAL_LANES * FANOUT_PER_EVAL} peak)", flush=True)
 
 class EvalResponse(BaseModel):
     success: bool
@@ -38,11 +66,12 @@ def _find_run_py(root: Path) -> Optional[Path]:
     return None
 
 
-async def _run_subprocess(cmd, cwd, timeout=3600):
+async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
     """Run subprocess asynchronously"""
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
@@ -111,7 +140,11 @@ async def simulate_and_evaluate(
                 "--resources", str(bundle_dir),
             ]
             
-            proc = await _run_subprocess(cmd, tmp, timeout=3600)
+            # NPUV1_MAX_PARALLEL is the knob the bundle already honours; the service sets it so
+            # the batch is sized against this host's share, not against the whole machine.
+            env = dict(os.environ, NPUV1_MAX_PARALLEL=str(FANOUT_PER_EVAL))
+            async with _eval_semaphore:
+                proc = await _run_subprocess(cmd, tmp, timeout=3600, env=env)
 
             if proc['returncode'] != 0:
                 return EvalResponse(

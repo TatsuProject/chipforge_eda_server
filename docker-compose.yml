@@ -65,6 +65,10 @@ services:
     environment:
       - VERILATOR_URL=http://verilator-api:8001
       - OPENLANE_URL=http://openlane-api:8003
+      # How long to wait for both services. Raise it when a validator runs several evaluations at
+      # once: openlane-api serialises synthesis behind a Semaphore(1), so concurrent requests queue
+      # their synthesis end to end rather than overlapping.
+      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-2700}
       # EDA_API_KEY comes from .env
 
 # Named volumes not needed if you standardize on ./results (remove clutter)

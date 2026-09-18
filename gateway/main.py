@@ -303,7 +303,12 @@ async def evaluate(
                 "openlane_bundle": openlane_bundle,
                 "submission_id": submission_id
             }
-            timeout = aiohttp.ClientTimeout(total=2700)  # 45 minute timeout
+            # How long the gateway waits for both services. Configurable because it is a
+            # DEPLOYMENT property, not a constant: synthesis dominates an evaluation and scales
+            # with the submitted design, and openlane-api serialises synthesis behind a
+            # Semaphore(1), so N concurrent evaluations queue N synthesis runs end to end. A box
+            # taking four at once needs a different ceiling than one taking them singly.
+            timeout = aiohttp.ClientTimeout(total=int(os.environ.get("EDA_REQUEST_TIMEOUT_S", "2700")))
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 
                 # Always call Verilator

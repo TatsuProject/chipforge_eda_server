@@ -14,7 +14,11 @@ services:
     environment:
       - SERVICE_NAME=verilator-simulation
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      # NOT curl: the verilator-api image does not carry it, so the check failed 113
+      # times in a row on a service that was answering /health in 1.4 ms. A health
+      # signal that is always red is a health signal nobody reads.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request as u; u.urlopen('http://localhost:8001/health', timeout=10)"]
       interval: 300s
       timeout: 20s
       retries: 2
@@ -43,7 +47,11 @@ services:
     # volumes:
     #   - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      # NOT curl: the verilator-api image does not carry it, so the check failed 113
+      # times in a row on a service that was answering /health in 1.4 ms. A health
+      # signal that is always red is a health signal nobody reads.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request as u; u.urlopen('http://localhost:8003/health', timeout=10)"]
       interval: 300s
       timeout: 20s
       retries: 2

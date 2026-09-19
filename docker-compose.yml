@@ -13,6 +13,12 @@ services:
       - ./results:/app/results                # unified results path
     environment:
       - SERVICE_NAME=verilator-simulation
+      # The whole timeout chain hangs off this ONE value. Each service kills its job 120s
+      # inside the gateway's ceiling, and the bundle's own stage budgets 60s inside that, so
+      # raising it here raises all of them. Three independent hardcoded ceilings on the same
+      # work is how a healthy 60-minute evaluation was killed at exactly 3600s and reported as
+      # SERVICE_UNAVAILABLE -- which reads as a broken server rather than as a budget.
+      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-2700}
     healthcheck:
       # NOT curl: the verilator-api image does not carry it, so the check failed 113
       # times in a row on a service that was answering /health in 1.4 ms. A health
@@ -38,6 +44,7 @@ services:
       # - ./test_designs/rv32i:/openlane/designs/rv32i
     environment:
       - SERVICE_NAME=openlane-implementation
+      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-2700}
       - PDK_ROOT=/openlane/pdks
       - PDK=sky130A
       - STD_CELL_LIBRARY=sky130_fd_sc_hd

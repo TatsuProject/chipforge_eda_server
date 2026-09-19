@@ -8,6 +8,19 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+
+def _envint(name, default):
+    """An env var that is SET BUT EMPTY is what `NAME=${NAME:-}` in a compose file produces, and
+    int("") raises. Treat empty, missing and unparseable all as absent."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return int(default)
+
+
 app = FastAPI(title="ChipForge Openlane API", version="4.0.0")
 
 # How many synthesis runs may proceed at once.
@@ -22,7 +35,7 @@ app = FastAPI(title="ChipForge Openlane API", version="4.0.0")
 # around 5 GB, so the limit is how many of those the host can hold at once; exceeding it gets a run
 # OOM-killed, which looks like a submission failure and is not one. Sized from the host at import,
 # overridable for a box whose memory profile differs.
-MEM_PER_RUN_MB = int(os.environ.get("OPENLANE_MEM_PER_RUN_MB", "6144"))   # 5 GB peak + headroom
+MEM_PER_RUN_MB = _envint("OPENLANE_MEM_PER_RUN_MB", 6144)   # 5 GB peak + headroom
 
 
 def _synthesis_lanes():
@@ -56,9 +69,34 @@ def _synthesis_lanes():
     return max(1, min(4, by_mem, cpus))
 
 
-OPENLANE_LANES = int(os.environ.get("OPENLANE_LANES", "0")) or _synthesis_lanes()
+OPENLANE_LANES = _envint("OPENLANE_LANES", 0) or _synthesis_lanes()
+
+
+# ---------------------------------------------------------------------------------------------
+# ONE timeout knob, not three.
+#
+# There were three independent hardcoded ceilings on the same piece of work: the gateway waited
+# EDA_REQUEST_TIMEOUT_S for us, we killed the subprocess at 3600, and the bundle's run.py had its
+# own stage budget inside that. Raising the outermost one and believing the job was safe cost a
+# healthy 60-minute evaluation, killed at EXACTLY 3600s and reported as
+# "SERVICE_UNAVAILABLE (system)" -- which reads as a broken server, not as a budget.
+#
+# Now the chain is derived from the gateway's ceiling and each layer is strictly inside the one
+# above it, so raising EDA_REQUEST_TIMEOUT_S raises all of it:
+#
+#   EDA_REQUEST_TIMEOUT_S     the gateway gives up on us here
+#     EVAL_TIMEOUT_S          we kill the job here, 120s earlier, so the error is OURS to explain
+#       run.py stage budgets  60s earlier again, so the stage names itself
+#
+# A service timeout ABOVE the gateway's is not a safety margin, it is dead code: the gateway has
+# already stopped listening.
+GATEWAY_CEILING_S = _envint("EDA_REQUEST_TIMEOUT_S", 2700)
+EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", max(1800, GATEWAY_CEILING_S - 120))
+RUNPY_TIMEOUT_S = max(900, EVAL_TIMEOUT_S - 60)
+
 _openlane_semaphore = asyncio.Semaphore(OPENLANE_LANES)
-print(f"[openlane-api] {OPENLANE_LANES} concurrent synthesis run(s) x {MEM_PER_RUN_MB} MB each",
+print(f"[openlane-api] {OPENLANE_LANES} concurrent synthesis run(s) x {MEM_PER_RUN_MB} MB each; "
+      f"gateway ceiling {GATEWAY_CEILING_S}s -> kill at {EVAL_TIMEOUT_S}s, flow {RUNPY_TIMEOUT_S}s",
       flush=True)
 RESULTS_DIR = Path("/app/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -163,9 +201,12 @@ async def run_openlane(
             # Reserving a lane is only half of it: the reservation has to be enforced inside the
             # run, or a design that grows without bound exhausts the host and the OOM killer picks
             # its victim by footprint rather than by blame -- letting one submission fail another.
-            env = dict(os.environ, NPUV1_SYNTH_MEM_MB=str(MEM_PER_RUN_MB))
+            env = dict(os.environ, NPUV1_SYNTH_MEM_MB=str(MEM_PER_RUN_MB),
+                       NPUV1_OPENLANE_TIMEOUT_S=str(RUNPY_TIMEOUT_S))
             async with _openlane_semaphore:
-                run = await _run_subprocess(cmd, work, timeout=3600, env=env)
+                # The timeout starts AFTER the lane is acquired, so time spent queued
+                # behind another synthesis is not charged to this one.
+                run = await _run_subprocess(cmd, work, timeout=EVAL_TIMEOUT_S, env=env)
                 # Clean up the design copy written into /openlane/designs/ by run.py
                 if openlane_design_copy.exists():
                     shutil.rmtree(openlane_design_copy, ignore_errors=True)

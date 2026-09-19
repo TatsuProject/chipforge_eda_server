@@ -7,6 +7,19 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 import os, tempfile, subprocess, zipfile, shutil, json, asyncio, aiofiles
 
+
+def _envint(name, default):
+    """An env var that is SET BUT EMPTY is what `NAME=${NAME:-}` in a compose file produces, and
+    int("") raises. Treat empty, missing and unparseable all as absent."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return int(default)
+
+
 app = FastAPI(title="ChipForge Verilator API", version="4.0.0")
 
 RESULTS_DIR = Path("/app/results")
@@ -34,11 +47,37 @@ def _cpus():
 
 
 _CPUS = _cpus()
-EVAL_LANES = int(os.environ.get("VERILATOR_EVAL_LANES", "0")) or max(1, min(4, _CPUS // 6))
-FANOUT_PER_EVAL = int(os.environ.get("VERILATOR_FANOUT", "0")) or max(1, (_CPUS - 1) // EVAL_LANES)
+EVAL_LANES = _envint("VERILATOR_EVAL_LANES", 0) or max(1, min(4, _CPUS // 6))
+FANOUT_PER_EVAL = _envint("VERILATOR_FANOUT", 0) or max(1, (_CPUS - 1) // EVAL_LANES)
 _eval_semaphore = asyncio.Semaphore(EVAL_LANES)
+
+
+# ---------------------------------------------------------------------------------------------
+# ONE timeout knob, not three.
+#
+# There were three independent hardcoded ceilings on the same piece of work: the gateway waited
+# EDA_REQUEST_TIMEOUT_S for us, we killed the subprocess at 3600, and the bundle's run.py had its
+# own stage budget inside that. Raising the outermost one and believing the job was safe cost a
+# healthy 60-minute evaluation, killed at EXACTLY 3600s and reported as
+# "SERVICE_UNAVAILABLE (system)" -- which reads as a broken server, not as a budget.
+#
+# Now the chain is derived from the gateway's ceiling and each layer is strictly inside the one
+# above it, so raising EDA_REQUEST_TIMEOUT_S raises all of it:
+#
+#   EDA_REQUEST_TIMEOUT_S     the gateway gives up on us here
+#     EVAL_TIMEOUT_S          we kill the job here, 120s earlier, so the error is OURS to explain
+#       run.py stage budgets  60s earlier again, so the stage names itself
+#
+# A service timeout ABOVE the gateway's is not a safety margin, it is dead code: the gateway has
+# already stopped listening.
+GATEWAY_CEILING_S = _envint("EDA_REQUEST_TIMEOUT_S", 2700)
+EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", max(1800, GATEWAY_CEILING_S - 120))
+RUNPY_TIMEOUT_S = max(900, EVAL_TIMEOUT_S - 60)
+
 print(f"[verilator-api] {_CPUS} cpus -> {EVAL_LANES} concurrent evaluations x {FANOUT_PER_EVAL} "
-      f"jobs each ({EVAL_LANES * FANOUT_PER_EVAL} peak)", flush=True)
+      f"jobs each ({EVAL_LANES * FANOUT_PER_EVAL} peak); gateway ceiling "
+      f"{GATEWAY_CEILING_S}s -> kill at {EVAL_TIMEOUT_S}s, run.py stages {RUNPY_TIMEOUT_S}s",
+      flush=True)
 
 class EvalResponse(BaseModel):
     success: bool
@@ -142,9 +181,13 @@ async def simulate_and_evaluate(
             
             # NPUV1_MAX_PARALLEL is the knob the bundle already honours; the service sets it so
             # the batch is sized against this host's share, not against the whole machine.
-            env = dict(os.environ, NPUV1_MAX_PARALLEL=str(FANOUT_PER_EVAL))
+            # No single simulation may outlive the whole evaluation budget.
+            env = dict(os.environ, NPUV1_MAX_PARALLEL=str(FANOUT_PER_EVAL),
+                       NPUV1_SIM_TIMEOUT_MAX_S=str(RUNPY_TIMEOUT_S))
             async with _eval_semaphore:
-                proc = await _run_subprocess(cmd, tmp, timeout=3600, env=env)
+                # The timeout starts AFTER the lane is acquired, so time spent queued
+                # behind another evaluation is not charged to this one.
+                proc = await _run_subprocess(cmd, tmp, timeout=EVAL_TIMEOUT_S, env=env)
 
             if proc['returncode'] != 0:
                 return EvalResponse(

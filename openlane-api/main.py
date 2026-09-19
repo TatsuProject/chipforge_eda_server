@@ -49,7 +49,10 @@ def _synthesis_lanes():
         cpus = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
         cpus = os.cpu_count() or 2
-    by_mem = max(1, (avail // budget_mb)) if avail else 1
+    # Keep a quarter of what is free in reserve. Filling memory exactly is how a host with four
+    # lanes x 6 GB on 28 GB ends up with nothing left for the page cache, the other service, or a
+    # run that peaks slightly above its ceiling.
+    by_mem = max(1, int(avail * 0.75) // budget_mb) if avail else 1
     return max(1, min(4, by_mem, cpus))
 
 

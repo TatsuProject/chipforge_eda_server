@@ -99,18 +99,38 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets, 
             speedup = (ips / perf_ref) if (ips and perf_ref > 0) else 0.0
         perf_gate = speedup >= min_speedup
         area_total = area_um2 or 0.0
-        passed = bool(func_gate and perf_gate and area_total > 0 and ips)
-        fom = (ips ** alpha) / (area_total ** beta) if passed else 0.0
+        # The FoM is a MEASUREMENT of what was measured, so it is computed whenever the inputs exist
+        # -- NOT only when the gates pass. It used to be zeroed on any gate failure, which threw the
+        # number away: a submission 4% short of the perf gate was told "overall 0.0" and learned
+        # nothing about how close it came or what it would have scored. The verdict is carried by
+        # overall_gate (and by result: ACCEPTED/REJECTED, which reads it), so the number does not
+        # have to carry it too.
+        measurable = bool(area_total > 0 and ips)
+        fom = (ips ** alpha) / (area_total ** beta) if measurable else 0.0
+        passed = bool(func_gate and perf_gate and measurable)
+        overall = round(fom * 1000.0, 4)      # FoM*1000 for readable magnitude; ranking is unaffected
         return {
             "func_score": round((func_0_1 or 0.0) * 100, 2),
             "area_total_um2": round(area_total, 2),
-            "area_scope": "whole_soc: core + accelerator + memory macros, one synthesis (core area is INSIDE area_total)",
+            # Read from the evaluator's own knobs. This used to be a hardcoded "whole_soc: core +
+            # accelerator + memory macros" string, which contradicted openlane_results.area_scope
+            # in the same response the moment the scope changed to npu_only.
+            "area_scope": str(targets.get("area_scope", "unspecified")),
             "speedup_vs_baseline": round(speedup, 3),
+            "min_speedup": min_speedup,
             "perf_gate": perf_gate,
             "functional_gate": func_gate,
-            "overall": round(fom * 1000.0, 4),   # FoM*1000 for readable magnitude; ranking is scale-invariant
+            "overall": overall,
             "fom_raw": fom,
             "overall_gate": passed,
+            # What a validator should weight on. Gating belongs in ONE place, and it is this field
+            # plus overall_gate -- never in the measurement.
+            "overall_gated": overall if passed else 0.0,
+            "overall_note": (
+                "overall is the measured FoM x 1000 whether or not the gates passed, so a rejected "
+                "submission can see how close it was. Weight on overall_gated, which is 0.0 unless "
+                "overall_gate is true. A FoM reported next to functional_gate=false is NOT a score: "
+                "a design that returns wrong answers quickly has a high FoM."),
             "scoring_mode": "fom_realmacro",
         }
 

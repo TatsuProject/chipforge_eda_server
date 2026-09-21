@@ -97,12 +97,31 @@ def _unzip(zippath: Path, dest: Path):
         zf.extractall(dest)
 
 
+# Files that sit beside the VERILATOR run.py and nowhere else. The openlane bundle also contains a
+# run.py, so "the first run.py found" is a coin flip decided by directory iteration order.
+_VERILATOR_MARKERS = ("soc_files.f.in", "model_set.txt")
+
+
 def _find_run_py(root: Path) -> Optional[Path]:
-    # accept run.py anywhere inside the bundle (root or subdir like verilator/run.py)
-    for p in root.rglob("run.py"):
-        if p.is_file():
+    """The verilator run.py, identified by what is next to it rather than by where it is.
+
+    The bundle can arrive pre-sliced by the gateway (run.py at the root) or as the whole evaluator
+    archive (verilator/run.py beside openlane/run.py). rglob returned whichever the filesystem
+    listed first, and when that was openlane's the run died with
+
+        run.py: error: the following arguments are required: --out
+
+    because openlane's script takes --design/--out and this service passes --design/--resources.
+    Observed, not hypothesised. Picking by marker file cannot get it wrong: only the verilator
+    bundle ships soc_files.f.in.
+    """
+    candidates = [p for p in root.rglob("run.py") if p.is_file()]
+    for p in candidates:
+        if any((p.parent / m).exists() for m in _VERILATOR_MARKERS):
             return p
-    return None
+    # No marker anywhere -- fall back to the old behaviour so a malformed bundle still reaches
+    # run.py's own intake check, which names exactly what is missing.
+    return candidates[0] if candidates else None
 
 
 async def _run_subprocess(cmd, cwd, timeout=3600, env=None):

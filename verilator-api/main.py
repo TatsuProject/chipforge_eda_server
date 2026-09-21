@@ -176,7 +176,17 @@ async def simulate_and_evaluate(
             cmd = [
                 "python3", str(run_py),
                 "--design", str(design_dir),
-                "--resources", str(bundle_dir),
+                # The RESOURCES ARE BESIDE run.py, not at the top of whatever was uploaded.
+                #
+                # _find_run_py deliberately accepts run.py in a subdirectory -- its own comment says
+                # "root or subdir like verilator/run.py" -- because the full evaluator archive can
+                # arrive here directly rather than pre-sliced by the gateway. But --resources then
+                # pointed at the extraction root, one level above everything run.py needs, and the
+                # run died at intake with "the evaluator bundle is missing 'soc_files.f.in'".
+                #
+                # Half-tolerant was worse than intolerant: it found the script, then blamed the
+                # bundle. Reported from a real deployment.
+                "--resources", str(run_py.parent),
             ]
             
             # NPUV1_MAX_PARALLEL is the knob the bundle already honours; the service sets it so

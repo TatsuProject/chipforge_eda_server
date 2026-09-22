@@ -209,6 +209,26 @@ async def make_http_request(session: aiohttp.ClientSession, url: str, files_data
 MAX_SUBMISSION_BYTES   = int(os.environ.get("C15_MAX_SUBMISSION_MB", "300")) * 1024 * 1024  # compressed upload cap
 MAX_UNCOMPRESSED_BYTES = int(os.environ.get("C15_MAX_UNCOMPRESSED_MB", "4096")) * 1024 * 1024  # zip-bomb guard
 
+def _as_error(e):
+    """Whatever a service left under `error`, as a structured dict -- or None if there is no error.
+
+    Services are supposed to return {code, category, fault, retryable, message}. Two of them do not
+    always: openlane-api reports unstructured `error_message` on all four of its failure paths, and
+    an aiohttp exception used to be stringified straight into this field. The code below asks every
+    error for .get("fault"), so a bare string was an AttributeError -- which the outer `except`
+    turned into a response with no result and no fault, discarding an evaluation that had already
+    cost most of an hour.
+
+    An error we cannot parse is OURS by default. A service that failed in a way it could not
+    describe is not evidence about the submission."""
+    if isinstance(e, dict):
+        return e or None
+    if e:
+        return {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system",
+                "retryable": True, "message": str(e)}
+    return None
+
+
 def _miner_reject(submission_id, code, category, stage, message, detail=""):
     return JSONResponse({
         "success": True, "submission_id": submission_id, "result": "REJECTED",
@@ -367,7 +387,15 @@ async def evaluate(
                 # Process OpenLane results
                 area_um2, fmax_mhz, power_mw = None, None, None
                 if run_openlane and len(results) > 1:
-                    o_json = results[1] if not isinstance(results[1], Exception) else {"success": False, "error": str(results[1])}
+                    # A structured error, not a bare string. `error` is read below as a dict with
+                    # .get("fault"); putting a string here made that an AttributeError that threw
+                    # away the whole evaluation -- including a verilator arm that had already
+                    # succeeded after fifty minutes.
+                    o_json = results[1] if not isinstance(results[1], Exception) else {
+                        "success": False,
+                        "error": {"code": "SERVICE_UNAVAILABLE", "category": "system",
+                                  "fault": "system", "retryable": True,
+                                  "message": f"openlane-api request failed: {results[1]}"}}
                     if o_json.get("success"):
                         area_um2 = o_json.get("results", {}).get("area_um2")
                         fmax_mhz = o_json.get("results", {}).get("fmax_mhz")
@@ -380,13 +408,23 @@ async def evaluate(
             # not scored, so the validator retries/alerts instead of setting weights. A MINER fault
             # (bad submission / failed gate) -> REJECTED, score 0, with the precise reason surfaced.
             v_res  = v_json.get("results", {}) if isinstance(v_json, dict) else {}
-            v_err  = v_res.get("error") if isinstance(v_res, dict) else None
+            v_err  = _as_error(v_res.get("error") if isinstance(v_res, dict) else None)
             o_res  = o_json.get("results", o_json) if isinstance(o_json, dict) else {}
-            o_err  = o_res.get("error") if isinstance(o_res, dict) else None
+            o_err  = _as_error(o_res.get("error") if isinstance(o_res, dict) else None)
             sys_err = next((e for e in (v_err, o_err) if e and e.get("fault") == "system"), None)
             if v_json.get("success") is False and not v_err:
                 sys_err = sys_err or {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system",
                                       "message": v_json.get("error") or v_json.get("error_message") or "verilator-api failed",
+                                      "retryable": True}
+            # The same guard for openlane, which did not have one. Without it a synthesis container
+            # that OOMed, restarted or timed out in its own queue fell straight through to scoring:
+            # area_um2 stays None, so measurable is False, so the response is REJECTED with
+            # overall_gated 0.0 and `scored` true -- our infrastructure failure, charged to the miner
+            # as a rejection. openlane-api returns unstructured error_message on every one of its
+            # failure paths, so this is the ONLY thing standing between that and a zero.
+            if isinstance(o_json, dict) and o_json.get("success") is False and not o_err:
+                sys_err = sys_err or {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system",
+                                      "message": o_json.get("error") or o_json.get("error_message") or "openlane-api failed",
                                       "retryable": True}
             if func_score is None and not sys_err:
                 sys_err = {"code": "INTERNAL_ERROR", "category": "system", "fault": "system",

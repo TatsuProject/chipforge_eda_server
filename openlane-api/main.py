@@ -69,7 +69,16 @@ def _synthesis_lanes():
     return max(1, min(4, by_mem, cpus))
 
 
-OPENLANE_LANES = _envint("OPENLANE_LANES", 0) or _synthesis_lanes()
+# Lanes from capacity.py, not from MemAvailable. _synthesis_lanes() above read MemAvailable, which
+# includes reclaimable page cache and moves between runs -- the live banner said 2 lanes at one start
+# and 3 at the next on the same box. capacity.plan() reads MemTotal and the PHYSICAL core count,
+# reserves 8 GB per lane, and leaves the rest of the cores to simulation, so the two services agree
+# on a split whose sum is the machine rather than each taking the whole box. _synthesis_lanes() is
+# kept for reference and no longer consulted.
+from capacity import plan as _capacity_plan
+import collections
+_PLAN = _capacity_plan("synth")
+OPENLANE_LANES = _envint("OPENLANE_LANES", 0) or _PLAN["L"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -95,6 +104,16 @@ EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", max(1800, GATEWAY_CEILING_S - 120))
 RUNPY_TIMEOUT_S = max(900, EVAL_TIMEOUT_S - 60)
 
 _openlane_semaphore = asyncio.Semaphore(OPENLANE_LANES)
+# One physical core (both SMT siblings) per lane, fastest first, handed to a synthesis when it is
+# spawned and returned when it exits. yosys and ABC are single-threaded, so a lane can never use
+# more than one core; pinning it there keeps the ten simulations from time-slicing the one process
+# that is the critical path of every accelerated group. Measured: ABC took ~19 min on an idle core
+# and 38-52 min beside ten simulations. Empty when the topology is not exposed -> no pinning.
+_synth_cores = collections.deque(frozenset(c) for c in _PLAN["synth_cores"][:OPENLANE_LANES])
+print(f"[openlane-api] P={_PLAN['P']} physical (of {_PLAN['logical']} logical, quota={_PLAN['quota']}) "
+      f"-> L={OPENLANE_LANES} synthesis lanes pinned to {[sorted(c) for c in _synth_cores] or 'nothing (no topology)'}, "
+      f"S={_PLAN['S']} left for simulation"
+      + (f"; WARN {'; '.join(_PLAN['warn'])}" if _PLAN['warn'] else ""), flush=True)
 print(f"[openlane-api] {OPENLANE_LANES} concurrent synthesis run(s) x {MEM_PER_RUN_MB} MB each; "
       f"gateway ceiling {GATEWAY_CEILING_S}s -> kill at {EVAL_TIMEOUT_S}s, flow {RUNPY_TIMEOUT_S}s",
       flush=True)
@@ -126,14 +145,47 @@ def _find_run_py(bundle_dir: Path) -> Optional[Path]:
             return p
     return None
 
+def _child_setup(cpus):
+    """Runs in the child between fork and exec, so everything it sets is inherited by run.py, tclsh,
+    yosys and yosys-abc. Two things:
+      - oom_score_adj 1000: if memory does run out, the kernel takes this job and never the service.
+      - CPU affinity to one physical core when a lane has one: the pin that gives ABC its core back."""
+    def _f():
+        try:
+            with open("/proc/self/oom_score_adj", "w") as f:
+                f.write("1000")
+        except OSError:
+            pass
+        if cpus:
+            try:
+                os.sched_setaffinity(0, cpus)
+            except (AttributeError, OSError):
+                pass
+    return _f
+
+
 async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
-    """Run subprocess asynchronously"""
+    """Run subprocess asynchronously, on a pinned core when one is free.
+
+    Called only from inside the lane semaphore, and the core pool has exactly OPENLANE_LANES entries,
+    so a pop here cannot fail while the pool is non-empty; it is returned in the finally. Single
+    event loop, no await between the pop and the spawn."""
+    cpus = _synth_cores.popleft() if _synth_cores else None
+    try:
+        return await _run_subprocess_pinned(cmd, cwd, timeout, env, cpus)
+    finally:
+        if cpus is not None:
+            _synth_cores.append(cpus)
+
+
+async def _run_subprocess_pinned(cmd, cwd, timeout, env, cpus):
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
         env=env,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        preexec_fn=_child_setup(cpus),
     )
     
     try:

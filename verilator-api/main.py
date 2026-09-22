@@ -47,8 +47,22 @@ def _cpus():
 
 
 _CPUS = _cpus()
-EVAL_LANES = _envint("VERILATOR_EVAL_LANES", 0) or max(1, min(4, _CPUS // 6))
-FANOUT_PER_EVAL = _envint("VERILATOR_FANOUT", 0) or max(1, (_CPUS - 1) // EVAL_LANES)
+# S simulation slots from capacity.py: physical cores minus the synthesis lanes openlane-api will
+# take, on the same rule, so the two services' sum is the machine. This replaces
+#     EVAL_LANES = min(4, cpus // 6)  and  FANOUT = (cpus - 1) // EVAL_LANES
+# which read LOGICAL cpus (12 here for 10 physical cores), had no memory term, and had nothing
+# recorded behind the 6. On this box that was 2 x 5 = 10 simulations beside 2-3 syntheses: thirteen
+# single-threaded processes on ten cores, and ABC -- the critical path of every accelerated group --
+# measured at 38-52 min contended against ~19 min alone.
+#
+# The lanes x fanout grid is kept for now (a per-request admission allocator is the next step);
+# lanes are chosen so fanout lands near 4, which keeps longest-first scheduling effective inside an
+# evaluation while leaving room for a second one.
+from capacity import plan as _capacity_plan
+_PLAN = _capacity_plan("sim")
+SIM_SLOTS = _PLAN["S"]
+EVAL_LANES = _envint("VERILATOR_EVAL_LANES", 0) or max(1, min(4, SIM_SLOTS // 3))
+FANOUT_PER_EVAL = _envint("VERILATOR_FANOUT", 0) or max(1, SIM_SLOTS // EVAL_LANES)
 _eval_semaphore = asyncio.Semaphore(EVAL_LANES)
 
 
@@ -74,6 +88,9 @@ GATEWAY_CEILING_S = _envint("EDA_REQUEST_TIMEOUT_S", 2700)
 EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", max(1800, GATEWAY_CEILING_S - 120))
 RUNPY_TIMEOUT_S = max(900, EVAL_TIMEOUT_S - 60)
 
+print(f"[verilator-api] P={_PLAN['P']} physical (of {_PLAN['logical']} logical, quota={_PLAN['quota']}) "
+      f"-> S={SIM_SLOTS} simulation slots (L={_PLAN['L']} reserved for synthesis)"
+      + (f"; WARN {'; '.join(_PLAN['warn'])}" if _PLAN['warn'] else ""), flush=True)
 print(f"[verilator-api] {_CPUS} cpus -> {EVAL_LANES} concurrent evaluations x {FANOUT_PER_EVAL} "
       f"jobs each ({EVAL_LANES * FANOUT_PER_EVAL} peak); gateway ceiling "
       f"{GATEWAY_CEILING_S}s -> kill at {EVAL_TIMEOUT_S}s, run.py stages {RUNPY_TIMEOUT_S}s",
@@ -124,6 +141,16 @@ def _find_run_py(root: Path) -> Optional[Path]:
     return candidates[0] if candidates else None
 
 
+def _child_setup():
+    """Between fork and exec, inherited by run.py and every simulation and g++ it starts: if memory
+    runs out the kernel takes a job, never the service."""
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except OSError:
+        pass
+
+
 async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
     """Run subprocess asynchronously"""
     process = await asyncio.create_subprocess_exec(
@@ -131,7 +158,8 @@ async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
         cwd=cwd,
         env=env,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        preexec_fn=_child_setup,
     )
     
     try:

@@ -6,8 +6,10 @@ services:
       context: ./verilator-api
       dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "8001:8001"
+    # NOT published. The gateway reaches this service by compose DNS (gateway/main.py names
+    # verilator-api:8001); publishing it too meant /simulate_and_evaluate was reachable from
+    # outside with no gateway and no auth, on a service that executes run.py from the uploaded
+    # evaluator zip as root. Audit 2026-09-23.
     volumes:
       - ./shared:/shared
       - ./results:/app/results                # unified results path
@@ -49,8 +51,10 @@ services:
       context: ./openlane-api
       dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "8003:8003"
+    # NOT published. The gateway reaches this service by compose DNS (gateway/main.py names
+    # verilator-api:8003); publishing it too meant /simulate_and_evaluate was reachable from
+    # outside with no gateway and no auth, on a service that executes run.py from the uploaded
+    # evaluator zip as root. Audit 2026-09-23.
     volumes:
       - ./shared:/shared
       - ./results:/app/results                # unified results path

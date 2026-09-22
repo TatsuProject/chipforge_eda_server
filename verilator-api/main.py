@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from pathlib import Path
-import os, tempfile, subprocess, zipfile, shutil, json, asyncio, aiofiles
+import os, signal, tempfile, subprocess, zipfile, shutil, json, asyncio, aiofiles
 
 
 def _envint(name, default):
@@ -20,7 +20,8 @@ def _envint(name, default):
         return int(default)
 
 
-app = FastAPI(title="ChipForge Verilator API", version="4.0.0")
+app = FastAPI(title="ChipForge Verilator API", version="4.0.0",
+              docs_url=None, redoc_url=None, openapi_url=None)  # no free schema for a scanner
 
 RESULTS_DIR = Path("/app/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -159,6 +160,7 @@ async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,   # its own process group: a timeout kills the TREE, not the parent
         preexec_fn=_child_setup,
     )
     
@@ -171,8 +173,14 @@ async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
             'stdout': stdout.decode('utf-8') if stdout else '',
             'stderr': stderr.decode('utf-8') if stderr else ''
         }
-    except asyncio.TimeoutError:
-        process.kill()
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # Kill the GROUP. process.kill() reached only the direct child -- run.py, or tclsh -- and
+        # left every simulation, yosys and yosys-abc it had started running on, holding the cores
+        # after the lane that owned them had already been released to the next request.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
         await process.wait()
         raise subprocess.TimeoutExpired(cmd, timeout)
 

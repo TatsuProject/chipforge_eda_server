@@ -4,7 +4,30 @@ from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import secrets
-app = FastAPI(title="ChipForge EDA Tools Gateway", version="5.0.0")
+# THE SHARED SECRET. There was a comment saying "EDA_API_KEY comes from .env" and no code anywhere
+# that read it. The gateway accepts an evaluator zip from the caller and verilator-api executes the
+# run.py inside it as root, so an open :8080 is remote code execution for anyone who can reach it.
+#
+# If EDA_API_KEY is set, every /evaluate must carry it in X-API-Key, compared in constant time. If it
+# is NOT set the gateway still serves -- with a loud warning at startup -- because the subnet team is
+# mid-integration and a silent refusal would read as a broken server. Fail-closed is the go-live
+# setting: set the variable. Audit 2026-09-23.
+import os
+import secrets as _secrets
+from fastapi import Header, HTTPException, Depends
+_API_KEY = (os.environ.get("EDA_API_KEY") or "").strip()
+if not _API_KEY:
+    print("[gateway] WARNING: EDA_API_KEY is not set. /evaluate is UNAUTHENTICATED. Set it before "
+          "exposing this port to anything but the validator.", flush=True)
+
+
+async def require_api_key(x_api_key: str = Header(default=None)):
+    if _API_KEY and not (x_api_key and _secrets.compare_digest(x_api_key, _API_KEY)):
+        raise HTTPException(status_code=401, detail="missing or wrong X-API-Key")
+
+
+app = FastAPI(title="ChipForge EDA Tools Gateway", version="5.0.0",
+              docs_url=None, redoc_url=None, openapi_url=None)  # no free schema for a scanner
 
 # Service URLs (must match docker-compose ports)
 VERILATOR_API = "http://verilator-api:8001/simulate_and_evaluate"
@@ -200,6 +223,16 @@ async def make_http_request(session: aiohttp.ClientSession, url: str, files_data
             data.add_field(field_name, open(value, 'rb'), filename=value.name)
     
     async with session.post(url, data=data) as response:
+        # The status was never read. A routed 404/405/422 -- a wrong path, a renamed field, a
+        # validation error from FastAPI itself -- carries a JSON body, which came back here as the
+        # service's "response" and was then classified by the miner-or-system rules as if it were an
+        # evaluation. It is neither: it is the request never having run. Ours, retryable.
+        if response.status != 200:
+            body = (await response.text())[:400]
+            return {"success": False,
+                    "error": {"code": "SERVICE_HTTP_%d" % response.status, "category": "system",
+                              "fault": "system", "retryable": True,
+                              "message": f"{url} answered HTTP {response.status}: {body}"}}
         return await response.json()
 
 
@@ -273,7 +306,7 @@ def _zip_problem(path):
 # -------------------------------
 # Endpoint
 # -------------------------------
-@app.post("/evaluate")
+@app.post("/evaluate", dependencies=[Depends(require_api_key)])
 async def evaluate(
     design_zip: UploadFile = File(..., description="This is miner's submission"),
     evaluator_zip: UploadFile = File(..., description="Testcases downloaded when the challenge started"),
@@ -412,7 +445,7 @@ async def evaluate(
             o_res  = o_json.get("results", o_json) if isinstance(o_json, dict) else {}
             o_err  = _as_error(o_res.get("error") if isinstance(o_res, dict) else None)
             sys_err = next((e for e in (v_err, o_err) if e and e.get("fault") == "system"), None)
-            if v_json.get("success") is False and not v_err:
+            if v_json.get("success") is not True and not v_err:
                 sys_err = sys_err or {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system",
                                       "message": v_json.get("error") or v_json.get("error_message") or "verilator-api failed",
                                       "retryable": True}
@@ -422,7 +455,7 @@ async def evaluate(
             # overall_gated 0.0 and `scored` true -- our infrastructure failure, charged to the miner
             # as a rejection. openlane-api returns unstructured error_message on every one of its
             # failure paths, so this is the ONLY thing standing between that and a zero.
-            if isinstance(o_json, dict) and o_json.get("success") is False and not o_err:
+            if isinstance(o_json, dict) and o_json.get("success") is not True and not o_err:
                 sys_err = sys_err or {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system",
                                       "message": o_json.get("error") or o_json.get("error_message") or "openlane-api failed",
                                       "retryable": True}

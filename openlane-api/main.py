@@ -1,6 +1,6 @@
 # openlane-api/main.py
 
-import os, json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles, uuid
+import os, signal, json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles, uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -21,7 +21,8 @@ def _envint(name, default):
         return int(default)
 
 
-app = FastAPI(title="ChipForge Openlane API", version="4.0.0")
+app = FastAPI(title="ChipForge Openlane API", version="4.0.0",
+              docs_url=None, redoc_url=None, openapi_url=None)  # no free schema for a scanner
 
 # How many synthesis runs may proceed at once.
 #
@@ -185,6 +186,7 @@ async def _run_subprocess_pinned(cmd, cwd, timeout, env, cpus):
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,   # its own process group: a timeout kills the TREE, not the parent
         preexec_fn=_child_setup(cpus),
     )
     
@@ -197,8 +199,14 @@ async def _run_subprocess_pinned(cmd, cwd, timeout, env, cpus):
             'stdout': stdout.decode('utf-8') if stdout else '',
             'stderr': stderr.decode('utf-8') if stderr else ''
         }
-    except asyncio.TimeoutError:
-        process.kill()
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # Kill the GROUP. process.kill() reached only the direct child -- run.py, or tclsh -- and
+        # left every simulation, yosys and yosys-abc it had started running on, holding the cores
+        # after the lane that owned them had already been released to the next request.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
         await process.wait()
         raise subprocess.TimeoutExpired(cmd, timeout)
 

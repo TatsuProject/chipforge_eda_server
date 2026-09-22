@@ -18,7 +18,21 @@ services:
       # raising it here raises all of them. Three independent hardcoded ceilings on the same
       # work is how a healthy 60-minute evaluation was killed at exactly 3600s and reported as
       # SERVICE_UNAVAILABLE -- which reads as a broken server rather than as a budget.
-      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-2700}
+      # 7200, not 2700. The old default was BELOW the measured wall clock: two concurrent
+      # evaluations of the scored four take 52m08s and 56m57s on a 12-core box, so a 45-minute
+      # ceiling cuts a healthy run and reports it as a broken server. That has already happened
+      # once, at exactly 2701 s.
+      #
+      # It has to be the DEFAULT rather than something an operator exports, because the exported
+      # value lives only in the shell that created the containers. 2026-09-22: the docker daemon
+      # restarted, every container came back on the compose default, and the six-hour ceiling
+      # someone had set was silently gone. A timeout that survives only until the next daemon
+      # restart is not a configuration, it is a coincidence.
+      #
+      # The whole chain derives from this one number (service kill at -120 s, run.py stages at
+      # -180 s), so raising it raises all of them. A generous ceiling costs nothing when things
+      # work: what judges a bad design is the testbench's 2-billion-cycle cap, not wall clock.
+      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-7200}
     healthcheck:
       # NOT curl: the verilator-api image does not carry it, so the check failed 113
       # times in a row on a service that was answering /health in 1.4 ms. A health
@@ -44,7 +58,7 @@ services:
       # - ./test_designs/rv32i:/openlane/designs/rv32i
     environment:
       - SERVICE_NAME=openlane-implementation
-      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-2700}
+      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-7200}
       - PDK_ROOT=/openlane/pdks
       - PDK=sky130A
       - STD_CELL_LIBRARY=sky130_fd_sc_hd
@@ -83,7 +97,7 @@ services:
       # How long to wait for both services. Raise it when a validator runs several evaluations at
       # once: openlane-api serialises synthesis behind a Semaphore(1), so concurrent requests queue
       # their synthesis end to end rather than overlapping.
-      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-2700}
+      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-7200}
       # EDA_API_KEY comes from .env
 
 # Named volumes not needed if you standardize on ./results (remove clutter)

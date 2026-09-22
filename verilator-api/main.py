@@ -248,6 +248,17 @@ async def simulate_and_evaluate(
             #         # rewrite in payload for convenience
             #         details["results_zip"] = results_zip_path
 
+            # A SUCCESSFUL run's stderr was being thrown away -- only the two failure branches
+            # above keep it. So the one case worth understanding operationally, a healthy evaluation
+            # that took 52 minutes, left no record of where those minutes went. run.py now measures
+            # itself and puts the answer in details.timings; print a compact line so it is in
+            # `docker logs` too, where someone watching a slow queue will actually look.
+            _tm = ((payload or {}).get("details") or {}).get("timings") or {}
+            if _tm:
+                print(f"[verilator-api] {submission_id} ok in {_tm.get('total_s')}s  "
+                      + "  ".join(f"{k}={v}s" for k, v in _tm.items() if not k.endswith("_s"))
+                      + f"  unaccounted={_tm.get('unaccounted_s')}s", flush=True)
+
             return EvalResponse(
                 success=True,
                 results=payload,

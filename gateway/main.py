@@ -133,7 +133,20 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets, 
         # overall_gate (and by result: ACCEPTED/REJECTED, which reads it), so the number does not
         # have to carry it too.
         measurable = bool(area_total > 0 and ips)
-        fom = (ips ** alpha) / (area_total ** beta) if measurable else 0.0
+        # THE NUMERATOR IS WHAT THE ACCELERATOR ADDS, not the whole SoC's throughput.
+        #
+        # area_scope is npu_only, so the denominator prices the accelerator alone -- but raw IPS in
+        # the numerator is the whole SoC's speed, most of which the CPU delivers with no accelerator
+        # at all. So a do-nothing npu paid almost no area and collected the baseline's IPS for free:
+        # measured, the inert stub (2,613 um2, 1.000x) scored 90.80 and the real 16x16 accelerator
+        # (4.99 M um2, 1.949x) scored 15.02. The gate hid it, because a stub cannot reach 2x -- but
+        # the number read as a ranking and ranked backwards.
+        #
+        # ips_gain = ips - ips_baseline = ips x (1 - 1/speedup). A design that adds nothing scores
+        # exactly zero; the ranking among designs that DO accelerate still trades throughput against
+        # area at the same alpha and beta. Decided 2026-09-23 before the npu-v1.0 launch.
+        ips_gain = ips * (1.0 - 1.0 / speedup) if (measurable and speedup > 1.0) else 0.0
+        fom = (ips_gain ** alpha) / (area_total ** beta) if ips_gain > 0 else 0.0
         passed = bool(func_gate and perf_gate and measurable)
         overall = round(fom * 1000.0, 4)      # FoM*1000 for readable magnitude; ranking is unaffected
         return {

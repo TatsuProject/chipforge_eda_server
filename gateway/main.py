@@ -120,6 +120,10 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets, 
             speedup = float(csg) * (fmax_mhz / base_fmax)
         else:
             speedup = (ips / perf_ref) if (ips and perf_ref > 0) else 0.0
+        # Round ONCE, then gate on the rounded value. The response reports speedup to 3 decimals, so
+        # gating on the raw float could return "speedup 2.0, min_speedup 2.0, REJECTED" for a design
+        # at 1.9996 -- a verdict the miner cannot reconcile with the numbers they were shown.
+        speedup = round(speedup, 3)
         perf_gate = speedup >= min_speedup
         area_total = area_um2 or 0.0
         # The FoM is a MEASUREMENT of what was measured, so it is computed whenever the inputs exist
@@ -358,11 +362,22 @@ async def evaluate(
             _rezip(openlane_dir, openlane_bundle)
 
             # weights + targets
-            weights, targets = {}, {}
-            if (gateway_dir / "weights.json").exists():
-                cfg = json.loads((gateway_dir / "weights.json").read_text())
+            # FAIL CLOSED. With weights.json absent this used to fall through to the legacy path with
+            # overall_threshold 0.0 and no gates, and score EVERYTHING ACCEPTED -- including a design
+            # returning wrong answers (the audit's refuter executed it: ACCEPTED at 50.0 and at 5.0).
+            # Every evaluator bundle that has ever shipped carries this file, legacy ones included,
+            # so its absence is a broken bundle, never a scoring mode.
+            wj = gateway_dir / "weights.json"
+            try:
+                cfg = json.loads(wj.read_text())
                 weights = cfg.get("weights", {})
                 targets = cfg.get("targets", {})
+                if not isinstance(weights, dict) or not isinstance(targets, dict):
+                    raise ValueError("weights/targets are not objects")
+            except (OSError, ValueError) as e:
+                return _system_error(submission_id, "EVALUATOR_BUNDLE_MALFORMED", "intake",
+                                     "Internal: the evaluator bundle's gateway/weights.json is missing or "
+                                     "unreadable, so the submission cannot be scored.", str(e))
 
             # Use aiohttp session for parallel requests
             submission_files = {

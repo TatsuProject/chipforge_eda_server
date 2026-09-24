@@ -96,10 +96,12 @@ chipforge_eda_server/
 
 ---
 
-## GUI Usage
-- After running `make start`, open your browser and go to [http://localhost:8080/docs](http://localhost:8080/docs)
-- In the GUI, for `/evaluate`, click "Browse..." and select both your design ZIP (`test_designs/adder.zip`) and evaluator ZIP (`test_designs/adder_evaluator.zip`)
-- Click "Execute" to run the evaluation and see results below
+## Command-line Usage
+```sh
+curl -X POST http://localhost:8080/evaluate \
+     -F "design_zip=@design.zip" -F "evaluator_zip=@evaluator.zip" -F "submission_id=my_run"
+# add  -H "X-API-Key: $EDA_API_KEY"  if the server sets EDA_API_KEY (see Security below)
+```
 
 ---
 
@@ -119,10 +121,35 @@ chipforge_eda_server/
 ---
 
 ## API Usage
-- **Gateway Docs**: [http://localhost:8080/docs](http://localhost:8080/docs)
-- **Main Evaluation Endpoint**:  `POST /evaluate` with ZIP files
-- **Verilator API**: Accessible at [http://localhost:8001](http://localhost:8001)
-- **OpenLane API**: Accessible at [http://localhost:8003](http://localhost:8003)
+- **Main Evaluation Endpoint**: `POST /evaluate` on port 8080, with the design and evaluator ZIPs.
+- The gateway is the only published port. verilator-api (8001) and openlane-api (8003) are reachable
+  only on the internal Docker network. The interactive `/docs` page is disabled.
+
+---
+
+## Security
+
+The code is open source; what needs protecting is a **running** server. `/evaluate` accepts an
+evaluator ZIP from the caller and executes the `run.py` inside it, so anyone who can reach port 8080
+can run code on that machine. Every operator (miner or validator) runs their own server and protects
+their own.
+
+- **Recommended:** do not expose port 8080 to the internet. Allow it only from the machine that
+  sends evaluations (localhost, or an AWS security group limited to the validator).
+- **If 8080 must be reachable from outside:** set `EDA_API_KEY` to a long random value of your own
+  choosing (e.g. `openssl rand -hex 32`) in `.env`. Every request must then send it in the
+  `X-API-Key` header. There is no shared or published key.
+- If `EDA_API_KEY` is unset, the server works as before and logs a warning at startup. That is fine
+  for a miner testing locally.
+
+## Time limits
+
+| setting | default | what it means |
+|---|---|---|
+| `EVAL_TIMEOUT_S` | 2700 (45 min) | Run-time limit per evaluation, counted after it leaves the queue. Exceeding it is `EVALUATION_TIMEOUT`, fault `miner`, not retryable. |
+| `EDA_REQUEST_TIMEOUT_S` | 14400 (4 h) | Gateway ceiling on queue + run. Only a backstop for a long queue; exceeding it is fault `system`, retryable. |
+
+Every failure is returned in one shape: `error{code, category, fault, retryable, stage, message}`.
 
 ---
 
@@ -148,7 +175,6 @@ with open(design_zip, "rb") as d, open(evaluator_zip, "rb") as e:
 
 ## Testing & Validation
 - Run `make test` to verify simulation from the terminal.
-- Use the GUI ([http://localhost:8080/docs](http://localhost:8080/docs)) for interactive testing.
 
 ---
 

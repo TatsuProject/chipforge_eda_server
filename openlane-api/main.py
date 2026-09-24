@@ -305,8 +305,23 @@ async def run_openlane(
                 logs=run['stderr']
             )
 
+# A TIMEOUT IS REPORTED AS ONE. It used to fall into the generic `except Exception`, which stringified
+# subprocess.TimeoutExpired -- "Command '['python3', '/tmp/<dir>/run.py', ...]' timed out after N
+# seconds" -- so the validator got an internal path and a command line, and the gateway then labelled
+# it SERVICE_UNAVAILABLE. Now: code EVALUATION_TIMEOUT, fault system, retryable, the stage, and how
+# long it ran. Nothing internal.
+    except subprocess.TimeoutExpired:
+        return RunResponse(success=False, results={"error": {
+            "code": "EVALUATION_TIMEOUT", "category": "system", "fault": "system", "retryable": True,
+            "stage": "synthesis",
+            "message": (f"Synthesis did not finish within {EVAL_TIMEOUT_S} s, the openlane-api budget "
+                        f"inside EDA_REQUEST_TIMEOUT_S={GATEWAY_CEILING_S}. This is the evaluator's time "
+                        "limit, not a property of the submission; retry.")}})
     except Exception as e:
-        return RunResponse(success=False, error_message=str(e))
+        return RunResponse(success=False, results={"error": {
+            "code": "INTERNAL_ERROR", "category": "system", "fault": "system", "retryable": True,
+            "stage": "synthesis",
+            "message": f"openlane-api failed internally: {type(e).__name__}. Not a property of the submission; retry."}})
 
 @app.get("/download_results")
 async def download_results():

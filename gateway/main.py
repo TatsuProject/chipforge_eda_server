@@ -259,6 +259,36 @@ async def make_http_request(session: aiohttp.ClientSession, url: str, files_data
 MAX_SUBMISSION_BYTES   = int(os.environ.get("C15_MAX_SUBMISSION_MB", "300")) * 1024 * 1024  # compressed upload cap
 MAX_UNCOMPRESSED_BYTES = int(os.environ.get("C15_MAX_UNCOMPRESSED_MB", "4096")) * 1024 * 1024  # zip-bomb guard
 
+_REQUEST_TIMEOUT_S = int(os.environ.get("EDA_REQUEST_TIMEOUT_S", "2700"))
+
+
+def _arm_exception(exc, stage, service):
+    """What asyncio.gather handed back for one arm, as a structured error.
+
+    The gateway's own clock (EDA_REQUEST_TIMEOUT_S) surfaces here as asyncio.TimeoutError, whose str()
+    is EMPTY -- so it used to become "verilator-api failed" under SERVICE_UNAVAILABLE, and an operator
+    could not tell a timeout from a crashed service."""
+    if isinstance(exc, asyncio.TimeoutError):
+        return {"code": "EVALUATION_TIMEOUT", "category": "system", "fault": "system", "retryable": True,
+                "stage": stage,
+                "message": (f"No answer from {service} within EDA_REQUEST_TIMEOUT_S={_REQUEST_TIMEOUT_S} s. "
+                            "This is the evaluator's time limit, not a property of the submission; retry.")}
+    return {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system", "retryable": True,
+            "stage": stage,
+            "message": f"Request to {service} failed: {type(exc).__name__}. Not a property of the submission; retry."}
+
+
+def _trim_logs(service_json, keep=2000):
+    """Service responses can carry whole evaluator logs. On an error the tail is what matters, and a
+    multi-megabyte response is its own problem for a validator."""
+    if isinstance(service_json, dict):
+        for k in ("evaluator_log", "logs"):
+            v = service_json.get(k)
+            if isinstance(v, str) and len(v) > keep:
+                service_json[k] = "...[truncated]...\n" + v[-keep:]
+    return service_json
+
+
 def _as_error(e):
     """Whatever a service left under `error`, as a structured dict -- or None if there is no error.
 
@@ -435,7 +465,8 @@ async def evaluate(
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
                 # Process Verilator results
-                v_json = results[0] if not isinstance(results[0], Exception) else {"success": False, "error": str(results[0])}
+                v_json = results[0] if not isinstance(results[0], BaseException) else {
+                    "success": False, "results": {"error": _arm_exception(results[0], "simulation", "verilator-api")}}
                 
                 func_score = 0.0
                 ipc, fmax_mhz, ips = None, None, None
@@ -452,11 +483,8 @@ async def evaluate(
                     # .get("fault"); putting a string here made that an AttributeError that threw
                     # away the whole evaluation -- including a verilator arm that had already
                     # succeeded after fifty minutes.
-                    o_json = results[1] if not isinstance(results[1], Exception) else {
-                        "success": False,
-                        "error": {"code": "SERVICE_UNAVAILABLE", "category": "system",
-                                  "fault": "system", "retryable": True,
-                                  "message": f"openlane-api request failed: {results[1]}"}}
+                    o_json = results[1] if not isinstance(results[1], BaseException) else {
+                        "success": False, "results": {"error": _arm_exception(results[1], "synthesis", "openlane-api")}}
                     if o_json.get("success"):
                         area_um2 = o_json.get("results", {}).get("area_um2")
                         fmax_mhz = o_json.get("results", {}).get("fmax_mhz")
@@ -475,8 +503,8 @@ async def evaluate(
             sys_err = next((e for e in (v_err, o_err) if e and e.get("fault") == "system"), None)
             if v_json.get("success") is not True and not v_err:
                 sys_err = sys_err or {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system",
-                                      "message": v_json.get("error") or v_json.get("error_message") or "verilator-api failed",
-                                      "retryable": True}
+                                      "stage": "simulation", "retryable": True,
+                                      "message": v_json.get("error_message") or "verilator-api returned no result"}
             # The same guard for openlane, which did not have one. Without it a synthesis container
             # that OOMed, restarted or timed out in its own queue fell straight through to scoring:
             # area_um2 stays None, so measurable is False, so the response is REJECTED with
@@ -485,14 +513,14 @@ async def evaluate(
             # failure paths, so this is the ONLY thing standing between that and a zero.
             if isinstance(o_json, dict) and o_json.get("success") is not True and not o_err:
                 sys_err = sys_err or {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system",
-                                      "message": o_json.get("error") or o_json.get("error_message") or "openlane-api failed",
-                                      "retryable": True}
+                                      "stage": "synthesis", "retryable": True,
+                                      "message": o_json.get("error_message") or "openlane-api returned no result"}
             if func_score is None and not sys_err:
                 sys_err = {"code": "INTERNAL_ERROR", "category": "system", "fault": "system",
                            "message": "evaluator returned no functionality score", "retryable": True}
             if sys_err:
                 return {"success": False, "submission_id": submission_id, "result": "ERROR",
-                        "error": sys_err, "verilator_results": v_json, "openlane_results": o_json,
+                        "error": sys_err, "verilator_results": _trim_logs(v_json), "openlane_results": _trim_logs(o_json),
                         "weights": weights, "targets": targets,
                         "final_score": {"overall": None, "overall_gate": False, "scored": False}}
             miner_err = next((e for e in (v_err, o_err) if e and e.get("fault") == "miner"), None)
@@ -537,8 +565,12 @@ async def evaluate(
             return resp
 
     except Exception as e:
-        return {
-            "success": False, 
-            "submission_id": submission_id if 'submission_id' in locals() else "",
-            "error_message": str(e)
-        }
+        # Same envelope as every other error. This used to return {"success", "error_message"} only --
+        # no result, no code, no fault, no retryable -- so a validator could not tell whether to retry.
+        return {"success": False,
+                "submission_id": submission_id if 'submission_id' in locals() else "",
+                "result": "ERROR",
+                "error": {"code": "INTERNAL_ERROR", "category": "system", "fault": "system", "retryable": True,
+                          "stage": "gateway",
+                          "message": f"The gateway failed internally: {type(e).__name__}. Not a property of the submission; retry."},
+                "final_score": {"overall": None, "overall_gate": False, "scored": False}}

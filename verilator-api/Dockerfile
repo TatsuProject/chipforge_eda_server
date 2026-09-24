@@ -22,9 +22,12 @@ RUN apt-get update && apt-get install -y \
 # Install Verilator from source
 # ----------------------------
 WORKDIR /tmp
+# Pinned to the exact revision EXPECTED.json was measured on. `stable` moves: the PC built 5.052 while
+# this box ran 5.046, so two servers built a week apart were not running the same simulator.
+ARG VERILATOR_REV=1264184fbbf44bbab9f41f9b83fbc5f04e291dc5
 RUN git clone https://github.com/verilator/verilator \
     && cd verilator \
-    && git checkout stable \
+    && git checkout "$VERILATOR_REV" \
     && autoconf \
     && ./configure \
     && make -j"$(nproc)" \

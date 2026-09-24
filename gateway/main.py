@@ -259,7 +259,7 @@ async def make_http_request(session: aiohttp.ClientSession, url: str, files_data
 MAX_SUBMISSION_BYTES   = int(os.environ.get("C15_MAX_SUBMISSION_MB", "300")) * 1024 * 1024  # compressed upload cap
 MAX_UNCOMPRESSED_BYTES = int(os.environ.get("C15_MAX_UNCOMPRESSED_MB", "4096")) * 1024 * 1024  # zip-bomb guard
 
-_REQUEST_TIMEOUT_S = int(os.environ.get("EDA_REQUEST_TIMEOUT_S", "2700"))
+_REQUEST_TIMEOUT_S = int(os.environ.get("EDA_REQUEST_TIMEOUT_S", "14400"))
 
 
 def _arm_exception(exc, stage, service):
@@ -439,7 +439,7 @@ async def evaluate(
             # with the submitted design, and openlane-api serialises synthesis behind a
             # Semaphore(1), so N concurrent evaluations queue N synthesis runs end to end. A box
             # taking four at once needs a different ceiling than one taking them singly.
-            timeout = aiohttp.ClientTimeout(total=int(os.environ.get("EDA_REQUEST_TIMEOUT_S", "2700")))
+            timeout = aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT_S)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 
                 # Always call Verilator

@@ -91,18 +91,22 @@ OPENLANE_LANES = _envint("OPENLANE_LANES", 0) or _PLAN["L"]
 # healthy 60-minute evaluation, killed at EXACTLY 3600s and reported as
 # "SERVICE_UNAVAILABLE (system)" -- which reads as a broken server, not as a budget.
 #
-# Now the chain is derived from the gateway's ceiling and each layer is strictly inside the one
-# above it, so raising EDA_REQUEST_TIMEOUT_S raises all of it:
+# Now ONE clock decides, and it is a run-time limit, not a derived budget (decided 2026-09-24):
 #
-#   EDA_REQUEST_TIMEOUT_S     the gateway gives up on us here
-#     EVAL_TIMEOUT_S          we kill the job here, 120s earlier, so the error is OURS to explain
-#       run.py stage budgets  60s earlier again, so the stage names itself
-#
-# A service timeout ABOVE the gateway's is not a safety margin, it is dead code: the gateway has
-# already stopped listening.
-GATEWAY_CEILING_S = _envint("EDA_REQUEST_TIMEOUT_S", 2700)
-EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", max(1800, GATEWAY_CEILING_S - 120))
-RUNPY_TIMEOUT_S = max(900, EVAL_TIMEOUT_S - 60)
+#   EVAL_TIMEOUT_S          45 min, counted from when the job LEAVES THE QUEUE. A submission still
+#                           running then has failed: fault miner, not retryable. Measured for the
+#                           16x16 reference (dummy_sol_2): 18 min alone on a 10-core laptop, ~25 min
+#                           sharing it with seven others, 11 min on an i9. The limit is a property of
+#                           the submission because queue time is excluded and concurrency is capped.
+#   run.py's own timers     set ABOVE the limit, so they never fire first and name a different fault.
+#   EDA_REQUEST_TIMEOUT_S   the gateway's ceiling; covers queue + run, so it is only a backstop for a
+#                           long queue, and its timeout stays fault system, retryable.
+GATEWAY_CEILING_S = _envint("EDA_REQUEST_TIMEOUT_S", 14400)
+EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", 2700)
+RUNPY_TIMEOUT_S = EVAL_TIMEOUT_S + 600
+if EVAL_TIMEOUT_S > GATEWAY_CEILING_S - 300:
+    print(f"WARN: EVAL_TIMEOUT_S={EVAL_TIMEOUT_S} leaves no room for queueing inside "
+          f"EDA_REQUEST_TIMEOUT_S={GATEWAY_CEILING_S}", flush=True)
 
 _openlane_semaphore = asyncio.Semaphore(OPENLANE_LANES)
 # One physical core (both SMT siblings) per lane, fastest first, handed to a synthesis when it is
@@ -312,11 +316,10 @@ async def run_openlane(
 # long it ran. Nothing internal.
     except subprocess.TimeoutExpired:
         return RunResponse(success=False, results={"error": {
-            "code": "EVALUATION_TIMEOUT", "category": "system", "fault": "system", "retryable": True,
+            "code": "EVALUATION_TIMEOUT", "category": "synthesis", "fault": "miner", "retryable": False,
             "stage": "synthesis",
-            "message": (f"Synthesis did not finish within {EVAL_TIMEOUT_S} s, the openlane-api budget "
-                        f"inside EDA_REQUEST_TIMEOUT_S={GATEWAY_CEILING_S}. This is the evaluator's time "
-                        "limit, not a property of the submission; retry.")}})
+            "message": (f"The synthesis did not finish within the {EVAL_TIMEOUT_S // 60}-minute run-time limit "
+                        "(time spent queued is not counted). A submission must complete evaluation within it.")}})
     except Exception as e:
         return RunResponse(success=False, results={"error": {
             "code": "INTERNAL_ERROR", "category": "system", "fault": "system", "retryable": True,

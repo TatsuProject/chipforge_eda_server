@@ -56,15 +56,63 @@ _CPUS = _cpus()
 # single-threaded processes on ten cores, and ABC -- the critical path of every accelerated group --
 # measured at 38-52 min contended against ~19 min alone.
 #
-# The lanes x fanout grid is kept for now (a per-request admission allocator is the next step);
-# lanes are chosen so fanout lands near 4, which keeps longest-first scheduling effective inside an
-# evaluation while leaving room for a second one.
-from capacity import plan as _capacity_plan
+# Lanes bound how many evaluations run at once; the CORES each one gets are decided per request
+# below, so a lone evaluation takes all of them.
+from capacity import plan as _capacity_plan, affinity as _affinity
 _PLAN = _capacity_plan("sim")
 SIM_SLOTS = _PLAN["S"]
 EVAL_LANES = _envint("VERILATOR_EVAL_LANES", 0) or max(1, min(4, SIM_SLOTS // 3))
 FANOUT_PER_EVAL = _envint("VERILATOR_FANOUT", 0) or max(1, SIM_SLOTS // EVAL_LANES)
 _eval_semaphore = asyncio.Semaphore(EVAL_LANES)
+
+# Per-request core allocation (2026-09-24). The simulation cpus are everything the synthesis lanes
+# do not own. Active evaluations hold disjoint, near-equal slices of them, re-cut on every admission
+# and every exit: one evaluation alone gets all S cores; when a second arrives the first is re-pinned
+# to half and the second gets the other half -- the same four cores each had under the fixed grid,
+# now dedicated, and off the synthesis cores' SMT siblings. Shrinking a running batch is safe: its
+# processes time-slice on fewer cpus and the throughput handed to the newcomer is exactly what they
+# give up. Without cpu topology there is nothing to pin to, and the fixed fanout applies.
+_SYNTH_CPUS = {c for core in _PLAN["synth_cores"] for c in core}
+_SIM_CPUS = sorted(_affinity() - _SYNTH_CPUS) if _PLAN["topology"] else []
+_active = []    # [[run.py pid or None, [cpus]], ...] in admission order; lists so a slice can be swapped
+
+
+def _slices(n):
+    """_SIM_CPUS cut into n contiguous near-equal slices, the first ones a cpu wider."""
+    base, extra = divmod(len(_SIM_CPUS), n)
+    out, i = [], 0
+    for k in range(n):
+        w = base + (1 if k < extra else 0)
+        out.append(_SIM_CPUS[i:i + w]); i += w
+    return out
+
+
+def _repin(entry):
+    """Apply an entry's slice to its whole process tree. run.py is spawned with start_new_session, so
+    its pid is the session id of everything it forks; a child inherits its parent's mask at fork, so
+    re-pinning the live tree also covers whatever it starts afterwards."""
+    pid, cpus = entry
+    if pid is None or not cpus:
+        return
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()   # after the comm: state ppid pgrp session ...
+            if int(fields[3]) == pid:
+                os.sched_setaffinity(int(p), cpus)
+        except (OSError, ValueError, IndexError):
+            pass
+
+
+def _rebalance():
+    if not _SIM_CPUS or not _active:
+        return
+    for entry, cpus in zip(_active, _slices(len(_active))):
+        if entry[1] != cpus:
+            entry[1] = cpus
+            _repin(entry)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -146,18 +194,25 @@ def _find_run_py(root: Path) -> Optional[Path]:
     return candidates[0] if candidates else None
 
 
-def _child_setup():
+def _child_setup(cpus=None):
     """Between fork and exec, inherited by run.py and every simulation and g++ it starts: if memory
-    runs out the kernel takes a job, never the service."""
-    try:
-        with open("/proc/self/oom_score_adj", "w") as f:
-            f.write("1000")
-    except OSError:
-        pass
+    runs out the kernel takes a job, never the service; and the request's core slice, when it has one."""
+    def _f():
+        try:
+            with open("/proc/self/oom_score_adj", "w") as f:
+                f.write("1000")
+        except OSError:
+            pass
+        if cpus:
+            try:
+                os.sched_setaffinity(0, cpus)
+            except (AttributeError, OSError):
+                pass
+    return _f
 
 
-async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
-    """Run subprocess asynchronously"""
+async def _run_subprocess(cmd, cwd, timeout=3600, env=None, entry=None):
+    """Run subprocess asynchronously, pinned to entry's core slice when it has one."""
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -165,9 +220,13 @@ async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,   # its own process group: a timeout kills the TREE, not the parent
-        preexec_fn=_child_setup,
+        preexec_fn=_child_setup(entry[1] if entry else None),
     )
-    
+    if entry is not None:
+        # The slice may have been re-cut between the fork and here; apply the current one.
+        entry[0] = process.pid
+        _repin(entry)
+
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         return_code = process.returncode
@@ -258,7 +317,22 @@ async def simulate_and_evaluate(
             async with _eval_semaphore:
                 # The timeout starts AFTER the lane is acquired, so time spent queued
                 # behind another evaluation is not charged to this one.
-                proc = await _run_subprocess(cmd, tmp, timeout=EVAL_TIMEOUT_S, env=env)
+                entry = [None, []]
+                if _SIM_CPUS:
+                    _active.append(entry)
+                    _rebalance()            # cuts this request its slice, shrinks the others
+                    # The slice IS the budget: run.py sizes its batch from the cpus it may use, and
+                    # inside a dedicated slice there is no service core to reserve.
+                    env["NPUV1_MAX_PARALLEL"] = str(len(entry[1]))
+                    env["NPUV1_RESERVE_CORES"] = "0"
+                    print(f"[verilator-api] {submission_id} cores {entry[1]} ({len(_active)} active)", flush=True)
+                try:
+                    proc = await _run_subprocess(cmd, tmp, timeout=EVAL_TIMEOUT_S, env=env,
+                                                 entry=entry if _SIM_CPUS else None)
+                finally:
+                    if _SIM_CPUS:
+                        _active.remove(entry)
+                        _rebalance()        # the others grow back
 
             if proc['returncode'] != 0:
                 return EvalResponse(

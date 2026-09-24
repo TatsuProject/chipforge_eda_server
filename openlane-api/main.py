@@ -125,6 +125,73 @@ print(f"[openlane-api] {OPENLANE_LANES} concurrent synthesis run(s) x {MEM_PER_R
 RESULTS_DIR = Path("/app/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ---------------------------------------------------------------------------------------------
+# Synthesis cache (2026-09-24). Synthesis is the long pole of every evaluation and is a pure
+# function of its inputs: the RTL, the evaluator's synthesis bundle, and the tools in this image.
+# The same design synthesised twice gives the same netlist, area and slack (verified: a re-run on a
+# different core and clock reproduced 4985134.034002 um2 / 57.94 MHz to the last digit). So the
+# second time the same RTL arrives -- a miner iterating on kernels.c only, a validator re-checking
+# a submission -- the recorded result is returned and the evaluation costs its simulation time.
+# Keyed on every design file except the software (*.c, *.h), the bundle bytes and a tool
+# fingerprint, so a new yosys or a new flow script is a new key. Only successes are cached; the
+# response says when it is a hit. OPENLANE_SYNTH_CACHE=0 disables it. Lives under RESULTS_DIR, a
+# mounted volume, so it survives a container restart.
+import hashlib, datetime
+SYNTH_CACHE = _envint("OPENLANE_SYNTH_CACHE", 1)
+_CACHE_DIR = RESULTS_DIR / "synth_cache"
+_CACHE_KEEP = _envint("OPENLANE_SYNTH_CACHE_KEEP", 500)
+
+
+def _tool_fingerprint():
+    h = hashlib.sha256()
+    for cmd in (["yosys", "-V"], ["sta", "-version"]):
+        try:
+            h.update(subprocess.run(cmd, capture_output=True, text=True, timeout=20,
+                                    env=dict(os.environ, PATH="/build/bin:" + os.environ.get("PATH", ""))).stdout.encode())
+        except Exception:
+            h.update(b"?")
+    for p in ("/openlane/scripts/yosys/synth.tcl", "/openlane/scripts/tcl_commands/synthesis.tcl",
+              "/openlane/configuration/synthesis.tcl", "/openlane/flow.tcl"):
+        try:
+            h.update(Path(p).read_bytes())
+        except OSError:
+            h.update(b"?")
+    return h.hexdigest()
+
+
+_TOOLS = _tool_fingerprint()
+
+
+def _cache_key(design_dir: Path, bundle_bytes: bytes) -> str:
+    h = hashlib.sha256(_TOOLS.encode())
+    h.update(hashlib.sha256(bundle_bytes).digest())
+    for p in sorted(x for x in design_dir.rglob("*") if x.is_file() and x.suffix not in (".c", ".h")):
+        h.update(str(p.relative_to(design_dir)).encode() + b"\0")
+        h.update(p.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def _cache_get(key: str):
+    try:
+        d = json.loads((_CACHE_DIR / f"{key}.json").read_text())
+        return d if d.get("key") == key and isinstance(d.get("results"), dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _cache_put(key: str, results: dict):
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _CACHE_DIR / f".{key}.{uuid.uuid4().hex[:6]}.tmp"
+        tmp.write_text(json.dumps({"key": key, "created": datetime.datetime.utcnow().isoformat() + "Z",
+                                   "results": results}))
+        tmp.replace(_CACHE_DIR / f"{key}.json")
+        entries = sorted(_CACHE_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        for old in entries[:max(0, len(entries) - _CACHE_KEEP)]:
+            old.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"[openlane-api] synthesis cache write failed: {e}", flush=True)
+
 class RunResponse(BaseModel):
     success: bool
     results: Optional[Dict[str, Any]] = None
@@ -262,6 +329,14 @@ async def run_openlane(
             ]
 
             openlane_design_copy = Path("/openlane/designs") / design_dir.name
+            key = _cache_key(design_dir, bundle_bytes) if SYNTH_CACHE else None
+            hit = _cache_get(key) if key else None
+            if hit:
+                res = dict(hit["results"])
+                res["synthesis_cache"] = {"hit": True, "first_synthesized": hit["created"], "key": key[:16]}
+                print(f"[openlane-api] {submission_id} synthesis cache hit {key[:16]} "
+                      f"(first synthesized {hit['created']})", flush=True)
+                return RunResponse(success=True, results=res, results_zip_path=None, logs="")
             # Reserving a lane is only half of it: the reservation has to be enforced inside the
             # run, or a design that grows without bound exhausts the host and the OOM killer picks
             # its victim by footprint rather than by blame -- letting one submission fail another.
@@ -296,11 +371,10 @@ async def run_openlane(
                         logs=run['stdout'] + "\n" + run['stderr']
                     )
 
-            # --- Zip results folder ---
-            # out_zip = work / "results.zip"
-            # _safe_zip_dir(out_dir, out_zip)
-            # final_zip = RESULTS_DIR / f"{submission_id}_openlane.zip"
-            # shutil.copy(out_zip, final_zip)
+            if key:
+                if result_obj.get("success") is True:
+                    _cache_put(key, result_obj)
+                result_obj = dict(result_obj, synthesis_cache={"hit": False, "key": key[:16]})
 
             return RunResponse(
                 success=True,

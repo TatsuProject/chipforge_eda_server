@@ -162,12 +162,19 @@ def _tool_fingerprint():
 _TOOLS = _tool_fingerprint()
 
 
-def _cache_key(design_dir: Path, bundle_bytes: bytes) -> str:
-    h = hashlib.sha256(_TOOLS.encode())
-    h.update(hashlib.sha256(bundle_bytes).digest())
-    for p in sorted(x for x in design_dir.rglob("*") if x.is_file() and x.suffix not in (".c", ".h")):
-        h.update(str(p.relative_to(design_dir)).encode() + b"\0")
+def _hash_tree(h, root: Path, skip=()):
+    for p in sorted(x for x in root.rglob("*") if x.is_file() and x.suffix not in skip):
+        h.update(str(p.relative_to(root)).encode() + b"\0")
         h.update(p.read_bytes() + b"\0")
+
+
+def _cache_key(design_dir: Path, bundle_dir: Path) -> str:
+    # CONTENTS, never zip bytes: the gateway re-zips the bundle for every request, and zip framing
+    # (timestamps, order) made two identical submissions hash differently -- every lookup missed.
+    # Caught by the smoke test on 2026-09-26.
+    h = hashlib.sha256(_TOOLS.encode())
+    _hash_tree(h, bundle_dir)
+    _hash_tree(h, design_dir, skip=(".c", ".h"))
     return h.hexdigest()
 
 
@@ -329,7 +336,7 @@ async def run_openlane(
             ]
 
             openlane_design_copy = Path("/openlane/designs") / design_dir.name
-            key = _cache_key(design_dir, bundle_bytes) if SYNTH_CACHE else None
+            key = _cache_key(design_dir, bundle_dir) if SYNTH_CACHE else None
             hit = _cache_get(key) if key else None
             if hit:
                 res = dict(hit["results"])

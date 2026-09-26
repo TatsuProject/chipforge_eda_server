@@ -106,6 +106,12 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets, 
         speedup = round(speedup, 3)
         perf_gate = speedup >= min_speedup
         area_total = area_um2 or 0.0
+        # AREA FLOOR (owner decision 2026-09-26): the area term is max(measured, floor). Speed gained in
+        # software alone costs no silicon, and without a floor an inert 2,614 um2 npu driven by optimised
+        # CPU kernels would out-score a real 5 mm2 accelerator ten to one on the area term. The floor is
+        # below any real accelerator; the numerator already scales with (speedup - 1).
+        area_floor = float(targets.get("area_floor_um2", 0.0) or 0.0)
+        area_scored = max(area_total, area_floor)
         # The FoM is a MEASUREMENT of what was measured, so it is computed whenever the inputs exist
         # -- NOT only when the gates pass. It used to be zeroed on any gate failure, which threw the
         # number away: a submission 4% short of the perf gate was told "overall 0.0" and learned
@@ -126,12 +132,14 @@ def compute_weighted_score(func_0_1, area_um2, ips, power_mw, weights, targets, 
         # exactly zero; the ranking among designs that DO accelerate still trades throughput against
         # area at the same alpha and beta. Decided 2026-09-23 before the npu-v1.0 launch.
         ips_gain = ips * (1.0 - 1.0 / speedup) if (measurable and speedup > 1.0) else 0.0
-        fom = (ips_gain ** alpha) / (area_total ** beta) if ips_gain > 0 else 0.0
+        fom = (ips_gain ** alpha) / (area_scored ** beta) if ips_gain > 0 else 0.0
         passed = bool(func_gate and perf_gate and measurable)
         overall = round(fom * 1000.0, 4)      # FoM*1000 for readable magnitude; ranking is unaffected
         return {
             "func_score": round((func_0_1 or 0.0) * 100, 2),
             "area_total_um2": round(area_total, 2),
+            "area_scored_um2": round(area_scored, 2),
+            "area_floor_um2": area_floor,
             # Read from the evaluator's own knobs. This used to be a hardcoded "whole_soc: core +
             # accelerator + memory macros" string, which contradicted openlane_results.area_scope
             # in the same response the moment the scope changed to npu_only.

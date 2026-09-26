@@ -100,7 +100,6 @@ chipforge_eda_server/
 ```sh
 curl -X POST http://localhost:8080/evaluate \
      -F "design_zip=@design.zip" -F "evaluator_zip=@evaluator.zip" -F "submission_id=my_run"
-# add  -H "X-API-Key: $EDA_API_KEY"  if the server sets EDA_API_KEY (see Security below)
 ```
 
 ---
@@ -134,13 +133,11 @@ evaluator ZIP from the caller and executes the `run.py` inside it, so anyone who
 can run code on that machine. Every operator (miner or validator) runs their own server and protects
 their own.
 
-- **Recommended:** do not expose port 8080 to the internet. Allow it only from the machine that
-  sends evaluations (localhost, or an AWS security group limited to the validator).
-- **If 8080 must be reachable from outside:** set `EDA_API_KEY` to a long random value of your own
-  choosing (e.g. `openssl rand -hex 32`) in `.env`. Every request must then send it in the
-  `X-API-Key` header. There is no shared or published key.
-- If `EDA_API_KEY` is unset, the server works as before and logs a warning at startup. That is fine
-  for a miner testing locally.
+- **There is no API key.** Access control is network-level: **never expose port 8080 to the
+  internet.** Allow it only from the machine(s) that send evaluations: `localhost`, or an AWS
+  security group / firewall rule limited to your validator's IP.
+- If the validator runs on the same machine, you can also bind the port to localhost in
+  `docker-compose.yml` (`"127.0.0.1:8080:8080"`).
 
 ## Time limits
 

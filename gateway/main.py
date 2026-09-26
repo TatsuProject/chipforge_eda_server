@@ -333,6 +333,12 @@ def _zip_problem(path):
 # -------------------------------
 # Endpoint
 # -------------------------------
+@app.get("/health")
+async def health():
+    """Liveness for validators' pre-flight check (no evaluation is run)."""
+    return {"status": "ok"}
+
+
 @app.post("/evaluate")
 async def evaluate(
     design_zip: UploadFile = File(..., description="This is miner's submission"),

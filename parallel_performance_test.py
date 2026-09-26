@@ -19,7 +19,6 @@ from datetime import datetime
 
 
 API_URL = os.getenv("EDA_BASE_URL", "http://localhost:8080")
-API_KEY = os.getenv("EDA_API_KEY")  # optional
 TEST_DIR = os.getenv("EDA_TEST_DIR", "test")
 RESULTS_FILE = "parallel_performance_results.csv"
 
@@ -55,12 +54,10 @@ def pick_test_files(test_dir: str):
     return design_zip, evaluator_zip
 
 
-def evaluate_sync(api_url: str, design_zip: str, evaluator_zip: str, api_key: str | None, request_id: int):
+def evaluate_sync(api_url: str, design_zip: str, evaluator_zip: str, request_id: int):
     """Synchronous version for thread pool execution"""
     url = f"{api_url.rstrip('/')}/evaluate"
     headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
 
     start_time = time.time()
     
@@ -118,7 +115,6 @@ def run_parallel_requests(num_parallel: int, design_zip: str, evaluator_zip: str
                 API_URL, 
                 design_zip, 
                 evaluator_zip, 
-                API_KEY, 
                 i + 1
             )
             futures.append(future)

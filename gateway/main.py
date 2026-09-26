@@ -4,26 +4,6 @@ from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import secrets
-# THE SHARED SECRET. There was a comment saying "EDA_API_KEY comes from .env" and no code anywhere
-# that read it. The gateway accepts an evaluator zip from the caller and verilator-api executes the
-# run.py inside it as root, so an open :8080 is remote code execution for anyone who can reach it.
-#
-# If EDA_API_KEY is set, every /evaluate must carry it in X-API-Key, compared in constant time. If it
-# is NOT set the gateway still serves -- with a loud warning at startup -- because the subnet team is
-# mid-integration and a silent refusal would read as a broken server. Fail-closed is the go-live
-# setting: set the variable. Audit 2026-09-23.
-import os
-import secrets as _secrets
-from fastapi import Header, HTTPException, Depends
-_API_KEY = (os.environ.get("EDA_API_KEY") or "").strip()
-if not _API_KEY:
-    print("[gateway] WARNING: EDA_API_KEY is not set. /evaluate is UNAUTHENTICATED. Set it before "
-          "exposing this port to anything but the validator.", flush=True)
-
-
-async def require_api_key(x_api_key: str = Header(default=None)):
-    if _API_KEY and not (x_api_key and _secrets.compare_digest(x_api_key, _API_KEY)):
-        raise HTTPException(status_code=401, detail="missing or wrong X-API-Key")
 
 
 app = FastAPI(title="ChipForge EDA Tools Gateway", version="5.0.0",
@@ -353,7 +333,7 @@ def _zip_problem(path):
 # -------------------------------
 # Endpoint
 # -------------------------------
-@app.post("/evaluate", dependencies=[Depends(require_api_key)])
+@app.post("/evaluate")
 async def evaluate(
     design_zip: UploadFile = File(..., description="This is miner's submission"),
     evaluator_zip: UploadFile = File(..., description="Testcases downloaded when the challenge started"),

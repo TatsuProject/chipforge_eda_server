@@ -88,7 +88,6 @@ services:
       # once: openlane-api serialises synthesis behind a Semaphore(1), so concurrent requests queue
       # their synthesis end to end rather than overlapping.
       - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
-      # EDA_API_KEY comes from .env
 
 # Named volumes not needed if you standardize on ./results (remove clutter)
 # volumes:

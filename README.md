@@ -173,6 +173,42 @@ with open(design_zip, "rb") as d, open(evaluator_zip, "rb") as e:
 ## Testing & Validation
 - Run `make test` to verify simulation from the terminal.
 
+### Mock mode (testing only)
+
+To test the validator/challenge-server flow without waiting for real EDA runs, the gateway can
+return a fixed result instead of running Verilator and OpenLane.
+
+1. Create `shared/eda_mock.json` (the `shared/` folder is mounted into the gateway and gitignored);
+   start from `gateway/mock_result.example.json`:
+   ```json
+   {
+     "delay_seconds": 10,
+     "overall": 50.0,
+     "func_score": 100.0,
+     "area_score": 40.0,
+     "perf_score": 60.0,
+     "power_score": 0.0,
+     "functional_gate": true,
+     "overall_gate": true
+   }
+   ```
+2. Restart the gateway with mock mode on:
+   ```bash
+   EDA_MOCK_FILE=/shared/eda_mock.json docker compose up -d --build eda-gateway
+   ```
+3. Edit the file at any time: it is re-read on every request, no restart needed.
+
+| field | effect |
+|---|---|
+| `delay_seconds` | how long `/evaluate` waits before answering (default 10) |
+| `overall`, `func_score`, `area_score`, `perf_score`, `power_score` | the scores returned; a number, or `[low, high]` for a random value per request |
+| `functional_gate`, `overall_gate` | gate flags; `overall_gate: false` returns `REJECTED` (fault `miner`) |
+| `result` | `"ERROR"` returns a retryable system error instead of a score |
+
+Mocked responses carry `"mock": true` and the gateway logs `[MOCK] … no EDA tools ran` for each one.
+To turn it off, restart without the variable: `docker compose up -d --build eda-gateway`.
+**Never set `EDA_MOCK_FILE` on a production EDA server.**
+
 ---
 
 ## Monitoring & Troubleshooting

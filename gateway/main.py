@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import secrets
+import random
 
 
 app = FastAPI(title="ChipForge EDA Tools Gateway", version="5.0.0",
@@ -339,6 +340,68 @@ def _zip_problem(path):
     return None
 
 # -------------------------------
+# Mock mode (TESTING ONLY)
+# -------------------------------
+# With EDA_MOCK_FILE set, /evaluate skips Verilator and OpenLane and returns the result described
+# in that JSON file after its delay. The file is re-read on every request, so edit it while the
+# gateway runs. Unset (the default) the gateway evaluates normally. See gateway/mock_result.example.json.
+EDA_MOCK_FILE = os.environ.get("EDA_MOCK_FILE", "").strip()
+
+
+def _mock_value(v):
+    """A number, or [low, high] for a random value in that range (different miners, different scores)."""
+    if isinstance(v, (list, tuple)) and len(v) == 2:
+        return round(random.uniform(float(v[0]), float(v[1])), 2)
+    return v
+
+
+async def _mock_evaluate(submission_id: str):
+    try:
+        cfg = json.loads(Path(EDA_MOCK_FILE).read_text())
+    except (OSError, ValueError) as e:
+        return _system_error(submission_id, "MOCK_CONFIG_UNREADABLE", "mock",
+                             f"EDA_MOCK_FILE {EDA_MOCK_FILE} is missing or not valid JSON.", str(e))
+    await asyncio.sleep(float(cfg.get("delay_seconds", 10)))
+    print(f"[MOCK] {submission_id}: returning the mocked result from {EDA_MOCK_FILE}, no EDA tools ran", flush=True)
+
+    if cfg.get("result") == "ERROR":
+        return _system_error(submission_id, "MOCK_SYSTEM_ERROR", "mock", "Mocked system error.", retryable=True)
+
+    overall = _mock_value(cfg.get("overall", 50.0))
+    func = _mock_value(cfg.get("func_score", 100.0))
+    functional_gate = bool(cfg.get("functional_gate", True))
+    overall_gate = bool(cfg.get("overall_gate", True))
+    score = {
+        "func_score": func,
+        "area_score": _mock_value(cfg.get("area_score", 0.0)),
+        "perf_score": _mock_value(cfg.get("perf_score", 0.0)),
+        "power_score": _mock_value(cfg.get("power_score", 0.0)),
+        "overall": overall,
+        "functional_gate": functional_gate,
+        "overall_gate": overall_gate,
+        "overall_gated": overall if overall_gate else 0.0,
+        "scoring_mode": "mock",
+    }
+    resp = {
+        "success": True,
+        "mock": True,
+        "submission_id": submission_id,
+        "result": "ACCEPTED" if overall_gate else "REJECTED",
+        # Validators read functionality_score here (passed_testbench needs it above 0)
+        "verilator_results": {"success": True, "mock": True,
+                              "results": {"functionality_score": (func or 0) / 100}},
+        "openlane_results": {"success": True, "mock": True, "results": {}},
+        "weights": {},
+        "targets": {},
+        "final_score": score,
+    }
+    if not overall_gate:
+        resp["error"] = {"fault": "miner", "code": "MOCK_GATE_FAILED", "stage": "mock",
+                         "message": "Mocked gate failure."}
+    return resp
+
+
+# -------------------------------
 # Endpoint
 # -------------------------------
 @app.get("/health")
@@ -357,6 +420,8 @@ async def evaluate(
         with tempfile.TemporaryDirectory() as tmpd:
             if not submission_id:
                 submission_id = generate_submission_id(length=32)
+            if EDA_MOCK_FILE:
+                return await _mock_evaluate(submission_id)
             work = Path(tmpd)
 
             # save zips using aiofiles

@@ -1,0 +1,11 @@
+{
+  "delay_seconds": 10,
+  "overall": 50.0,
+  "func_score": 100.0,
+  "area_score": 40.0,
+  "perf_score": 60.0,
+  "power_score": 0.0,
+  "functional_gate": true,
+  "overall_gate": true,
+  "result": "ACCEPTED"
+}

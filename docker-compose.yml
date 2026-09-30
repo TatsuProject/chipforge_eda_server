@@ -84,6 +84,9 @@ services:
     environment:
       - VERILATOR_URL=http://verilator-api:8001
       - OPENLANE_URL=http://openlane-api:8003
+      # TESTING ONLY: path to a mock result JSON (e.g. /shared/eda_mock.json). When set, /evaluate
+      # skips Verilator and OpenLane and returns that result. Empty (the default) evaluates normally.
+      - EDA_MOCK_FILE=${EDA_MOCK_FILE:-}
       # How long to wait for both services. Raise it when a validator runs several evaluations at
       # once: openlane-api serialises synthesis behind a Semaphore(1), so concurrent requests queue
       # their synthesis end to end rather than overlapping.

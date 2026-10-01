@@ -96,10 +96,11 @@ chipforge_eda_server/
 
 ---
 
-## GUI Usage
-- After running `make start`, open your browser and go to [http://localhost:8080/docs](http://localhost:8080/docs)
-- In the GUI, for `/evaluate`, click "Browse..." and select both your design ZIP (`test_designs/adder.zip`) and evaluator ZIP (`test_designs/adder_evaluator.zip`)
-- Click "Execute" to run the evaluation and see results below
+## Command-line Usage
+```sh
+curl -X POST http://localhost:8080/evaluate \
+     -F "design_zip=@design.zip" -F "evaluator_zip=@evaluator.zip" -F "submission_id=my_run"
+```
 
 ---
 
@@ -119,10 +120,33 @@ chipforge_eda_server/
 ---
 
 ## API Usage
-- **Gateway Docs**: [http://localhost:8080/docs](http://localhost:8080/docs)
-- **Main Evaluation Endpoint**:  `POST /evaluate` with ZIP files
-- **Verilator API**: Accessible at [http://localhost:8001](http://localhost:8001)
-- **OpenLane API**: Accessible at [http://localhost:8003](http://localhost:8003)
+- **Main Evaluation Endpoint**: `POST /evaluate` on port 8080, with the design and evaluator ZIPs.
+- The gateway is the only published port. verilator-api (8001) and openlane-api (8003) are reachable
+  only on the internal Docker network. The interactive `/docs` page is disabled.
+
+---
+
+## Security
+
+The code is open source; what needs protecting is a **running** server. `/evaluate` accepts an
+evaluator ZIP from the caller and executes the `run.py` inside it, so anyone who can reach port 8080
+can run code on that machine. Every operator (miner or validator) runs their own server and protects
+their own.
+
+- **There is no API key.** Access control is network-level: **never expose port 8080 to the
+  internet.** Allow it only from the machine(s) that send evaluations: `localhost`, or an AWS
+  security group / firewall rule limited to your validator's IP.
+- If the validator runs on the same machine, you can also bind the port to localhost in
+  `docker-compose.yml` (`"127.0.0.1:8080:8080"`).
+
+## Time limits
+
+| setting | default | what it means |
+|---|---|---|
+| `EVAL_TIMEOUT_S` | 2700 (45 min) | Run-time limit per evaluation, counted after it leaves the queue. Exceeding it is `EVALUATION_TIMEOUT`, fault `miner`, not retryable. |
+| `EDA_REQUEST_TIMEOUT_S` | 14400 (4 h) | Gateway ceiling on queue + run. Only a backstop for a long queue; exceeding it is fault `system`, retryable. |
+
+Every failure is returned in one shape: `error{code, category, fault, retryable, stage, message}`.
 
 ---
 
@@ -148,7 +172,42 @@ with open(design_zip, "rb") as d, open(evaluator_zip, "rb") as e:
 
 ## Testing & Validation
 - Run `make test` to verify simulation from the terminal.
-- Use the GUI ([http://localhost:8080/docs](http://localhost:8080/docs)) for interactive testing.
+
+### Mock mode (testing only)
+
+To test the validator/challenge-server flow without waiting for real EDA runs, the gateway can
+return a fixed result instead of running Verilator and OpenLane.
+
+1. Create `shared/eda_mock.json` (the `shared/` folder is mounted into the gateway and gitignored);
+   start from `gateway/mock_result.example.json`:
+   ```json
+   {
+     "delay_seconds": 10,
+     "overall": 50.0,
+     "func_score": 100.0,
+     "area_score": 40.0,
+     "perf_score": 60.0,
+     "power_score": 0.0,
+     "functional_gate": true,
+     "overall_gate": true
+   }
+   ```
+2. Restart the gateway with mock mode on:
+   ```bash
+   EDA_MOCK_FILE=/shared/eda_mock.json docker compose up -d --build eda-gateway
+   ```
+3. Edit the file at any time: it is re-read on every request, no restart needed.
+
+| field | effect |
+|---|---|
+| `delay_seconds` | how long `/evaluate` waits before answering (default 10) |
+| `overall`, `func_score`, `area_score`, `perf_score`, `power_score` | the scores returned; a number, or `[low, high]` for a random value per request |
+| `functional_gate`, `overall_gate` | gate flags; `overall_gate: false` returns `REJECTED` (fault `miner`) |
+| `result` | `"ERROR"` returns a retryable system error instead of a score |
+
+Mocked responses carry `"mock": true` and the gateway logs `[MOCK] … no EDA tools ran` for each one.
+To turn it off, restart without the variable: `docker compose up -d --build eda-gateway`.
+**Never set `EDA_MOCK_FILE` on a production EDA server.**
 
 ---
 

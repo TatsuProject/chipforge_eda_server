@@ -66,3 +66,154 @@ Thumbs.db
 
 # Build tracking files
 .last_build_*
+
+
+# ===== Appended ChipForge master .gitignore =====
+# ============================================================
+#  ChipForge master .gitignore  —  EDA / RTL / verification
+# ============================================================
+# Strategy: ignore OUTPUT directories and known artifact extensions.
+# Source extensions (.S, .cpp, .v, .sv, .mem, .csv) are NOT blanket-ignored
+# at the top level, so source assembly / RTL / test vectors survive.
+# They are only excluded when they live inside an ignored output dir.
+
+# ---- Output / generated directories (recursive) ----
+build/
+build_*/
+.build/
+out/
+out_*/
+work/
+obj/
+obj_dir/
+target/
+dist/
+sim_build/
+sim/
+runs/
+run[0-9]*/
+results/
+waves/
+gen/
+csrc/
+DVEfiles/
+.simvision/
+verdiLog/
+verdi_logs/
+xsim.dir/
+.Xil/
+*.cache/
+*.runs/
+*.hw/
+*.ip_user_files/
+bazel-*/
+
+# ---- Waveforms / dumps ----
+*.vcd
+*.fsdb
+*.fst
+*.vpd
+*.wlf
+*.shm
+*.lxt
+*.lxt2
+*.dve
+*.aedb
+*.saif
+novas.*
+novas_dump.log
+
+# ---- Simulator artifacts ----
+simv
+simv.daidir/
+ucli.key
+vc_hdrs.h
+xelab.log
+xvlog.log
+xsim.log
+vivado.jou
+vivado.log
+vivado_*.backup.*
+
+# ---- Verilator artifacts ----
+V*.cpp
+V*.h
+V*.mk
+*.gch
+
+# ---- Logs / coverage ----
+*.log
+*.log.gz
+*.cov
+*.ucdb
+*.cov.db
+*.vstf
+coverage/
+.coverage
+htmlcov/
+
+# ---- Compiled binaries ----
+*.o
+*.a
+*.so
+*.so.*
+*.elf
+*.bin
+*.hex
+*.dump
+*.disasm
+*.lst
+*.map
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Node ----
+node_modules/
+
+# ---- JVM / Scala ----
+*.class
+.gradle/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Claude Code (sync project rules, keep personal overrides local) ----
+.claude/settings.local.json
+
+# ---- Backups / trash (very prevalent in your tree) ----
+*.tmp
+*.bak
+*.old
+*.stale*
+*.duplicate
+_trash/
+trash/
+
+# ---- Large distributables (zips are mostly trash in your tree) ----
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tar.xz
+*.7z
+*.iso

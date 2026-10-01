@@ -15,7 +15,6 @@ import json
 import requests
 
 API_URL = os.getenv("EDA_BASE_URL", "http://localhost:8080")
-API_KEY = os.getenv("EDA_API_KEY")  # optional
 TEST_DIR = os.getenv("EDA_TEST_DIR", "test")
 
 
@@ -50,11 +49,9 @@ def pick_test_files(test_dir: str):
     return design_zip, evaluator_zip
 
 
-def evaluate(api_url: str, design_zip: str, evaluator_zip: str, api_key: str | None):
+def evaluate(api_url: str, design_zip: str, evaluator_zip: str):
     url = f"{api_url.rstrip('/')}/evaluate"
     headers = {}
-    if api_key:  # only send header if provided
-        headers["Authorization"] = f"Bearer {api_key}"
 
     with open(design_zip, "rb") as df, open(evaluator_zip, "rb") as ef:
         files = {
@@ -93,7 +90,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        resp = evaluate(API_URL, design_zip, evaluator_zip, API_KEY)
+        resp = evaluate(API_URL, design_zip, evaluator_zip)
     except Exception as e:
         print(f"[ERROR] Request failed: {e}")
         sys.exit(2)

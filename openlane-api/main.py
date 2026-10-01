@@ -1,6 +1,6 @@
 # openlane-api/main.py
 
-import json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles, uuid
+import os, signal, json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles, uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -8,14 +8,196 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="ChipForge Openlane API", version="4.0.0")
 
-# Serialize OpenLane runs: synthesis is CPU-heavy and non-deterministic under
-# contention. Running one at a time gives consistent results and avoids
-# competing for the same CPU cores.
-_openlane_semaphore = asyncio.Semaphore(1)
+def _envint(name, default):
+    """An env var that is SET BUT EMPTY is what `NAME=${NAME:-}` in a compose file produces, and
+    int("") raises. Treat empty, missing and unparseable all as absent."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return int(default)
+
+
+app = FastAPI(title="ChipForge Openlane API", version="4.0.0",
+              docs_url=None, redoc_url=None, openapi_url=None)  # no free schema for a scanner
+
+# How many synthesis runs may proceed at once.
+#
+# This was a hard 1. The collision it was guarding against had already been fixed in the same
+# change that introduced it -- each request now stages into its own uuid-named directory, so
+# concurrent runs no longer share a path -- and serialising on top of that made synthesis the
+# throughput ceiling for the whole service: N concurrent evaluations queue N synthesis runs end to
+# end, and synthesis is the long pole of an evaluation.
+#
+# What genuinely does bound it is MEMORY, not correctness. A synthesis of a real accelerator peaks
+# around 5 GB, so the limit is how many of those the host can hold at once; exceeding it gets a run
+# OOM-killed, which looks like a submission failure and is not one. Sized from the host at import,
+# overridable for a box whose memory profile differs.
+MEM_PER_RUN_MB = _envint("OPENLANE_MEM_PER_RUN_MB", 6144)   # 5 GB peak + headroom
+
+
+def _synthesis_lanes():
+    budget_mb = MEM_PER_RUN_MB
+    avail = None
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) // 1024
+                break
+    except OSError:
+        pass
+    for lim_p, use_p in (("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+                         ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                          "/sys/fs/cgroup/memory/memory.usage_in_bytes")):
+        try:
+            lim = int(open(lim_p).read().split()[0]); use = int(open(use_p).read().split()[0])
+            if 0 < lim < (1 << 62):                       # an "unlimited" cgroup reports a sentinel
+                free = (lim - use) // (1024 * 1024)
+                avail = free if avail is None else min(avail, free)
+        except (OSError, ValueError):
+            pass
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 2
+    # Keep a quarter of what is free in reserve. Filling memory exactly is how a host with four
+    # lanes x 6 GB on 28 GB ends up with nothing left for the page cache, the other service, or a
+    # run that peaks slightly above its ceiling.
+    by_mem = max(1, int(avail * 0.75) // budget_mb) if avail else 1
+    return max(1, min(4, by_mem, cpus))
+
+
+# Lanes from capacity.py, not from MemAvailable. _synthesis_lanes() above read MemAvailable, which
+# includes reclaimable page cache and moves between runs -- the live banner said 2 lanes at one start
+# and 3 at the next on the same box. capacity.plan() reads MemTotal and the PHYSICAL core count,
+# reserves 8 GB per lane, and leaves the rest of the cores to simulation, so the two services agree
+# on a split whose sum is the machine rather than each taking the whole box. _synthesis_lanes() is
+# kept for reference and no longer consulted.
+from capacity import plan as _capacity_plan
+import collections
+_PLAN = _capacity_plan("synth")
+OPENLANE_LANES = _envint("OPENLANE_LANES", 0) or _PLAN["L"]
+
+
+# ---------------------------------------------------------------------------------------------
+# ONE timeout knob, not three.
+#
+# There were three independent hardcoded ceilings on the same piece of work: the gateway waited
+# EDA_REQUEST_TIMEOUT_S for us, we killed the subprocess at 3600, and the bundle's run.py had its
+# own stage budget inside that. Raising the outermost one and believing the job was safe cost a
+# healthy 60-minute evaluation, killed at EXACTLY 3600s and reported as
+# "SERVICE_UNAVAILABLE (system)" -- which reads as a broken server, not as a budget.
+#
+# Now ONE clock decides, and it is a run-time limit, not a derived budget (decided 2026-09-24):
+#
+#   EVAL_TIMEOUT_S          45 min, counted from when the job LEAVES THE QUEUE. A submission still
+#                           running then has failed: fault miner, not retryable. Measured for the
+#                           16x16 reference (dummy_sol_2): 18 min alone on a 10-core laptop, ~25 min
+#                           sharing it with seven others, 11 min on an i9. The limit is a property of
+#                           the submission because queue time is excluded and concurrency is capped.
+#   run.py's own timers     set ABOVE the limit, so they never fire first and name a different fault.
+#   EDA_REQUEST_TIMEOUT_S   the gateway's ceiling; covers queue + run, so it is only a backstop for a
+#                           long queue, and its timeout stays fault system, retryable.
+GATEWAY_CEILING_S = _envint("EDA_REQUEST_TIMEOUT_S", 14400)
+EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", 2700)
+RUNPY_TIMEOUT_S = EVAL_TIMEOUT_S + 600
+if EVAL_TIMEOUT_S > GATEWAY_CEILING_S - 300:
+    print(f"WARN: EVAL_TIMEOUT_S={EVAL_TIMEOUT_S} leaves no room for queueing inside "
+          f"EDA_REQUEST_TIMEOUT_S={GATEWAY_CEILING_S}", flush=True)
+
+_openlane_semaphore = asyncio.Semaphore(OPENLANE_LANES)
+# One physical core (both SMT siblings) per lane, fastest first, handed to a synthesis when it is
+# spawned and returned when it exits. yosys and ABC are single-threaded, so a lane can never use
+# more than one core; pinning it there keeps the ten simulations from time-slicing the one process
+# that is the critical path of every accelerated group. Measured: ABC took ~19 min on an idle core
+# and 38-52 min beside ten simulations. Empty when the topology is not exposed -> no pinning.
+_synth_cores = collections.deque(frozenset(c) for c in _PLAN["synth_cores"][:OPENLANE_LANES])
+print(f"[openlane-api] P={_PLAN['P']} physical (of {_PLAN['logical']} logical, quota={_PLAN['quota']}) "
+      f"-> L={OPENLANE_LANES} synthesis lanes pinned to {[sorted(c) for c in _synth_cores] or 'nothing (no topology)'}, "
+      f"S={_PLAN['S']} left for simulation"
+      + (f"; WARN {'; '.join(_PLAN['warn'])}" if _PLAN['warn'] else ""), flush=True)
+print(f"[openlane-api] {OPENLANE_LANES} concurrent synthesis run(s) x {MEM_PER_RUN_MB} MB each; "
+      f"gateway ceiling {GATEWAY_CEILING_S}s -> kill at {EVAL_TIMEOUT_S}s, flow {RUNPY_TIMEOUT_S}s",
+      flush=True)
 RESULTS_DIR = Path("/app/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------------------------
+# Synthesis cache (2026-09-24). Synthesis is the long pole of every evaluation and is a pure
+# function of its inputs: the RTL, the evaluator's synthesis bundle, and the tools in this image.
+# The same design synthesised twice gives the same netlist, area and slack (verified: a re-run on a
+# different core and clock reproduced 4985134.034002 um2 / 57.94 MHz to the last digit). So the
+# second time the same RTL arrives -- a miner iterating on kernels.c only, a validator re-checking
+# a submission -- the recorded result is returned and the evaluation costs its simulation time.
+# Keyed on every design file except the software (*.c, *.h), the bundle bytes and a tool
+# fingerprint, so a new yosys or a new flow script is a new key. Only successes are cached; the
+# response says when it is a hit. OPENLANE_SYNTH_CACHE=0 disables it. Lives under RESULTS_DIR, a
+# mounted volume, so it survives a container restart.
+import hashlib, datetime
+SYNTH_CACHE = _envint("OPENLANE_SYNTH_CACHE", 1)
+_CACHE_DIR = RESULTS_DIR / "synth_cache"
+_CACHE_KEEP = _envint("OPENLANE_SYNTH_CACHE_KEEP", 500)
+
+
+def _tool_fingerprint():
+    h = hashlib.sha256()
+    for cmd in (["yosys", "-V"], ["sta", "-version"]):
+        try:
+            h.update(subprocess.run(cmd, capture_output=True, text=True, timeout=20,
+                                    env=dict(os.environ, PATH="/build/bin:" + os.environ.get("PATH", ""))).stdout.encode())
+        except Exception:
+            h.update(b"?")
+    for p in ("/openlane/scripts/yosys/synth.tcl", "/openlane/scripts/tcl_commands/synthesis.tcl",
+              "/openlane/configuration/synthesis.tcl", "/openlane/flow.tcl"):
+        try:
+            h.update(Path(p).read_bytes())
+        except OSError:
+            h.update(b"?")
+    return h.hexdigest()
+
+
+_TOOLS = _tool_fingerprint()
+
+
+def _hash_tree(h, root: Path, skip=()):
+    for p in sorted(x for x in root.rglob("*") if x.is_file() and x.suffix not in skip):
+        h.update(str(p.relative_to(root)).encode() + b"\0")
+        h.update(p.read_bytes() + b"\0")
+
+
+def _cache_key(design_dir: Path, bundle_dir: Path) -> str:
+    # CONTENTS, never zip bytes: the gateway re-zips the bundle for every request, and zip framing
+    # (timestamps, order) made two identical submissions hash differently -- every lookup missed.
+    # Caught by the smoke test on 2026-09-26.
+    h = hashlib.sha256(_TOOLS.encode())
+    _hash_tree(h, bundle_dir)
+    _hash_tree(h, design_dir, skip=(".c", ".h"))
+    return h.hexdigest()
+
+
+def _cache_get(key: str):
+    try:
+        d = json.loads((_CACHE_DIR / f"{key}.json").read_text())
+        return d if d.get("key") == key and isinstance(d.get("results"), dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _cache_put(key: str, results: dict):
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _CACHE_DIR / f".{key}.{uuid.uuid4().hex[:6]}.tmp"
+        tmp.write_text(json.dumps({"key": key, "created": datetime.datetime.utcnow().isoformat() + "Z",
+                                   "results": results}))
+        tmp.replace(_CACHE_DIR / f"{key}.json")
+        entries = sorted(_CACHE_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        for old in entries[:max(0, len(entries) - _CACHE_KEEP)]:
+            old.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"[openlane-api] synthesis cache write failed: {e}", flush=True)
 
 class RunResponse(BaseModel):
     success: bool
@@ -42,13 +224,48 @@ def _find_run_py(bundle_dir: Path) -> Optional[Path]:
             return p
     return None
 
-async def _run_subprocess(cmd, cwd, timeout=3600):
-    """Run subprocess asynchronously"""
+def _child_setup(cpus):
+    """Runs in the child between fork and exec, so everything it sets is inherited by run.py, tclsh,
+    yosys and yosys-abc. Two things:
+      - oom_score_adj 1000: if memory does run out, the kernel takes this job and never the service.
+      - CPU affinity to one physical core when a lane has one: the pin that gives ABC its core back."""
+    def _f():
+        try:
+            with open("/proc/self/oom_score_adj", "w") as f:
+                f.write("1000")
+        except OSError:
+            pass
+        if cpus:
+            try:
+                os.sched_setaffinity(0, cpus)
+            except (AttributeError, OSError):
+                pass
+    return _f
+
+
+async def _run_subprocess(cmd, cwd, timeout=3600, env=None):
+    """Run subprocess asynchronously, on a pinned core when one is free.
+
+    Called only from inside the lane semaphore, and the core pool has exactly OPENLANE_LANES entries,
+    so a pop here cannot fail while the pool is non-empty; it is returned in the finally. Single
+    event loop, no await between the pop and the spawn."""
+    cpus = _synth_cores.popleft() if _synth_cores else None
+    try:
+        return await _run_subprocess_pinned(cmd, cwd, timeout, env, cpus)
+    finally:
+        if cpus is not None:
+            _synth_cores.append(cpus)
+
+
+async def _run_subprocess_pinned(cmd, cwd, timeout, env, cpus):
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,   # its own process group: a timeout kills the TREE, not the parent
+        preexec_fn=_child_setup(cpus),
     )
     
     try:
@@ -60,8 +277,14 @@ async def _run_subprocess(cmd, cwd, timeout=3600):
             'stdout': stdout.decode('utf-8') if stdout else '',
             'stderr': stderr.decode('utf-8') if stderr else ''
         }
-    except asyncio.TimeoutError:
-        process.kill()
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # Kill the GROUP. process.kill() reached only the direct child -- run.py, or tclsh -- and
+        # left every simulation, yosys and yosys-abc it had started running on, holding the cores
+        # after the lane that owned them had already been released to the next request.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
         await process.wait()
         raise subprocess.TimeoutExpired(cmd, timeout)
 
@@ -113,8 +336,23 @@ async def run_openlane(
             ]
 
             openlane_design_copy = Path("/openlane/designs") / design_dir.name
+            key = _cache_key(design_dir, bundle_dir) if SYNTH_CACHE else None
+            hit = _cache_get(key) if key else None
+            if hit:
+                res = dict(hit["results"])
+                res["synthesis_cache"] = {"hit": True, "first_synthesized": hit["created"], "key": key[:16]}
+                print(f"[openlane-api] {submission_id} synthesis cache hit {key[:16]} "
+                      f"(first synthesized {hit['created']})", flush=True)
+                return RunResponse(success=True, results=res, results_zip_path=None, logs="")
+            # Reserving a lane is only half of it: the reservation has to be enforced inside the
+            # run, or a design that grows without bound exhausts the host and the OOM killer picks
+            # its victim by footprint rather than by blame -- letting one submission fail another.
+            env = dict(os.environ, NPUV1_SYNTH_MEM_MB=str(MEM_PER_RUN_MB),
+                       NPUV1_OPENLANE_TIMEOUT_S=str(RUNPY_TIMEOUT_S))
             async with _openlane_semaphore:
-                run = await _run_subprocess(cmd, work, timeout=3600)
+                # The timeout starts AFTER the lane is acquired, so time spent queued
+                # behind another synthesis is not charged to this one.
+                run = await _run_subprocess(cmd, work, timeout=EVAL_TIMEOUT_S, env=env)
                 # Clean up the design copy written into /openlane/designs/ by run.py
                 if openlane_design_copy.exists():
                     shutil.rmtree(openlane_design_copy, ignore_errors=True)
@@ -140,11 +378,10 @@ async def run_openlane(
                         logs=run['stdout'] + "\n" + run['stderr']
                     )
 
-            # --- Zip results folder ---
-            # out_zip = work / "results.zip"
-            # _safe_zip_dir(out_dir, out_zip)
-            # final_zip = RESULTS_DIR / f"{submission_id}_openlane.zip"
-            # shutil.copy(out_zip, final_zip)
+            if key:
+                if result_obj.get("success") is True:
+                    _cache_put(key, result_obj)
+                result_obj = dict(result_obj, synthesis_cache={"hit": False, "key": key[:16]})
 
             return RunResponse(
                 success=True,
@@ -153,8 +390,22 @@ async def run_openlane(
                 logs=run['stderr']
             )
 
+# A TIMEOUT IS REPORTED AS ONE. It used to fall into the generic `except Exception`, which stringified
+# subprocess.TimeoutExpired -- "Command '['python3', '/tmp/<dir>/run.py', ...]' timed out after N
+# seconds" -- so the validator got an internal path and a command line, and the gateway then labelled
+# it SERVICE_UNAVAILABLE. Now: code EVALUATION_TIMEOUT, fault system, retryable, the stage, and how
+# long it ran. Nothing internal.
+    except subprocess.TimeoutExpired:
+        return RunResponse(success=False, results={"error": {
+            "code": "EVALUATION_TIMEOUT", "category": "synthesis", "fault": "miner", "retryable": False,
+            "stage": "synthesis",
+            "message": (f"The synthesis did not finish within the {EVAL_TIMEOUT_S // 60}-minute run-time limit "
+                        "(time spent queued is not counted). A submission must complete evaluation within it.")}})
     except Exception as e:
-        return RunResponse(success=False, error_message=str(e))
+        return RunResponse(success=False, results={"error": {
+            "code": "INTERNAL_ERROR", "category": "system", "fault": "system", "retryable": True,
+            "stage": "synthesis",
+            "message": f"openlane-api failed internally: {type(e).__name__}. Not a property of the submission; retry."}})
 
 @app.get("/download_results")
 async def download_results():

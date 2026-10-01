@@ -5,12 +5,149 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from pathlib import Path
-import tempfile, subprocess, zipfile, shutil, json, asyncio, aiofiles
+import os, signal, tempfile, subprocess, zipfile, shutil, json, asyncio, aiofiles
 
-app = FastAPI(title="ChipForge Verilator API", version="4.0.0")
+
+def _envint(name, default):
+    """An env var that is SET BUT EMPTY is what `NAME=${NAME:-}` in a compose file produces, and
+    int("") raises. Treat empty, missing and unparseable all as absent."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return int(default)
+
+
+app = FastAPI(title="ChipForge Verilator API", version="4.0.0",
+              docs_url=None, redoc_url=None, openapi_url=None)  # no free schema for a scanner
 
 RESULTS_DIR = Path("/app/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# Capacity control.
+#
+# An evaluation is not one process: the bundle's run.py fans out into a batch of simulations, and
+# it sizes that batch from the CPUs it can see. That is correct for ONE evaluation and wrong for
+# several, because each concurrent request sizes itself as though it owned the machine. Measured
+# on a 12-core host: four concurrent evaluations launched 36 simulations, everything crawled, and
+# all four failed on their own internal budget.
+#
+# The service owns the host, so the service decides. Two levers, both sized at import:
+#   * how many evaluations may run at once, and
+#   * how wide each one may fan out -- handed to run.py through the knob it already reads.
+# Their product is what actually lands on the CPUs, and it is what we keep under the core count.
+def _cpus():
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 2)
+
+
+_CPUS = _cpus()
+# S simulation slots from capacity.py: physical cores minus the synthesis lanes openlane-api will
+# take, on the same rule, so the two services' sum is the machine. This replaces
+#     EVAL_LANES = min(4, cpus // 6)  and  FANOUT = (cpus - 1) // EVAL_LANES
+# which read LOGICAL cpus (12 here for 10 physical cores), had no memory term, and had nothing
+# recorded behind the 6. On this box that was 2 x 5 = 10 simulations beside 2-3 syntheses: thirteen
+# single-threaded processes on ten cores, and ABC -- the critical path of every accelerated group --
+# measured at 38-52 min contended against ~19 min alone.
+#
+# Lanes bound how many evaluations run at once; the CORES each one gets are decided per request
+# below, so a lone evaluation takes all of them.
+from capacity import plan as _capacity_plan, affinity as _affinity
+_PLAN = _capacity_plan("sim")
+SIM_SLOTS = _PLAN["S"]
+EVAL_LANES = _envint("VERILATOR_EVAL_LANES", 0) or max(1, min(4, SIM_SLOTS // 3))
+FANOUT_PER_EVAL = _envint("VERILATOR_FANOUT", 0) or max(1, SIM_SLOTS // EVAL_LANES)
+_eval_semaphore = asyncio.Semaphore(EVAL_LANES)
+
+# Per-request core allocation (2026-09-24). The simulation cpus are everything the synthesis lanes
+# do not own. Active evaluations hold disjoint, near-equal slices of them, re-cut on every admission
+# and every exit: one evaluation alone gets all S cores; when a second arrives the first is re-pinned
+# to half and the second gets the other half -- the same four cores each had under the fixed grid,
+# now dedicated, and off the synthesis cores' SMT siblings. Shrinking a running batch is safe: its
+# processes time-slice on fewer cpus and the throughput handed to the newcomer is exactly what they
+# give up. Without cpu topology there is nothing to pin to, and the fixed fanout applies.
+_SYNTH_CPUS = {c for core in _PLAN["synth_cores"] for c in core}
+_SIM_CPUS = sorted(_affinity() - _SYNTH_CPUS) if _PLAN["topology"] else []
+_active = []    # [[run.py pid or None, [cpus]], ...] in admission order; lists so a slice can be swapped
+
+
+def _slices(n):
+    """_SIM_CPUS cut into n contiguous near-equal slices, the first ones a cpu wider."""
+    base, extra = divmod(len(_SIM_CPUS), n)
+    out, i = [], 0
+    for k in range(n):
+        w = base + (1 if k < extra else 0)
+        out.append(_SIM_CPUS[i:i + w]); i += w
+    return out
+
+
+def _repin(entry):
+    """Apply an entry's slice to its whole process tree. run.py is spawned with start_new_session, so
+    its pid is the session id of everything it forks; a child inherits its parent's mask at fork, so
+    re-pinning the live tree also covers whatever it starts afterwards."""
+    pid, cpus = entry
+    if pid is None or not cpus:
+        return
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()   # after the comm: state ppid pgrp session ...
+            if int(fields[3]) == pid:
+                os.sched_setaffinity(int(p), cpus)
+        except (OSError, ValueError, IndexError):
+            pass
+
+
+def _rebalance():
+    if not _SIM_CPUS or not _active:
+        return
+    for entry, cpus in zip(_active, _slices(len(_active))):
+        if entry[1] != cpus:
+            entry[1] = cpus
+            _repin(entry)
+
+
+# ---------------------------------------------------------------------------------------------
+# ONE timeout knob, not three.
+#
+# There were three independent hardcoded ceilings on the same piece of work: the gateway waited
+# EDA_REQUEST_TIMEOUT_S for us, we killed the subprocess at 3600, and the bundle's run.py had its
+# own stage budget inside that. Raising the outermost one and believing the job was safe cost a
+# healthy 60-minute evaluation, killed at EXACTLY 3600s and reported as
+# "SERVICE_UNAVAILABLE (system)" -- which reads as a broken server, not as a budget.
+#
+# Now ONE clock decides, and it is a run-time limit, not a derived budget (decided 2026-09-24):
+#
+#   EVAL_TIMEOUT_S          45 min, counted from when the job LEAVES THE QUEUE. A submission still
+#                           running then has failed: fault miner, not retryable. Measured for the
+#                           16x16 reference (dummy_sol_2): 18 min alone on a 10-core laptop, ~25 min
+#                           sharing it with seven others, 11 min on an i9. The limit is a property of
+#                           the submission because queue time is excluded and concurrency is capped.
+#   run.py's own timers     set ABOVE the limit, so they never fire first and name a different fault.
+#   EDA_REQUEST_TIMEOUT_S   the gateway's ceiling; covers queue + run, so it is only a backstop for a
+#                           long queue, and its timeout stays fault system, retryable.
+GATEWAY_CEILING_S = _envint("EDA_REQUEST_TIMEOUT_S", 14400)
+EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", 2700)
+RUNPY_TIMEOUT_S = EVAL_TIMEOUT_S + 600
+if EVAL_TIMEOUT_S > GATEWAY_CEILING_S - 300:
+    print(f"WARN: EVAL_TIMEOUT_S={EVAL_TIMEOUT_S} leaves no room for queueing inside "
+          f"EDA_REQUEST_TIMEOUT_S={GATEWAY_CEILING_S}", flush=True)
+
+print(f"[verilator-api] P={_PLAN['P']} physical (of {_PLAN['logical']} logical, quota={_PLAN['quota']}) "
+      f"-> S={SIM_SLOTS} simulation slots (L={_PLAN['L']} reserved for synthesis)"
+      + (f"; WARN {'; '.join(_PLAN['warn'])}" if _PLAN['warn'] else ""), flush=True)
+print(f"[verilator-api] {_CPUS} cpus -> {EVAL_LANES} concurrent evaluations x {FANOUT_PER_EVAL} "
+      f"jobs each ({EVAL_LANES * FANOUT_PER_EVAL} peak); gateway ceiling "
+      f"{GATEWAY_CEILING_S}s -> kill at {EVAL_TIMEOUT_S}s, run.py stages {RUNPY_TIMEOUT_S}s",
+      flush=True)
 
 class EvalResponse(BaseModel):
     success: bool
@@ -30,23 +167,66 @@ def _unzip(zippath: Path, dest: Path):
         zf.extractall(dest)
 
 
+# Files that sit beside the VERILATOR run.py and nowhere else. The openlane bundle also contains a
+# run.py, so "the first run.py found" is a coin flip decided by directory iteration order.
+_VERILATOR_MARKERS = ("soc_files.f.in", "model_set.txt")
+
+
 def _find_run_py(root: Path) -> Optional[Path]:
-    # accept run.py anywhere inside the bundle (root or subdir like verilator/run.py)
-    for p in root.rglob("run.py"):
-        if p.is_file():
+    """The verilator run.py, identified by what is next to it rather than by where it is.
+
+    The bundle can arrive pre-sliced by the gateway (run.py at the root) or as the whole evaluator
+    archive (verilator/run.py beside openlane/run.py). rglob returned whichever the filesystem
+    listed first, and when that was openlane's the run died with
+
+        run.py: error: the following arguments are required: --out
+
+    because openlane's script takes --design/--out and this service passes --design/--resources.
+    Observed, not hypothesised. Picking by marker file cannot get it wrong: only the verilator
+    bundle ships soc_files.f.in.
+    """
+    candidates = [p for p in root.rglob("run.py") if p.is_file()]
+    for p in candidates:
+        if any((p.parent / m).exists() for m in _VERILATOR_MARKERS):
             return p
-    return None
+    # No marker anywhere -- fall back to the old behaviour so a malformed bundle still reaches
+    # run.py's own intake check, which names exactly what is missing.
+    return candidates[0] if candidates else None
 
 
-async def _run_subprocess(cmd, cwd, timeout=3600):
-    """Run subprocess asynchronously"""
+def _child_setup(cpus=None):
+    """Between fork and exec, inherited by run.py and every simulation and g++ it starts: if memory
+    runs out the kernel takes a job, never the service; and the request's core slice, when it has one."""
+    def _f():
+        try:
+            with open("/proc/self/oom_score_adj", "w") as f:
+                f.write("1000")
+        except OSError:
+            pass
+        if cpus:
+            try:
+                os.sched_setaffinity(0, cpus)
+            except (AttributeError, OSError):
+                pass
+    return _f
+
+
+async def _run_subprocess(cmd, cwd, timeout=3600, env=None, entry=None):
+    """Run subprocess asynchronously, pinned to entry's core slice when it has one."""
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,   # its own process group: a timeout kills the TREE, not the parent
+        preexec_fn=_child_setup(entry[1] if entry else None),
     )
-    
+    if entry is not None:
+        # The slice may have been re-cut between the fork and here; apply the current one.
+        entry[0] = process.pid
+        _repin(entry)
+
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         return_code = process.returncode
@@ -56,8 +236,14 @@ async def _run_subprocess(cmd, cwd, timeout=3600):
             'stdout': stdout.decode('utf-8') if stdout else '',
             'stderr': stderr.decode('utf-8') if stderr else ''
         }
-    except asyncio.TimeoutError:
-        process.kill()
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # Kill the GROUP. process.kill() reached only the direct child -- run.py, or tclsh -- and
+        # left every simulation, yosys and yosys-abc it had started running on, holding the cores
+        # after the lane that owned them had already been released to the next request.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
         await process.wait()
         raise subprocess.TimeoutExpired(cmd, timeout)
 
@@ -108,10 +294,45 @@ async def simulate_and_evaluate(
             cmd = [
                 "python3", str(run_py),
                 "--design", str(design_dir),
-                "--resources", str(bundle_dir),
+                # The RESOURCES ARE BESIDE run.py, not at the top of whatever was uploaded.
+                #
+                # _find_run_py deliberately accepts run.py in a subdirectory -- its own comment says
+                # "root or subdir like verilator/run.py" -- because the full evaluator archive can
+                # arrive here directly rather than pre-sliced by the gateway. But --resources then
+                # pointed at the extraction root, one level above everything run.py needs, and the
+                # run died at intake with "the evaluator bundle is missing 'soc_files.f.in'".
+                #
+                # Half-tolerant was worse than intolerant: it found the script, then blamed the
+                # bundle. Reported from a real deployment.
+                "--resources", str(run_py.parent),
             ]
             
-            proc = await _run_subprocess(cmd, tmp, timeout=3600)
+            # NPUV1_MAX_PARALLEL is the knob the bundle already honours; the service sets it so
+            # the batch is sized against this host's share, not against the whole machine.
+            # run.py's per-simulation timer is pinned ABOVE the run-time limit (floor and cap), so
+            # the one clock that decides is EVAL_TIMEOUT_S below.
+            env = dict(os.environ, NPUV1_MAX_PARALLEL=str(FANOUT_PER_EVAL),
+                       NPUV1_SIM_TIMEOUT_S=str(RUNPY_TIMEOUT_S),
+                       NPUV1_SIM_TIMEOUT_MAX_S=str(RUNPY_TIMEOUT_S))
+            async with _eval_semaphore:
+                # The timeout starts AFTER the lane is acquired, so time spent queued
+                # behind another evaluation is not charged to this one.
+                entry = [None, []]
+                if _SIM_CPUS:
+                    _active.append(entry)
+                    _rebalance()            # cuts this request its slice, shrinks the others
+                    # The slice IS the budget: run.py sizes its batch from the cpus it may use, and
+                    # inside a dedicated slice there is no service core to reserve.
+                    env["NPUV1_MAX_PARALLEL"] = str(len(entry[1]))
+                    env["NPUV1_RESERVE_CORES"] = "0"
+                    print(f"[verilator-api] {submission_id} cores {entry[1]} ({len(_active)} active)", flush=True)
+                try:
+                    proc = await _run_subprocess(cmd, tmp, timeout=EVAL_TIMEOUT_S, env=env,
+                                                 entry=entry if _SIM_CPUS else None)
+                finally:
+                    if _SIM_CPUS:
+                        _active.remove(entry)
+                        _rebalance()        # the others grow back
 
             if proc['returncode'] != 0:
                 return EvalResponse(
@@ -143,14 +364,39 @@ async def simulate_and_evaluate(
             #         # rewrite in payload for convenience
             #         details["results_zip"] = results_zip_path
 
+            # A SUCCESSFUL run's stderr was being thrown away -- only the two failure branches
+            # above keep it. So the one case worth understanding operationally, a healthy evaluation
+            # that took 52 minutes, left no record of where those minutes went. run.py now measures
+            # itself and puts the answer in details.timings; print a compact line so it is in
+            # `docker logs` too, where someone watching a slow queue will actually look.
+            _tm = ((payload or {}).get("details") or {}).get("timings") or {}
+            if _tm:
+                print(f"[verilator-api] {submission_id} ok in {_tm.get('total_s')}s  "
+                      + "  ".join(f"{k}={v}s" for k, v in _tm.items() if not k.endswith("_s"))
+                      + f"  unaccounted={_tm.get('unaccounted_s')}s", flush=True)
+
             return EvalResponse(
                 success=True,
                 results=payload,
                 results_zip_path=None
             )
 
+# A TIMEOUT IS REPORTED AS ONE. It used to fall into the generic `except Exception`, which stringified
+# subprocess.TimeoutExpired -- "Command '['python3', '/tmp/<dir>/run.py', ...]' timed out after N
+# seconds" -- so the validator got an internal path and a command line, and the gateway then labelled
+# it SERVICE_UNAVAILABLE. Now: code EVALUATION_TIMEOUT, fault system, retryable, the stage, and how
+# long it ran. Nothing internal.
+    except subprocess.TimeoutExpired:
+        return EvalResponse(success=False, results={"error": {
+            "code": "EVALUATION_TIMEOUT", "category": "simulation", "fault": "miner", "retryable": False,
+            "stage": "simulation",
+            "message": (f"The simulation did not finish within the {EVAL_TIMEOUT_S // 60}-minute run-time limit "
+                        "(time spent queued is not counted). A submission must complete evaluation within it.")}})
     except Exception as e:
-        return EvalResponse(success=False, error_message=str(e))
+        return EvalResponse(success=False, results={"error": {
+            "code": "INTERNAL_ERROR", "category": "system", "fault": "system", "retryable": True,
+            "stage": "simulation",
+            "message": f"verilator-api failed internally: {type(e).__name__}. Not a property of the submission; retry."}})
 
 
 @app.get("/download_results")

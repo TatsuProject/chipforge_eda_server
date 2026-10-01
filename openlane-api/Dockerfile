@@ -1,7 +1,8 @@
 # Pull ChipForge openlane image as base
-# TODO: pin to a specific tag (e.g. logicx101/openlane:2024.xx) once you identify
-#       the tag in use, to prevent cache-busting from upstream updates.
-FROM logicx101/openlane:latest
+# Pinned by digest (2026-09-26): the tools inside decide every area and fmax, and an unpinned tag
+# moved between July and September (the same core read 72.1 MHz then, 79.05 MHz now). Everyone
+# who evaluates must run this exact image.
+FROM logicx101/openlane@sha256:b5433bed02733611b385e0dc217512d2b459c83027c7b82178ffb2979b0e7d05
 
 # Install Python dependencies for FastAPI service
 RUN pip install --no-cache-dir \

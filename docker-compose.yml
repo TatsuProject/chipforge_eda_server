@@ -6,15 +6,27 @@ services:
       context: ./verilator-api
       dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "8001:8001"
+    # NOT published. The gateway reaches this service by compose DNS (gateway/main.py names
+    # verilator-api:8001); publishing it too meant /simulate_and_evaluate was reachable from
+    # outside with no gateway and no auth, on a service that executes run.py from the uploaded
+    # evaluator zip as root. Audit 2026-09-23.
     volumes:
       - ./shared:/shared
       - ./results:/app/results                # unified results path
     environment:
       - SERVICE_NAME=verilator-simulation
+      # Two clocks since 2026-09-24. What judges a submission is EVAL_TIMEOUT_S in each service:
+      # 45 minutes of RUN time, counted after the job leaves the queue, fault miner. This ceiling
+      # covers queue + run, so it is only a backstop for a long queue (fault system, retryable).
+      # It is the DEFAULT, not an export, because an exported value is lost on a daemon restart
+      # (it was, 2026-09-22).
+      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      # NOT curl: the verilator-api image does not carry it, so the check failed 113
+      # times in a row on a service that was answering /health in 1.4 ms. A health
+      # signal that is always red is a health signal nobody reads.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request as u; u.urlopen('http://localhost:8001/health', timeout=10)"]
       interval: 300s
       timeout: 20s
       retries: 2
@@ -25,8 +37,10 @@ services:
       context: ./openlane-api
       dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "8003:8003"
+    # NOT published. The gateway reaches this service by compose DNS (gateway/main.py names
+    # verilator-api:8003); publishing it too meant /simulate_and_evaluate was reachable from
+    # outside with no gateway and no auth, on a service that executes run.py from the uploaded
+    # evaluator zip as root. Audit 2026-09-23.
     volumes:
       - ./shared:/shared
       - ./results:/app/results                # unified results path
@@ -34,6 +48,7 @@ services:
       # - ./test_designs/rv32i:/openlane/designs/rv32i
     environment:
       - SERVICE_NAME=openlane-implementation
+      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
       - PDK_ROOT=/openlane/pdks
       - PDK=sky130A
       - STD_CELL_LIBRARY=sky130_fd_sc_hd
@@ -43,7 +58,11 @@ services:
     # volumes:
     #   - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      # NOT curl: the verilator-api image does not carry it, so the check failed 113
+      # times in a row on a service that was answering /health in 1.4 ms. A health
+      # signal that is always red is a health signal nobody reads.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request as u; u.urlopen('http://localhost:8003/health', timeout=10)"]
       interval: 300s
       timeout: 20s
       retries: 2
@@ -65,7 +84,13 @@ services:
     environment:
       - VERILATOR_URL=http://verilator-api:8001
       - OPENLANE_URL=http://openlane-api:8003
-      # EDA_API_KEY comes from .env
+      # TESTING ONLY: path to a mock result JSON (e.g. /shared/eda_mock.json). When set, /evaluate
+      # skips Verilator and OpenLane and returns that result. Empty (the default) evaluates normally.
+      - EDA_MOCK_FILE=${EDA_MOCK_FILE:-}
+      # How long to wait for both services. Raise it when a validator runs several evaluations at
+      # once: openlane-api serialises synthesis behind a Semaphore(1), so concurrent requests queue
+      # their synthesis end to end rather than overlapping.
+      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
 
 # Named volumes not needed if you standardize on ./results (remove clutter)
 # volumes:

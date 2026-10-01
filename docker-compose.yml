@@ -21,6 +21,12 @@ services:
       # It is the DEFAULT, not an export, because an exported value is lost on a daemon restart
       # (it was, 2026-09-22).
       - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
+      # Settings from .env (see .env.example); empty = automatic / built-in default
+      - EVAL_TIMEOUT_S=${EVAL_TIMEOUT_S:-}
+      - OPENLANE_LANES=${OPENLANE_LANES:-}
+      - VERILATOR_SIM_SLOTS=${VERILATOR_SIM_SLOTS:-}
+      - VERILATOR_EVAL_LANES=${VERILATOR_EVAL_LANES:-}
+      - VERILATOR_FANOUT=${VERILATOR_FANOUT:-}
     healthcheck:
       # NOT curl: the verilator-api image does not carry it, so the check failed 113
       # times in a row on a service that was answering /health in 1.4 ms. A health
@@ -49,6 +55,13 @@ services:
     environment:
       - SERVICE_NAME=openlane-implementation
       - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
+      # Settings from .env (see .env.example); empty = automatic / built-in default
+      - EVAL_TIMEOUT_S=${EVAL_TIMEOUT_S:-}
+      - OPENLANE_LANES=${OPENLANE_LANES:-}
+      - OPENLANE_MEM_PER_RUN_MB=${OPENLANE_MEM_PER_RUN_MB:-}
+      - VERILATOR_SIM_SLOTS=${VERILATOR_SIM_SLOTS:-}
+      - OPENLANE_SYNTH_CACHE=${OPENLANE_SYNTH_CACHE:-}
+      - OPENLANE_SYNTH_CACHE_KEEP=${OPENLANE_SYNTH_CACHE_KEEP:-}
       - PDK_ROOT=/openlane/pdks
       - PDK=sky130A
       - STD_CELL_LIBRARY=sky130_fd_sc_hd
@@ -74,7 +87,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # 127.0.0.1 by default: /evaluate executes code from the uploaded evaluator ZIP and has no
+      # API key. Set EDA_BIND_ADDRESS=0.0.0.0 in .env only behind a firewall (see .env.example).
+      - "${EDA_BIND_ADDRESS:-127.0.0.1}:8080:8080"
     depends_on:
       - verilator-api
       - openlane-api
@@ -87,6 +102,8 @@ services:
       # TESTING ONLY: path to a mock result JSON (e.g. /shared/eda_mock.json). When set, /evaluate
       # skips Verilator and OpenLane and returns that result. Empty (the default) evaluates normally.
       - EDA_MOCK_FILE=${EDA_MOCK_FILE:-}
+      - C15_MAX_SUBMISSION_MB=${C15_MAX_SUBMISSION_MB:-300}
+      - C15_MAX_UNCOMPRESSED_MB=${C15_MAX_UNCOMPRESSED_MB:-4096}
       # How long to wait for both services. Raise it when a validator runs several evaluations at
       # once: openlane-api serialises synthesis behind a Semaphore(1), so concurrent requests queue
       # their synthesis end to end rather than overlapping.

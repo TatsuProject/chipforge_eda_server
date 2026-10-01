@@ -1,130 +1,105 @@
 # ChipForge EDA Tools Server
 
-A production-ready, containerized solution for evaluating hardware designs described in Verilog/SystemVerilog using Verilator and OpenLane. Built for ChipForge, it enables automated simulation and validation workflows. This guide helps validators and miners quickly set up, test, and operate the server from both the terminal and the GUI.
+A production-ready, containerized solution for evaluating hardware designs described in Verilog/SystemVerilog using Verilator and OpenLane. Built for ChipForge, it enables automated simulation and validation workflows. This guide helps validators and miners quickly set up, test, and operate the server from the terminal.
 
 ---
 
 ## Features
-- Integrated EDA Tools: Verilator (simulation) and OpenLane (area, performance, and soon power evaluation)
-- Evaluation Metrics: Functionality, area, performance, and (coming soon) power
-- File Management: Direct upload, automatic parsing, ZIP archival
+- **Simulation** with Verilator: functionality score from the challenge's testbench
+- **Synthesis** with OpenLane (sky130): area and performance
+- One endpoint, `POST /evaluate`, that runs both and returns the scores and the pass/fail gates
+- Sizes itself to the machine: parallel simulation and synthesis lanes are derived from the CPU cores
+  and memory (override in `.env`)
+
+Validators run this server next to their validator; miners can run it to test designs before submitting.
 
 ---
 
 ## Project Structure
-```bash
+```
 chipforge_eda_server/
-├── .env.example
+├── .env.example          # every setting, with defaults (copy to .env)
+├── docker-compose.yml    # the three services
 ├── Makefile
-├── README.md
-├── docker-compose.yml
-├── example_usage.py
-├── gateway/
-│   ├── Dockerfile
-│   ├── main.py
-│   ├── requirements.txt
-│   └── evaluator/
-│       ├── evaluator.py
-│       ├── evaluator.txt
-│       └── evaluator.zip
-├── test_designs/
-│   ├── adder.zip
-│   └── adder_evaluator.zip
-├── verilator-api/
-│   ├── Dockerfile
-│   ├── main.py
-│   └── requirements.txt
-├── openlane-api/
-│   ├── Dockerfile
-│   ├── main.py
-│   └── requirements.txt
+├── gateway/              # POST /evaluate on port 8080: unpacks, calls the two services, scores
+├── verilator-api/        # simulation service (internal port 8001)
+├── openlane-api/         # synthesis service (internal port 8003)
+├── capacity.py           # how lanes are sized from the machine
+├── example_usage.py      # sends test/*.zip to the gateway (make test)
+├── test/                 # adder.zip + adder_evaluator.zip: a design and its evaluator bundle
+├── shared/, results/     # mounted into the containers (gitignored)
 ```
 
 ---
 
-## Quick Start for Setting up the EDA Server
+## Quick Start
 
-1. **Prerequisites**: Docker, Docker Compose, Python 3.8+, 8GB+ RAM, 20GB+ disk.
+1. **Prerequisites**: Linux with Docker and the Docker Compose plugin. 16 GB+ RAM recommended (each
+   synthesis run reserves about 6 GB), 25 GB+ free disk (the images are about 9 GB), and Python 3 with
+   `requests` for the test script.
 
-2. **Clone & Setup**:
-   ```fish
+2. **Clone and configure**:
+   ```bash
    git clone https://github.com/TatsuProject/chipforge_eda_server
    cd chipforge_eda_server
-   cp .env.example .env
-   # Edit .env if needed
+   cp .env.example .env      # optional: the defaults work; see "Configuration"
    ```
 
-3. **Build Docker Images**:
-   ```fish
-   make build
-   # If this fails (sometimes due to internet speed), just run 'make build' again until it succeeds
+3. **Build and start**:
+   ```bash
+   make start                # build the images and start the services
+   # A failed build is usually a download timeout: run it again.
    ```
 
-4. **Run Test from Terminal**:
-   ```fish
-   make test
-   # This will build, start all services, and run the validator script (example_usage.py)
+4. **Check it works**:
+   ```bash
+   make health               # {"status": "ok"}
+   pip install requests
+   make test                 # evaluates test/adder.zip against test/adder_evaluator.zip
    ```
+
+5. **Validators:** set `EDA_SERVER_URL=http://localhost:8080` in the validator's `.env` (the default)
+   and start the validator after this server is up.
+
+**Updating:** `git pull`, compare your `.env` with `.env.example` for new settings, then `make start`.
 
 ---
 
-## Step-by-Step Usage (Manual Control)
-- Build Docker images:
-  ```fish
-  make build
-  ```
-- Start all services (if already built):
-  ```fish
-  make up
-  ```
-- Build and start all services together:
-  ```fish
-  make start
-  ```
-- Run the validator script (if services are already running):
-  ```fish
-  python3 example_usage.py
-  ```
-- Check health:
-  ```fish
-  make health
-  ```
-- View logs:
-  ```fish
-  make logs
-  ```
+## Configuration
 
----
+All settings are in [`.env.example`](.env.example) and are optional; docker compose reads `.env` from
+this folder. Apply a change with `docker compose up -d`.
 
-## Command-line Usage
-```sh
-curl -X POST http://localhost:8080/evaluate \
-     -F "design_zip=@design.zip" -F "evaluator_zip=@evaluator.zip" -F "submission_id=my_run"
-```
+| setting | default | what it does |
+|---|---|---|
+| `EDA_BIND_ADDRESS` | `127.0.0.1` | interface port 8080 is published on (see Security) |
+| `EVAL_TIMEOUT_S`, `EDA_REQUEST_TIMEOUT_S` | 2700, 14400 | see "Time limits" |
+| `OPENLANE_LANES`, `VERILATOR_EVAL_LANES`, ... | automatic | parallel synthesis/simulation; the startup logs print the plan |
+| `C15_MAX_SUBMISSION_MB`, `C15_MAX_UNCOMPRESSED_MB` | 300, 4096 | upload and unpacked-size limits |
+| `EDA_MOCK_FILE` | empty | testing only, see "Mock mode" |
 
 ---
 
 ## Makefile Commands
-- `make build` — Build all Docker images
-- `make up` — Start all services
-- `make start` — Build and start all services together
-- `make test` — Build, start, and run the validator script (all-in-one)
-- `make health` — Check API health
-- `make logs` — View logs
-- `make down` — Stop all services
-- `make clean` — Remove containers and prune system
-- `make restart-gateway` — Restart only the gateway service
-- `build-gateway` — Build only the gateway service
-- `build-verilator` — Build only the verilator-api service
+- `make start` — build and start all services
+- `make build` / `make up` / `make down` — build, start, stop
+- `make logs` — follow the logs of all services
+- `make health` — check the gateway
+- `make test` — run `example_usage.py` against the running services
+- `make clean` — stop, remove volumes and prune Docker
+- `make restart-gateway` / `make restart-openlane` — rebuild and restart one service
 
 ---
 
 ## API Usage
 - **Main Evaluation Endpoint**: `POST /evaluate` on port 8080, with the design and evaluator ZIPs.
+  ```bash
+  curl -X POST http://localhost:8080/evaluate \
+       -F "design_zip=@design.zip" -F "evaluator_zip=@evaluator.zip" -F "submission_id=my_run"
+  ```
+- `GET /health` answers without running anything.
 - The gateway is the only published port. verilator-api (8001) and openlane-api (8003) are reachable
   only on the internal Docker network. The interactive `/docs` page is disabled.
-
----
 
 ## Security
 
@@ -136,8 +111,9 @@ their own.
 - **There is no API key.** Access control is network-level: **never expose port 8080 to the
   internet.** Allow it only from the machine(s) that send evaluations: `localhost`, or an AWS
   security group / firewall rule limited to your validator's IP.
-- If the validator runs on the same machine, you can also bind the port to localhost in
-  `docker-compose.yml` (`"127.0.0.1:8080:8080"`).
+- **By default the port is bound to `127.0.0.1`** (`EDA_BIND_ADDRESS` in `.env`), so only the same
+  machine can reach it. If the validator runs elsewhere, set `EDA_BIND_ADDRESS=0.0.0.0` **and** allow
+  port 8080 only from the validator's IP.
 
 ## Time limits
 
@@ -153,25 +129,21 @@ Every failure is returned in one shape: `error{code, category, fault, retryable,
 ## Python Client Example
 
 ```python
-# example_usage.py (run with: make test)
-import os
 import requests
-BASE_URL = os.getenv("EDA_BASE_URL", "http://localhost:8080")
-design_zip = "test_designs/adder.zip"
-evaluator_zip = "test_designs/adder_evaluator.zip"
-with open(design_zip, "rb") as d, open(evaluator_zip, "rb") as e:
-    files = {
-        "design_zip": (os.path.basename(design_zip), d, "application/zip"),
-        "evaluator_zip": (os.path.basename(evaluator_zip), e, "application/zip")
-    }
-    resp = requests.post(f"{BASE_URL}/evaluate", files=files)
-    print(resp.json() if resp.ok else resp.text)
+with open("test/adder.zip", "rb") as d, open("test/adder_evaluator.zip", "rb") as e:
+    resp = requests.post("http://localhost:8080/evaluate",
+                         files={"design_zip": d, "evaluator_zip": e},
+                         data={"submission_id": "my_run"})
+print(resp.json())
 ```
+
+`example_usage.py` does the same for the ZIPs in `test/` (`EDA_BASE_URL` and `EDA_TEST_DIR` override
+the URL and folder).
 
 ---
 
 ## Testing & Validation
-- Run `make test` to verify simulation from the terminal.
+- `make test` evaluates the example design in `test/` end to end.
 
 ### Mock mode (testing only)
 
@@ -196,6 +168,7 @@ return a fixed result instead of running Verilator and OpenLane.
    ```bash
    EDA_MOCK_FILE=/shared/eda_mock.json docker compose up -d --build eda-gateway
    ```
+   (or set `EDA_MOCK_FILE=/shared/eda_mock.json` in `.env` and run `docker compose up -d`)
 3. Edit the file at any time: it is re-read on every request, no restart needed.
 
 | field | effect |
@@ -206,16 +179,19 @@ return a fixed result instead of running Verilator and OpenLane.
 | `result` | `"ERROR"` returns a retryable system error instead of a score |
 
 Mocked responses carry `"mock": true` and the gateway logs `[MOCK] … no EDA tools ran` for each one.
-To turn it off, restart without the variable: `docker compose up -d --build eda-gateway`.
+To turn it off, empty `EDA_MOCK_FILE` (in `.env` or the shell) and run `docker compose up -d --build eda-gateway`.
 **Never set `EDA_MOCK_FILE` on a production EDA server.**
 
 ---
 
 ## Monitoring & Troubleshooting
-- Health: `/health`, `/metrics`, `/status`
-- Logging: JSON, ELK stack, Sentry
-- Use `make logs`, and check `.env` for issues.
-- See docs for common errors and solutions.
+- `make health` (or `curl http://localhost:8080/health`) must return `{"status": "ok"}`.
+- `make logs` shows all three services; at startup each prints its capacity plan (lanes, cores, memory).
+- `docker compose ps` shows whether the services are up and healthy.
+- Every failed evaluation carries `error.code`, `error.stage` and `error.fault` (`miner` or `system`)
+  in the response; the validator logs them.
+- A validator that cannot connect: check `EDA_SERVER_URL` in its `.env`, and that it runs on the same
+  machine (or that `EDA_BIND_ADDRESS` and the firewall allow it).
 
 ---
 
@@ -234,6 +210,3 @@ MIT License—see `LICENSE`.
 - Email: contact@tatsuecosystem.io
 
 ---
-
-**Ready to revolutionize hardware design evaluation!**
-*Built with ❤️ for the hardware design community*

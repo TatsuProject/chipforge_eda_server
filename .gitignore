@@ -14,6 +14,7 @@ ENV/
 # Environment variables & secrets
 *.env
 .env.*
+!.env.example
 .envrc
 
 # Results, test artifacts, and shared data

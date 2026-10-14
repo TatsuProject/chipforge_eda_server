@@ -1,6 +1,7 @@
 # openlane-api/main.py
 
 import os, signal, json, zipfile, tempfile, shutil, subprocess, asyncio, aiofiles, uuid
+import deadline
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -101,9 +102,14 @@ OPENLANE_LANES = _envint("OPENLANE_LANES", 0) or _PLAN["L"]
 #   run.py's own timers     set ABOVE the limit, so they never fire first and name a different fault.
 #   EDA_REQUEST_TIMEOUT_S   the gateway's ceiling; covers queue + run, so it is only a backstop for a
 #                           long queue, and its timeout stays fault system, retryable.
+#
+# Since 2026-10-14 the clock is the CHALLENGE SERVER's batch deadline (deadline.py): the validator sends
+# time_limit_s with each request and the run gets what is left of it after this service's queue.
+# EVAL_TIMEOUT_S now applies only to a request without one (a validator older than this change).
 GATEWAY_CEILING_S = _envint("EDA_REQUEST_TIMEOUT_S", 14400)
 EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", 2700)
-RUNPY_TIMEOUT_S = EVAL_TIMEOUT_S + 600
+RUNPY_MARGIN_S = 600     # the flow's own timer sits this far ABOVE the run's limit: it never fires first
+RUNPY_TIMEOUT_S = EVAL_TIMEOUT_S + RUNPY_MARGIN_S
 if EVAL_TIMEOUT_S > GATEWAY_CEILING_S - 300:
     print(f"WARN: EVAL_TIMEOUT_S={EVAL_TIMEOUT_S} leaves no room for queueing inside "
           f"EDA_REQUEST_TIMEOUT_S={GATEWAY_CEILING_S}", flush=True)
@@ -292,8 +298,11 @@ async def _run_subprocess_pinned(cmd, cwd, timeout, env, cpus):
 async def run_openlane(
     design_zip: UploadFile = File(..., description="Miner design.zip (rtl/, rtl.f, etc.)"),
     openlane_bundle: UploadFile = File(..., description="Bundle with flow.tcl, config.json, constraints.sdc, run.py"),
-    submission_id: str = Form(None)
+    submission_id: str = Form(None),
+    time_limit_s: str = Form(None, description="Seconds this request may take from its arrival (batch deadline); absent = EVAL_TIMEOUT_S"),
+    fair_limit_s: str = Form(None, description="Run time every submission of the batch is entitled to (whose fault a timeout is)"),
 ):
+    budget = deadline.Budget(time_limit_s, fair_limit_s, cap_s=EVAL_TIMEOUT_S, ceiling_s=GATEWAY_CEILING_S)
     try:
         with tempfile.TemporaryDirectory() as tmpd:
             work = Path(tmpd)
@@ -347,12 +356,19 @@ async def run_openlane(
             # Reserving a lane is only half of it: the reservation has to be enforced inside the
             # run, or a design that grows without bound exhausts the host and the OOM killer picks
             # its victim by footprint rather than by blame -- letting one submission fail another.
-            env = dict(os.environ, NPUV1_SYNTH_MEM_MB=str(MEM_PER_RUN_MB),
-                       NPUV1_OPENLANE_TIMEOUT_S=str(RUNPY_TIMEOUT_S))
+            env = dict(os.environ, NPUV1_SYNTH_MEM_MB=str(MEM_PER_RUN_MB))
             async with _openlane_semaphore:
-                # The timeout starts AFTER the lane is acquired, so time spent queued
-                # behind another synthesis is not charged to this one.
-                run = await _run_subprocess(cmd, work, timeout=EVAL_TIMEOUT_S, env=env)
+                # The run gets what is left of the request's budget after the queue (deadline.py);
+                # without a budget, EVAL_TIMEOUT_S from now, as before.
+                run_s = budget.start()
+                if run_s is None:
+                    err = budget.not_started("openlane", "synthesis")
+                    print(f"[openlane-api] {submission_id} not started: {err['message']}", flush=True)
+                    return RunResponse(success=False, results={"error": err})
+                env["NPUV1_OPENLANE_TIMEOUT_S"] = str(int(run_s) + RUNPY_MARGIN_S)
+                print(f"[openlane-api] {submission_id} limit {deadline.fmt(run_s)} ({budget.limited_by}), "
+                      f"queued {deadline.fmt(budget.queued_s)}", flush=True)
+                run = await _run_subprocess(cmd, work, timeout=run_s, env=env)
                 # Clean up the design copy written into /openlane/designs/ by run.py
                 if openlane_design_copy.exists():
                     shutil.rmtree(openlane_design_copy, ignore_errors=True)
@@ -395,12 +411,12 @@ async def run_openlane(
 # seconds" -- so the validator got an internal path and a command line, and the gateway then labelled
 # it SERVICE_UNAVAILABLE. Now: code EVALUATION_TIMEOUT, fault system, retryable, the stage, and how
 # long it ran. Nothing internal.
+    # Since 2026-10-14: code EDA_TIMEOUT_SYNTHESIS, the limit, what set it (the batch deadline or
+    # EVAL_TIMEOUT_S), and whose fault it is (deadline.py).
     except subprocess.TimeoutExpired:
-        return RunResponse(success=False, results={"error": {
-            "code": "EVALUATION_TIMEOUT", "category": "synthesis", "fault": "miner", "retryable": False,
-            "stage": "synthesis",
-            "message": (f"The synthesis did not finish within the {EVAL_TIMEOUT_S // 60}-minute run-time limit "
-                        "(time spent queued is not counted). A submission must complete evaluation within it.")}})
+        err = budget.timeout_error("openlane", "synthesis")
+        print(f"[openlane-api] {submission_id} {err['code']} fault={err['fault']}: {err['message']}", flush=True)
+        return RunResponse(success=False, results={"error": err})
     except Exception as e:
         return RunResponse(success=False, results={"error": {
             "code": "INTERNAL_ERROR", "category": "system", "fault": "system", "retryable": True,

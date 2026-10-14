@@ -117,12 +117,33 @@ their own.
 
 ## Time limits
 
+The time an evaluation may take is set by the **challenge server**: every batch has an evaluation
+deadline, and the validator sends each request with what is left of it (`/evaluate` form fields):
+
+| field | meaning |
+|---|---|
+| `time_limit_s` | seconds this evaluation may take from now (the batch deadline minus the validator's margin for answering) |
+| `fair_limit_s` | the run time every submission of the batch is entitled to (the evaluation window minus the margins) |
+
+The gateway forwards what is left of `time_limit_s` to Verilator and OpenLane. Each service measures it
+from the request's arrival, so time spent in its queue is spent from it, and runs the job for the rest.
+A job with less than 2 minutes left when it leaves the queue is not started (`EDA_QUEUE_EXHAUSTED`).
+
+A run that reaches its limit returns `EDA_TIMEOUT_<STAGE>` (`INTAKE`, `COMPILE`, `BUILD`, `SIMULATION`,
+`ROBUSTNESS`, `SYNTHESIS`) with `where` (`eda_server/verilator` or `eda_server/openlane`) and `timing`
+(`limit_s`, `used_s`, `queued_s`, `limited_by`). Whose fault it is:
+
+- the run had at least `fair_limit_s` (or `EVAL_TIMEOUT_S` without a budget): fault `miner`, score 0;
+- it had less (it waited in a queue, or the validator sent it late): fault `system`, retryable; the
+  challenge server evaluates it again in a later batch.
+
 | setting | default | what it means |
 |---|---|---|
-| `EVAL_TIMEOUT_S` | 2700 (45 min) | Run-time limit per evaluation, counted after it leaves the queue. Exceeding it is `EVALUATION_TIMEOUT`, fault `miner`, not retryable. |
-| `EDA_REQUEST_TIMEOUT_S` | 14400 (4 h) | Gateway ceiling on queue + run. Only a backstop for a long queue; exceeding it is fault `system`, retryable. |
+| `EVAL_TIMEOUT_S` | 2700 (45 min) | Run-time limit for a request **without** `time_limit_s` (an older validator), counted after the queue. Exceeding it is `EDA_TIMEOUT_<STAGE>`, fault `miner`. |
+| `EDA_REQUEST_TIMEOUT_S` | 14400 (4 h) | Gateway ceiling on queue + run. Keep it above the batch evaluation window: a longer budget is cut to it, and a run stopped by it is fault `system`, retryable. |
 
-Every failure is returned in one shape: `error{code, category, fault, retryable, stage, message}`.
+Every failure is returned in one shape: `error{code, category, fault, retryable, stage, message}`
+(timeouts add `where` and `timing`).
 
 ---
 

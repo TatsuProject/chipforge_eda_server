@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# The three copies of capacity.py must be byte-identical. Each service's docker build context is
-# its own directory, so the module is vendored rather than imported from the repo root -- which is
-# exactly how two copies of one rule start to disagree. This is the check that stops it.
+# The vendored modules (capacity.py, deadline.py) must be byte-identical in all three places. Each
+# service's docker build context is its own directory, so the modules are vendored rather than
+# imported from the repo root -- which is exactly how two copies of one rule start to disagree. This
+# is the check that stops it.
 set -u
 cd "$(dirname "$0")"
 ok=1
-for c in verilator-api/capacity.py openlane-api/capacity.py; do
-  cmp -s capacity.py "$c" || { echo "DRIFT: $c differs from capacity.py"; ok=0; }
+for m in capacity.py deadline.py; do
+  for c in "verilator-api/$m" "openlane-api/$m"; do
+    cmp -s "$m" "$c" || { echo "DRIFT: $c differs from $m"; ok=0; }
+  done
 done
-[ $ok = 1 ] && echo "capacity.py: all copies identical" || exit 1
+[ $ok = 1 ] && echo "capacity.py, deadline.py: all copies identical" || exit 1

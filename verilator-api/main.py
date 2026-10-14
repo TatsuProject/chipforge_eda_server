@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from pathlib import Path
 import os, signal, tempfile, subprocess, zipfile, shutil, json, asyncio, aiofiles
+import deadline
 
 
 def _envint(name, default):
@@ -134,9 +135,14 @@ def _rebalance():
 #   run.py's own timers     set ABOVE the limit, so they never fire first and name a different fault.
 #   EDA_REQUEST_TIMEOUT_S   the gateway's ceiling; covers queue + run, so it is only a backstop for a
 #                           long queue, and its timeout stays fault system, retryable.
+#
+# Since 2026-10-14 the clock is the CHALLENGE SERVER's batch deadline (deadline.py): the validator sends
+# time_limit_s with each request and the run gets what is left of it after this service's queue.
+# EVAL_TIMEOUT_S now applies only to a request without one (a validator older than this change).
 GATEWAY_CEILING_S = _envint("EDA_REQUEST_TIMEOUT_S", 14400)
 EVAL_TIMEOUT_S = _envint("EVAL_TIMEOUT_S", 2700)
-RUNPY_TIMEOUT_S = EVAL_TIMEOUT_S + 600
+RUNPY_MARGIN_S = 600     # run.py's own stage timers sit this far ABOVE the run's limit: they never fire first
+RUNPY_TIMEOUT_S = EVAL_TIMEOUT_S + RUNPY_MARGIN_S
 if EVAL_TIMEOUT_S > GATEWAY_CEILING_S - 300:
     print(f"WARN: EVAL_TIMEOUT_S={EVAL_TIMEOUT_S} leaves no room for queueing inside "
           f"EDA_REQUEST_TIMEOUT_S={GATEWAY_CEILING_S}", flush=True)
@@ -211,8 +217,37 @@ def _child_setup(cpus=None):
     return _f
 
 
-async def _run_subprocess(cmd, cwd, timeout=3600, env=None, entry=None):
+class RunTimeout(Exception):
+    """run.py hit the request's limit; `stage` is the stage its log had reached."""
+    def __init__(self, stage):
+        super().__init__(stage)
+        self.stage = stage
+
+
+async def _read_stderr(stream, progress):
+    """Collect run.py's stderr, following the stage each line reports (deadline.stage_of), so a run
+    stopped at its limit can say WHERE it was stopped."""
+    # Chunks, not readline(): a single stderr line longer than the stream's 64 KB limit (a compiler
+    # error can be) makes readline() raise, and that would turn a normal run into an internal error.
+    chunks, partial = [], b""
+    while True:
+        raw = await stream.read(65536)
+        if not raw:
+            if partial:
+                progress["stage"] = deadline.stage_of(partial.decode("utf-8", errors="replace"), progress["stage"])
+            return b"".join(chunks).decode("utf-8", errors="replace")
+        chunks.append(raw)
+        *complete, partial = (partial + raw).split(b"\n")
+        for line in complete:
+            progress["stage"] = deadline.stage_of(line.decode("utf-8", errors="replace"), progress["stage"])
+        if len(partial) > 65536:          # an endless line: its start is all a stage label could be
+            progress["stage"] = deadline.stage_of(partial[:4096].decode("utf-8", errors="replace"), progress["stage"])
+            partial = b""
+
+
+async def _run_subprocess(cmd, cwd, timeout=3600, env=None, entry=None, progress=None):
     """Run subprocess asynchronously, pinned to entry's core slice when it has one."""
+    progress = progress if progress is not None else {"stage": "intake"}
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -227,16 +262,21 @@ async def _run_subprocess(cmd, cwd, timeout=3600, env=None, entry=None):
         entry[0] = process.pid
         _repin(entry)
 
+    async def _both():
+        out, err = await asyncio.gather(process.stdout.read(), _read_stderr(process.stderr, progress))
+        await process.wait()
+        return out, err
+
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        stdout, stderr = await asyncio.wait_for(_both(), timeout=timeout)
         return_code = process.returncode
-        
+
         return {
             'returncode': return_code,
             'stdout': stdout.decode('utf-8') if stdout else '',
-            'stderr': stderr.decode('utf-8') if stderr else ''
+            'stderr': stderr or ''
         }
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except (asyncio.TimeoutError, asyncio.CancelledError) as e:
         # Kill the GROUP. process.kill() reached only the direct child -- run.py, or tclsh -- and
         # left every simulation, yosys and yosys-abc it had started running on, holding the cores
         # after the lane that owned them had already been released to the next request.
@@ -245,15 +285,21 @@ async def _run_subprocess(cmd, cwd, timeout=3600, env=None, entry=None):
         except (ProcessLookupError, PermissionError):
             process.kill()
         await process.wait()
-        raise subprocess.TimeoutExpired(cmd, timeout)
+        if isinstance(e, asyncio.CancelledError):
+            raise
+        raise RunTimeout(progress["stage"])
 
 
 @app.post("/simulate_and_evaluate", response_model=EvalResponse)
 async def simulate_and_evaluate(
     design_zip: UploadFile = File(..., description="Miner design (zip with rtl.f + rtl/...)"),
     verilator_bundle: UploadFile = File(..., description="Evaluator's Verilator bundle (run.py, tb_files.f, Makefile, Regression.mk, tests/, scripts/, top_module.txt)"),
-    submission_id: str = Form(None)
+    submission_id: str = Form(None),
+    time_limit_s: str = Form(None, description="Seconds this request may take from its arrival (batch deadline); absent = EVAL_TIMEOUT_S"),
+    fair_limit_s: str = Form(None, description="Run time every submission of the batch is entitled to (whose fault a timeout is)"),
 ):
+    budget = deadline.Budget(time_limit_s, fair_limit_s, cap_s=EVAL_TIMEOUT_S, ceiling_s=GATEWAY_CEILING_S)
+    progress = {"stage": "intake"}
     try:
         with tempfile.TemporaryDirectory() as tmpd:
             tmp = Path(tmpd)
@@ -309,14 +355,24 @@ async def simulate_and_evaluate(
             
             # NPUV1_MAX_PARALLEL is the knob the bundle already honours; the service sets it so
             # the batch is sized against this host's share, not against the whole machine.
-            # run.py's per-simulation timer is pinned ABOVE the run-time limit (floor and cap), so
-            # the one clock that decides is EVAL_TIMEOUT_S below.
-            env = dict(os.environ, NPUV1_MAX_PARALLEL=str(FANOUT_PER_EVAL),
-                       NPUV1_SIM_TIMEOUT_S=str(RUNPY_TIMEOUT_S),
-                       NPUV1_SIM_TIMEOUT_MAX_S=str(RUNPY_TIMEOUT_S))
+            # run.py's own timers are pinned ABOVE the run's limit below, so the one clock that decides
+            # is the request's budget (or EVAL_TIMEOUT_S without one).
+            env = dict(os.environ, NPUV1_MAX_PARALLEL=str(FANOUT_PER_EVAL))
             async with _eval_semaphore:
-                # The timeout starts AFTER the lane is acquired, so time spent queued
-                # behind another evaluation is not charged to this one.
+                # The run gets what is left of the request's budget after the queue (deadline.py);
+                # without a budget, EVAL_TIMEOUT_S from now, as before.
+                run_s = budget.start()
+                if run_s is None:
+                    err = budget.not_started("verilator", "intake")
+                    print(f"[verilator-api] {submission_id} not started: {err['message']}", flush=True)
+                    return EvalResponse(success=False, results={"error": err})
+                # Every timer inside run.py (compile, build, each simulation) sits ABOVE the run's
+                # limit, so the one that fires is ours and names the stage it stopped.
+                runpy_s = str(int(run_s) + RUNPY_MARGIN_S)
+                env.update(NPUV1_SIM_TIMEOUT_S=runpy_s, NPUV1_SIM_TIMEOUT_MAX_S=runpy_s,
+                           NPUV1_BUILD_TIMEOUT_S=runpy_s, NPUV1_COMPILE_TIMEOUT_S=runpy_s)
+                print(f"[verilator-api] {submission_id} limit {deadline.fmt(run_s)} ({budget.limited_by}), "
+                      f"queued {deadline.fmt(budget.queued_s)}", flush=True)
                 entry = [None, []]
                 if _SIM_CPUS:
                     _active.append(entry)
@@ -327,8 +383,8 @@ async def simulate_and_evaluate(
                     env["NPUV1_RESERVE_CORES"] = "0"
                     print(f"[verilator-api] {submission_id} cores {entry[1]} ({len(_active)} active)", flush=True)
                 try:
-                    proc = await _run_subprocess(cmd, tmp, timeout=EVAL_TIMEOUT_S, env=env,
-                                                 entry=entry if _SIM_CPUS else None)
+                    proc = await _run_subprocess(cmd, tmp, timeout=run_s, env=env,
+                                                 entry=entry if _SIM_CPUS else None, progress=progress)
                 finally:
                     if _SIM_CPUS:
                         _active.remove(entry)
@@ -386,12 +442,12 @@ async def simulate_and_evaluate(
 # seconds" -- so the validator got an internal path and a command line, and the gateway then labelled
 # it SERVICE_UNAVAILABLE. Now: code EVALUATION_TIMEOUT, fault system, retryable, the stage, and how
 # long it ran. Nothing internal.
-    except subprocess.TimeoutExpired:
-        return EvalResponse(success=False, results={"error": {
-            "code": "EVALUATION_TIMEOUT", "category": "simulation", "fault": "miner", "retryable": False,
-            "stage": "simulation",
-            "message": (f"The simulation did not finish within the {EVAL_TIMEOUT_S // 60}-minute run-time limit "
-                        "(time spent queued is not counted). A submission must complete evaluation within it.")}})
+    # Since 2026-10-14: code EDA_TIMEOUT_<STAGE>, the stage run.py had reached, the limit, what set it
+    # (the batch deadline or EVAL_TIMEOUT_S), and whose fault it is (deadline.py).
+    except RunTimeout as t:
+        err = budget.timeout_error("verilator", t.stage)
+        print(f"[verilator-api] {submission_id} {err['code']} fault={err['fault']}: {err['message']}", flush=True)
+        return EvalResponse(success=False, results={"error": err})
     except Exception as e:
         return EvalResponse(success=False, results={"error": {
             "code": "INTERNAL_ERROR", "category": "system", "fault": "system", "retryable": True,

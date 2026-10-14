@@ -221,9 +221,11 @@ async def make_http_request(session: aiohttp.ClientSession, url: str, files_data
     """Make async HTTP request with multipart files"""
     data = aiohttp.FormData()
     for field_name, value in files_data.items():
-        if field_name == "submission_id":
-            # Add submission_id as a form field, not a file
-            data.add_field(field_name, value)
+        if value is None:
+            continue
+        if not isinstance(value, Path):
+            # submission_id and the time budget are form fields, not files
+            data.add_field(field_name, str(value))
         else:
             # Add file fields
             data.add_field(field_name, open(value, 'rb'), filename=value.name)
@@ -249,6 +251,18 @@ MAX_SUBMISSION_BYTES   = int(os.environ.get("C15_MAX_SUBMISSION_MB", "300")) * 1
 MAX_UNCOMPRESSED_BYTES = int(os.environ.get("C15_MAX_UNCOMPRESSED_MB", "4096")) * 1024 * 1024  # zip-bomb guard
 
 _REQUEST_TIMEOUT_S = int(os.environ.get("EDA_REQUEST_TIMEOUT_S", "14400"))
+# A service answers a run that reached its limit with a structured EDA_TIMEOUT_<STAGE>; the gateway waits
+# this much longer than the budget it forwarded, so that answer arrives before the gateway's own clock.
+_SERVICE_ANSWER_S = 120
+
+
+def _budget(raw):
+    """time_limit_s / fair_limit_s from the validator: positive seconds, or None (absent or junk)."""
+    try:
+        v = float(str(raw).strip()) if raw is not None else None
+    except ValueError:
+        return None
+    return v if v and v > 0 else None
 
 
 def _arm_exception(exc, stage, service):
@@ -258,10 +272,10 @@ def _arm_exception(exc, stage, service):
     is EMPTY -- so it used to become "verilator-api failed" under SERVICE_UNAVAILABLE, and an operator
     could not tell a timeout from a crashed service."""
     if isinstance(exc, asyncio.TimeoutError):
-        return {"code": "EVALUATION_TIMEOUT", "category": "system", "fault": "system", "retryable": True,
-                "stage": stage,
-                "message": (f"No answer from {service} within EDA_REQUEST_TIMEOUT_S={_REQUEST_TIMEOUT_S} s. "
-                            "This is the evaluator's time limit, not a property of the submission; retry.")}
+        return {"code": "EDA_GATEWAY_TIMEOUT", "category": "timeout", "fault": "system", "retryable": True,
+                "stage": stage, "where": "eda_server/gateway",
+                "message": (f"Timeout in the EDA gateway: no answer from {service} in time. "
+                            "Not a property of the submission; it will be evaluated again in a later batch.")}
     return {"code": "SERVICE_UNAVAILABLE", "category": "system", "fault": "system", "retryable": True,
             "stage": stage,
             "message": f"Request to {service} failed: {type(exc).__name__}. Not a property of the submission; retry."}
@@ -414,8 +428,15 @@ async def health():
 async def evaluate(
     design_zip: UploadFile = File(..., description="This is miner's submission"),
     evaluator_zip: UploadFile = File(..., description="Testcases downloaded when the challenge started"),
-    submission_id: str = Form(None)
+    submission_id: str = Form(None),
+    time_limit_s: str = Form(None, description="Seconds this evaluation may take from now (the batch deadline "
+                                               "minus the validator's margin). Absent: each service's EVAL_TIMEOUT_S."),
+    fair_limit_s: str = Form(None, description="Run time every submission of the batch is entitled to: a timeout "
+                                               "with at least this much is the submission's, with less it is ours."),
 ):
+    received = asyncio.get_running_loop().time()
+    limit = _budget(time_limit_s)
+    fair = _budget(fair_limit_s)
     try:
         with tempfile.TemporaryDirectory() as tmpd:
             if not submission_id:
@@ -482,23 +503,30 @@ async def evaluate(
                                      "unreadable, so the submission cannot be scored.", str(e))
 
             # Use aiohttp session for parallel requests
+            # What is left of the validator's budget after our own unpacking, forwarded to both services;
+            # each measures it from its own arrival, so its queue spends it too (deadline.py).
+            left = None if limit is None else round(limit - (asyncio.get_running_loop().time() - received), 1)
+            budget_fields = {"time_limit_s": left, "fair_limit_s": fair}
             submission_files = {
                 "design_zip": design_path,
                 "verilator_bundle": verilator_bundle,
-                "submission_id": submission_id
+                "submission_id": submission_id,
+                **budget_fields,
             }
             
             openlane_files = {
                 "design_zip": design_path,
                 "openlane_bundle": openlane_bundle,
-                "submission_id": submission_id
+                "submission_id": submission_id,
+                **budget_fields,
             }
             # How long the gateway waits for both services. Configurable because it is a
             # DEPLOYMENT property, not a constant: synthesis dominates an evaluation and scales
             # with the submitted design, and openlane-api serialises synthesis behind a
             # Semaphore(1), so N concurrent evaluations queue N synthesis runs end to end. A box
             # taking four at once needs a different ceiling than one taking them singly.
-            timeout = aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT_S)
+            ceiling = _REQUEST_TIMEOUT_S if left is None else min(_REQUEST_TIMEOUT_S, max(1.0, left) + _SERVICE_ANSWER_S)
+            timeout = aiohttp.ClientTimeout(total=ceiling)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 
                 # Always call Verilator

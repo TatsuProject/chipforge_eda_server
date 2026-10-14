@@ -15,8 +15,9 @@ services:
       - ./results:/app/results                # unified results path
     environment:
       - SERVICE_NAME=verilator-simulation
-      # Two clocks since 2026-09-24. What judges a submission is EVAL_TIMEOUT_S in each service:
-      # 45 minutes of RUN time, counted after the job leaves the queue, fault miner. This ceiling
+      # Since 2026-10-14 the run time comes with each request (time_limit_s, from the challenge
+      # server's batch deadline; see README "Time limits"); EVAL_TIMEOUT_S is only the limit for a
+      # request without one, counted after the job leaves the queue, fault miner. This ceiling
       # covers queue + run, so it is only a backstop for a long queue (fault system, retryable).
       # It is the DEFAULT, not an export, because an exported value is lost on a daemon restart
       # (it was, 2026-09-22).

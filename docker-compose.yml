@@ -1,7 +1,8 @@
-version: '3.8'
+name: chipforge_eda_server
 
 services:
   verilator-api:
+    image: chipforge_eda_server-verilator-api:latest
     build:
       context: ./verilator-api
       dockerfile: Dockerfile
@@ -39,6 +40,7 @@ services:
       start_period: 30s
 
   openlane-api:
+    image: chipforge_eda_server-openlane-api:latest
     build:
       context: ./openlane-api
       dockerfile: Dockerfile
@@ -113,23 +115,45 @@ services:
       - V2_SERVICE_URL=${V2_SERVICE_URL:-}
       - V2_ADMIN_TOKEN=${V2_ADMIN_TOKEN:-}
 
-  # v2 evaluator: STUB, off unless the `v2` profile is selected, so v1-only deployments are unchanged.
-  # Not published; only the gateway talks to it. Image/build and its volumes are completed when the
-  # v2 evaluator image ships.
+  # Locally rebuilt and content-pinned; never pull a private compiler image.
+  cf-compiler:
+    platform: linux/amd64
+    profiles: ["v2"]
+    build: { context: ./v2-compiler }
+    image: cf-compiler:v2.1-public
+    pull_policy: build
+    entrypoint: ["true"]
+    restart: "no"
+
+  # C1 tools-only placeholder. C2/C6 will add scopes + the evaluator zip loader/HTTP service.
   v2-evaluator:
+    platform: linux/amd64
     profiles: ["v2"]
     build: { context: ./v2-evaluator }
     image: chipforge_eda_server-v2-evaluator:2.0
+    pull_policy: build
     restart: unless-stopped
+    privileged: true
+    pid: host
+    cgroup: host
+    stop_grace_period: 30m
     expose: ["18080"]
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ${CF_V2_ROOT:-/var/lib/chipforge-v2}:${CF_V2_ROOT:-/var/lib/chipforge-v2}
+      - ${CF_V2_SECRETS:-/var/lib/chipforge-v2-secrets}:/run/cf-secrets
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
       - ./shared/v2-incoming:/incoming
-
-# Named volumes not needed if you standardize on ./results (remove clutter)
-# volumes:
-#   openlane_designs:
-#     driver: local
-#   openlane_runs:
-#     driver: local
-#   openlane_results:
-#     driver: local
+    environment:
+      - CF_V2_ROOT=${CF_V2_ROOT:-/var/lib/chipforge-v2}
+      - CF_EVALUATOR_SALT_FILE=/run/cf-secrets/evaluator-salt.bin
+      - CF_COMPILER_IMAGE=cf-compiler:v2.1-public
+      - CF_RTL_IMAGE=chipforge_eda_server-verilator-api:latest
+      - CF_OPENLANE_IMAGE=chipforge_eda_server-openlane-api:latest
+      - CF_DOCKER_REQUIRED_SERVICES=
+      - CF_V2_CORES=${CF_V2_CORES:-}
+      - CF_V2_WORKERS=${CF_V2_WORKERS:-1}
+      - CF_V2_ALLOWED_MODES=${CF_V2_ALLOWED_MODES:-T2}

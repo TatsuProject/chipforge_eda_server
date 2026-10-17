@@ -30,7 +30,7 @@ RUN git clone https://github.com/verilator/verilator \
     && git checkout "$VERILATOR_REV" \
     && autoconf \
     && ./configure \
-    && make -j"$(nproc)" \
+    && make -j2 \
     && make install \
     && cd / && rm -rf /tmp/verilator
 
@@ -41,9 +41,11 @@ RUN git clone https://github.com/verilator/verilator \
 # Placed AFTER the Verilator build so that slow layer stays cached on rebuild.
 # ----------------------------------------------------------------------------
 ARG RISCV_TOOLCHAIN_URL="https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v14.2.0-3/xpack-riscv-none-elf-gcc-14.2.0-3-linux-x64.tar.gz"
+ARG RISCV_TOOLCHAIN_SHA256=f574415b63f12b09bdd3475223ab492a465d23810646c90c13a4c3b676c83503
 RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /opt/riscv && cd /tmp \
     && wget -q "${RISCV_TOOLCHAIN_URL}" -O riscv-toolchain.tar.gz \
+    && echo "${RISCV_TOOLCHAIN_SHA256}  riscv-toolchain.tar.gz" | sha256sum -c - \
     && tar xzf riscv-toolchain.tar.gz -C /opt/riscv --strip-components=1 \
     && rm riscv-toolchain.tar.gz \
     && ln -sf /opt/riscv/bin/riscv-none-elf-gcc     /usr/local/bin/riscv64-unknown-elf-gcc \

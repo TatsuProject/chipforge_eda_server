@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!fetch.py
+!versions.sh
+!requirements*.lock
+!iree-dev/
+!iree-dev/**
+!expected-versions.txt
+!target-gcc.sha256

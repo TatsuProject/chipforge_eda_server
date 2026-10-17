@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!pins.env
+!fetch.py
+!build_dram.py
+!nangate45.sha256
+!VERSIONS.sh
+!entrypoint.sh
+!smoke.sh
+!locks/
+!locks/*.lock

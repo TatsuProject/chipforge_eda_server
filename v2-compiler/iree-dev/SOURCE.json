@@ -1,0 +1,8 @@
+{
+  "commit": "e4a3b0405d7d23554da26403658d0e8c3c5ecf25",
+  "version": "3.11.0",
+  "sha256": {
+    "embedding_api.h": "9b32eb85613ccb98dfc6748b6ebb40bfaaa5359c975be5071d4734d8dd9bd38c",
+    "api_support.h": "7b7bd61abaab92ece2370e6b6aff36b19660bfd3aa3d03697a7db5cd8a40f62c"
+  }
+}

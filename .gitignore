@@ -218,3 +218,6 @@ trash/
 *.tar.xz
 *.7z
 *.iso
+
+# Reviewed public tool pins (no credentials).
+!v2-evaluator/pins.env

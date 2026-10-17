@@ -10,6 +10,9 @@ import random
 app = FastAPI(title="ChipForge EDA Tools Gateway", version="5.0.0",
               docs_url=None, redoc_url=None, openapi_url=None)  # no free schema for a scanner
 
+from v2_proxy import router as _v2_router
+app.include_router(_v2_router)   # /v2/* pass-through; 503 unless V2_SERVICE_URL is set
+
 # Service URLs (must match docker-compose ports)
 VERILATOR_API = "http://verilator-api:8001/simulate_and_evaluate"
 OPENLANE_API  = "http://openlane-api:8003/run_openlane"

@@ -108,6 +108,22 @@ services:
       # once: openlane-api serialises synthesis behind a Semaphore(1), so concurrent requests queue
       # their synthesis end to end rather than overlapping.
       - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
+      # v2 routes (/v2/*). Empty = v2 disabled (503). Set to http://v2-evaluator:18080 and start with
+      # `docker compose --profile v2 up -d` to enable.
+      - V2_SERVICE_URL=${V2_SERVICE_URL:-}
+      - V2_ADMIN_TOKEN=${V2_ADMIN_TOKEN:-}
+
+  # v2 evaluator: STUB, off unless the `v2` profile is selected, so v1-only deployments are unchanged.
+  # Not published; only the gateway talks to it. Image/build and its volumes are completed when the
+  # v2 evaluator image ships.
+  v2-evaluator:
+    profiles: ["v2"]
+    build: { context: ./v2-evaluator }
+    image: chipforge_eda_server-v2-evaluator:2.0
+    restart: unless-stopped
+    expose: ["18080"]
+    volumes:
+      - ./shared/v2-incoming:/incoming
 
 # Named volumes not needed if you standardize on ./results (remove clutter)
 # volumes:

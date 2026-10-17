@@ -80,6 +80,24 @@ this folder. Apply a change with `docker compose up -d`.
 
 ---
 
+## v2 routes (optional)
+
+The gateway can front the v2 evaluator service. It forwards the request body as a stream with its
+`Content-Length`, and returns the service's status code and body unchanged (only `Location` is
+rewritten to `/v2/status/<id>`). Disabled unless `V2_SERVICE_URL` is set; v1 `/evaluate` is unaffected.
+
+| route | forwards to |
+|---|---|
+| `POST /v2/evaluator`, `GET /v2/evaluator[/<sha256>]` | install an evaluator / read install state |
+| `POST /v2/evaluate` | submit a design (202 accepted, 200 already finished, 409 evaluator mismatch) |
+| `GET /v2/status/<request_id>` | 202 while active, 200 final result, 404 unknown |
+| `GET /v2/health` | service health |
+
+When v2 is not configured or the service is down, every route returns 503 with a JSON body
+(`V2_NOT_CONFIGURED` or `V2_UNREACHABLE`). Enable with `V2_SERVICE_URL=http://v2-evaluator:18080` in
+`.env` and `docker compose --profile v2 up -d`. Set `V2_ADMIN_TOKEN` to require a bearer token for
+installing evaluators. Tests: `pytest gateway/tests`.
+
 ## Makefile Commands
 - `make start` — build and start all services
 - `make build` / `make up` / `make down` — build, start, stop

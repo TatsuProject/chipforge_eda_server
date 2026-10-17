@@ -162,6 +162,14 @@ Exit 0 is required. An explicit `CF_V2_ALLOW_RUNC=1` appends `--allow-runc` to b
 preflight and service, and is recorded in health. The evaluator must implement
 that flag/recording contract. Preflight has a 300 second ceiling.
 
+The preflight also checks free space under the data root against the evaluator's own
+minimum (100 GiB for the v2.0 evaluator); a smaller disk fails the install with
+`EVALUATOR_PREFLIGHT_FAILED`. A non-empty `CF_V2_PREFLIGHT_MIN_DISK_GIB=N` appends
+`--min-disk-gib N` to preflight, is bound into the ready marker (changing it re-runs
+preflight) and is reported as `preflight_min_disk_gib` in health. Lower it only on a
+testnet/development host that runs one evaluation at a time. Preflight output is
+discarded (it may name private paths); the install state shows only the failure code.
+
 The service runs on a private loopback port, with the native service CLI:
 
 ```text
@@ -193,6 +201,9 @@ Compose mounts a separate host secrets directory **only** at `/run/cf-secrets`.
 `CF_EVALUATOR_SALT_FILE=/run/cf-secrets/evaluator-salt.bin` is generated once with
 64 random bytes, fsynced and atomically published with mode **0600**. Standalone
 default: a sibling `<root-name>-secrets/evaluator-salt.bin` outside `CF_V2_ROOT`.
+To keep an existing salt (moving a validator, or comparing with earlier runs), place
+it as `$CF_V2_SECRETS/evaluator-salt.bin` before the first install: a regular file of
+at least 32 bytes, one link, mode 0600. An existing salt is never regenerated.
 Secrets must never appear in a miner box mount, asset, response or log. The
 loader does not log request paths, evaluator output, salts or exception details.
 A trusted evaluator must uphold the same rule in its own responses/logs.

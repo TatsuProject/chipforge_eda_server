@@ -153,8 +153,12 @@ def main():
     workers, cores = int(os.environ.get('CF_V2_WORKERS') or '1'), int(os.environ.get('CF_V2_CORES') or len(os.sched_getaffinity(0)))
     if not modes or set(modes) - {'DEV', 'T1', 'T2'} or not 1 <= workers <= 2 or not 1 <= cores <= len(os.sched_getaffinity(0)):
         ap.error('invalid modes, workers or CPU allocation')
+    min_disk = os.environ.get('CF_V2_PREFLIGHT_MIN_DISK_GIB', '').strip()
+    if min_disk and not (min_disk.isdigit() and 1 <= int(min_disk) <= 100000):
+        ap.error('CF_V2_PREFLIGHT_MIN_DISK_GIB must be empty or a whole number of GiB')
     runtime = Runtime(root, salt, public_key, os.environ.get('CF_V2_ALLOW_UNSIGNED') == '1', modes,
-                      os.environ.get('CF_V2_ALLOW_RUNC') == '1', workers, cores)
+                      os.environ.get('CF_V2_ALLOW_RUNC') == '1', workers, cores,
+                      int(min_disk) if min_disk else None)
     server = Server((args.host, args.port), runtime)
     runtime.start()
 

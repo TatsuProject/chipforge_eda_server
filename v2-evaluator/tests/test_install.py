@@ -155,6 +155,23 @@ def test_full_install_public_asset_post_install_and_readonly(tmp_path, asset_ser
     assert installer.ready(sha) is None
 
 
+def test_operator_disk_minimum_passed_to_preflight_and_bound(tmp_path):
+    installer, sha = prepare(tmp_path)
+    installer.min_disk_gib = 20
+    ready = installer.install(sha, b'')
+    assert ready['min_disk_gib'] == 20
+    assert '--min-disk-gib 20' in (installer.root / 'preflight-argv').read_text()
+    assert installer.ready(sha)
+    installer.min_disk_gib = None      # back to the evaluator default: preflight must run again
+    assert installer.ready(sha) is None
+
+
+def test_default_disk_minimum_left_to_the_evaluator(tmp_path):
+    installer, sha = prepare(tmp_path)
+    assert installer.install(sha, b'')['min_disk_gib'] is None
+    assert '--min-disk-gib' not in (installer.root / 'preflight-argv').read_text()
+
+
 def test_concurrent_install_single_preflight_and_failed_retry(tmp_path):
     installer, sha = prepare(tmp_path, preflight_delay=0.1, fail_preflight=True)
     with pytest.raises(InstallError, match='EVALUATOR_PREFLIGHT_FAILED'):

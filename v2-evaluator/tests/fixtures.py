@@ -63,6 +63,7 @@ root = pathlib.Path(os.environ['CF_V2_ROOT'])
 time.sleep({preflight_delay!r})
 p = root / 'preflight-count'
 p.write_text(str(int(p.read_text())+1) if p.exists() else '1')
+(root / 'preflight-argv').write_text(' '.join(__import__('sys').argv[1:]))
 assert pathlib.Path(os.environ['CF_EVALUATOR_SALT_FILE']).stat().st_size == 64
 assert {not fail_preflight!r} or (root/'permit-preflight').exists()
 '''

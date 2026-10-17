@@ -47,13 +47,13 @@ def system_error(job, code):
 
 class Runtime:
     def __init__(self, root, salt, public_key='', allow_unsigned=False, modes=('T2',), allow_runc=False,
-                 workers=1, cores=None):
+                 workers=1, cores=None, min_disk_gib=None):
         self.root = Path(root).absolute()
         (self.root / 'loader').mkdir(parents=True, exist_ok=True)
         (self.root / 'loader/uploads').mkdir(exist_ok=True)
         self.lock = (self.root / 'loader/loader.lock').open('a')
         fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        self.installer = Installer(self.root, salt, public_key, allow_unsigned, modes, allow_runc)
+        self.installer = Installer(self.root, salt, public_key, allow_unsigned, modes, allow_runc, min_disk_gib)
         self.service = Service(self.installer, workers, cores)
         self.allow_unsigned = allow_unsigned
         self.mutex = threading.RLock()
@@ -319,4 +319,5 @@ class Runtime:
         return dict(ready=bool(ready and alive and service_alive and self.tools_ready and not self.tools_error),
                     status='ok' if alive else 'degraded', active_evaluator=self.service.sha,
                     modes=list(self.installer.modes), allow_unsigned=self.allow_unsigned,
-                    sandbox_override=self.installer.allow_runc, scope_backend='cfscope')
+                    sandbox_override=self.installer.allow_runc, preflight_min_disk_gib=self.installer.min_disk_gib,
+                    scope_backend='cfscope')

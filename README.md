@@ -95,8 +95,20 @@ v1 `/evaluate` is unaffected.
 | `GET /v2/health` | service health |
 
 When v2 is not configured or the service is down, every route returns 503 with a JSON body
-(`V2_NOT_CONFIGURED` or `V2_UNREACHABLE`). Enable with `docker compose --profile v2 up -d --build`
-and a trusted `CF_V2_EVALUATOR_PUBLIC_KEY`. Set `V2_ADMIN_TOKEN` to require a bearer token for
+(`V2_NOT_CONFIGURED` or `V2_UNREACHABLE`). To enable it, set in `.env`:
+
+- `CF_V2_EVALUATOR_PUBLIC_KEY`: the publisher's `ssh-ed25519 AAAA...` public key line;
+- `CF_V2_ROOT`: the data root, an absolute path on a local POSIX filesystem (not NTFS/FUSE)
+  with at least 100 GiB free, which the evaluator's preflight checks
+  (`CF_V2_PREFLIGHT_MIN_DISK_GIB` lowers it on a testnet host);
+- `CF_V2_SECRETS`: a directory outside the data root; the salt is generated there on first
+  install, or place an existing one first (see the archive contract).
+
+Then `docker compose --profile v2 up -d --build`. `--build` rebuilds every service's image,
+v1 included; on a small machine build sequentially with the legacy builder by prefixing
+`COMPOSE_PARALLEL_LIMIT=1 DOCKER_BUILDKIT=0` (see `v2-evaluator/README.md`), and keep the same
+prefix on later `up --build` runs so its layer cache is reused. The first `/v2/evaluate` installs
+the evaluator (download, regeneration, preflight); progress is in `GET /v2/evaluator`. Set `V2_ADMIN_TOKEN` to require a bearer token for
 optional pre-warm via `/v2/evaluator`. Automatic installs verify publisher signatures too.
 See [the evaluator archive contract](v2-evaluator/EVALUATOR_ZIP.md). Tests: `pytest gateway/tests v2-evaluator/tests`.
 

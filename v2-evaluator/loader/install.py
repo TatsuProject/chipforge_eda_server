@@ -94,8 +94,12 @@ def provision_tools(root):
 
 
 class Installer:
-    def __init__(self, root, salt, public_key='', allow_unsigned=False, modes=('T2',), allow_runc=False):
+    def __init__(self, root, salt, public_key='', allow_unsigned=False, modes=('T2',), allow_runc=False,
+                 min_disk_gib=None):
         self.root, self.salt = Path(root), Path(salt)
+        # None = the evaluator's own preflight minimum. An explicit operator override is passed as
+        # --min-disk-gib, bound into the ready marker and reported by health.
+        self.min_disk_gib = min_disk_gib
         self.public_key, self.allow_unsigned = public_key.strip(), allow_unsigned
         self.modes, self.allow_runc = tuple(modes), allow_runc
         for name in ('evaluators', 'assets', 'archives', 'locks', 'tmp'):
@@ -110,7 +114,8 @@ class Installer:
             data = read_json(marker)
             return (data if data['sha256'] == sha and data['trust'] == self.trust()
                     and (not data['unsigned'] or self.allow_unsigned)
-                    and data['modes'] == list(self.modes) and data['allow_runc'] == self.allow_runc else None)
+                    and data['modes'] == list(self.modes) and data['allow_runc'] == self.allow_runc
+                    and data.get('min_disk_gib') == self.min_disk_gib else None)
         except (InstallError, KeyError, TypeError):
             return None
 
@@ -182,9 +187,11 @@ class Installer:
                                '--scratch', env['CF_ORCH_SSD'], '--posix', env['CF_ORCH_POSIX'], '--json']
                     if self.allow_runc:
                         command.append('--allow-runc')
+                    if self.min_disk_gib is not None:
+                        command += ['--min-disk-gib', str(self.min_disk_gib)]
                     self.run(command, target, env, 300, 'EVALUATOR_PREFLIGHT_FAILED')
                 ready = dict(sha256=sha, unsigned=unsigned, trust=self.trust(), modes=list(self.modes),
-                             allow_runc=self.allow_runc, manifest=manifest)
+                             allow_runc=self.allow_runc, min_disk_gib=self.min_disk_gib, manifest=manifest)
                 atomic_json(target / '.cf-ready.json', ready)
                 readonly(target)
                 sync_dir(target.parent)

@@ -120,8 +120,11 @@ The loader reserves `assets`, `archives`, `evaluators`, `loader`, `tools`, `stat
 `escrow`, `locks`, `tmp`, `lanes` and dot-prefixed root names. A target already
 holding different bytes fails closed; evaluators sharing a root should use
 versioned target names. `unpack: zip` and `unpack: tar.gz` extract into the
-`dest` directory with traversal/link/device/size guards (16 GiB expanded,
-200,000 entries per archive). Several archives may share a directory; existing
+`dest` directory with traversal/device/size guards (16 GiB expanded,
+200,000 entries per archive). Only regular files and directories are materialized:
+symbolic and hard link members (common in upstream source tarballs) are skipped,
+never created or followed; a link whose own name is unsafe still fails the install,
+and devices/FIFOs are refused. The evaluator ZIP itself refuses every link. Several archives may share a directory; existing
 files must have identical bytes. No existing file is overwritten with different
 content, and no pre-existing symlink is followed. Assets are fetched only while installing, never when
 forwarding a design to the service.

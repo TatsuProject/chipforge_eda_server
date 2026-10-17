@@ -22,6 +22,10 @@ def extract_tar(archive, target, max_bytes=16 << 30, max_files=200000):
                 if not name and member.isdir():
                     continue
                 p = relative(name.rstrip('/'))
+                if member.issym() or member.islnk():
+                    # Upstream source tarballs carry links (e.g. docs aliases). A link is never
+                    # created and never followed; its name was still checked above.
+                    continue
                 if p in seen or not (member.isfile() or member.isdir()):
                     raise InstallError('UNSAFE_ASSET_ARCHIVE')
                 seen.add(p)
@@ -79,7 +83,7 @@ def materialize(root, cached, dest, unpack):
         temp = Path(tempfile.mkdtemp(prefix='asset-', dir=root / 'tmp'))
         try:
             if unpack == 'zip':
-                extract(cached, temp, max_bytes=16 << 30, max_files=200000)
+                extract(cached, temp, max_bytes=16 << 30, max_files=200000, skip_links=True)
             elif unpack == 'tar.gz':
                 extract_tar(cached, temp)
             else:

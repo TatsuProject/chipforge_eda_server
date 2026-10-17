@@ -99,11 +99,14 @@ def verify(archive, sha, signature, public_key, allow_unsigned):
     return False
 
 
-def extract(archive, target, max_bytes=512 << 20, max_files=20000):
-    """No links, devices, encryption, duplicate names, absolute paths or zip bombs."""
+def extract(archive, target, max_bytes=512 << 20, max_files=20000, skip_links=False):
+    """No links, devices, encryption, duplicate names, absolute paths or zip bombs.
+
+    skip_links (public asset archives only): symlink entries are left out instead of refused;
+    a link is never created or followed. The evaluator archive itself always refuses links."""
     try:
         with zipfile.ZipFile(archive) as z:
-            entries, total, names = z.infolist(), 0, set()
+            entries, total, names, links = z.infolist(), 0, set(), set()
             if len(entries) > max_files:
                 raise InstallError('EVALUATOR_TOO_MANY_FILES')
             for entry in entries:
@@ -116,12 +119,17 @@ def extract(archive, target, max_bytes=512 << 20, max_files=20000):
                 names.add(str(p))
                 mode = entry.external_attr >> 16
                 kind = stat.S_IFMT(mode)
+                if skip_links and kind == stat.S_IFLNK and not entry.flag_bits & 1:
+                    links.add(entry.filename)
+                    continue
                 if kind not in (0, stat.S_IFDIR, stat.S_IFREG) or entry.flag_bits & 1:
                     raise InstallError('UNSAFE_ARCHIVE')
                 total += entry.file_size
                 if entry.file_size > max_bytes or total > max_bytes:
                     raise InstallError('EVALUATOR_TOO_LARGE')
             for entry in entries:
+                if entry.filename in links:
+                    continue
                 p = target / relative(entry.filename.rstrip('/'))
                 if entry.is_dir():
                     p.mkdir(parents=True, exist_ok=True)

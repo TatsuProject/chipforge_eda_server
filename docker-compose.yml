@@ -110,9 +110,9 @@ services:
       # once: openlane-api serialises synthesis behind a Semaphore(1), so concurrent requests queue
       # their synthesis end to end rather than overlapping.
       - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
-      # v2 routes (/v2/*). Empty = v2 disabled (503). Set to http://v2-evaluator:18080 and start with
-      # `docker compose --profile v2 up -d` to enable.
-      - V2_SERVICE_URL=${V2_SERVICE_URL:-}
+      # Start the optional upstream with `docker compose --profile v2 up -d --build`.
+      # Without that profile /v2/* returns 503; v1 routes work independently.
+      - V2_SERVICE_URL=${V2_SERVICE_URL:-http://v2-evaluator:18080}
       - V2_ADMIN_TOKEN=${V2_ADMIN_TOKEN:-}
 
   # Locally rebuilt and content-pinned; never pull a private compiler image.
@@ -125,7 +125,7 @@ services:
     entrypoint: ["true"]
     restart: "no"
 
-  # C1 tools-only placeholder. C2/C6 will add scopes + the evaluator zip loader/HTTP service.
+  # Automatic authenticated evaluator install and cgroup-v2 stage scopes.
   v2-evaluator:
     platform: linux/amd64
     profiles: ["v2"]
@@ -157,3 +157,8 @@ services:
       - CF_V2_CORES=${CF_V2_CORES:-}
       - CF_V2_WORKERS=${CF_V2_WORKERS:-1}
       - CF_V2_ALLOWED_MODES=${CF_V2_ALLOWED_MODES:-T2}
+      # OpenSSH Ed25519 public key text; never a private signing key.
+      - CF_V2_EVALUATOR_PUBLIC_KEY=${CF_V2_EVALUATOR_PUBLIC_KEY:-}
+      - CF_V2_ALLOW_UNSIGNED=${CF_V2_ALLOW_UNSIGNED:-0}
+      - CF_V2_ALLOW_RUNC=${CF_V2_ALLOW_RUNC:-0}
+      - CF_V2_SERVICE_MEMORY_MAX=${CF_V2_SERVICE_MEMORY_MAX:-5G}

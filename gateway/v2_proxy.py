@@ -23,7 +23,8 @@ router = APIRouter(prefix="/v2")
 _ID = r"[A-Za-z0-9._-]{1,128}"
 _FWD_REQ = ("content-type", "content-length", "x-request-id", "accept")
 _FWD_RESP = ("content-type", "cache-control", "retry-after", "x-request-id",
-             "x-cf-evaluator-sha256", "allow")
+             "x-cf-evaluator-sha256", "x-cf-evaluator-unsigned", "x-cf-v2-allow-unsigned",
+             "x-cf-phase", "x-cf-scope-backend", "allow")
 
 
 def _cfg():

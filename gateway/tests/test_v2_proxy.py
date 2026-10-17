@@ -127,3 +127,27 @@ def test_admin_token(client, monkeypatch):
 
 def test_v1_health_unchanged(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_evaluate_streams_evaluator_zip_with_design(client):
+    evaluator = os.urandom(2 * 1024 * 1024)
+    r = client.post('/v2/evaluate', files={
+        'design_zip': ('design.zip', b'dummy design'),
+        'evaluator_zip': ('evaluator.zip', evaluator),
+        'evaluator_sig': ('evaluator.sig', b'detached signature'),
+    }, data={'request_id': 'r1'})
+    assert r.status_code == 202
+    assert SEEN[-1][1] == '/evaluate' and SEEN[-1][3] > len(evaluator)
+
+
+def test_unsigned_override_headers_preserved(client, monkeypatch):
+    def reply(self):
+        self._send(200, RAW, [('X-CF-V2-Allow-Unsigned', '1'), ('X-CF-Evaluator-Unsigned', '1'),
+                             ('X-CF-Phase', 'done'), ('X-CF-Scope-Backend', 'cfscope')])
+    monkeypatch.setattr(Fake, 'do_GET', reply)
+    r = client.get('/v2/status/done')
+    assert r.content == RAW
+    assert r.headers['x-cf-v2-allow-unsigned'] == '1'
+    assert r.headers['x-cf-evaluator-unsigned'] == '1'
+    assert r.headers['x-cf-phase'] == 'done'
+    assert r.headers['x-cf-scope-backend'] == 'cfscope'

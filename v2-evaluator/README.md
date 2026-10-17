@@ -1,14 +1,22 @@
-# v2 evaluator tools image (C1)
+# v2 evaluator container (C1 + C2 + C6)
 
 Ubuntu 24.04 LTS, Linux amd64 only. This public context contains tools, Python
 package locks and public Nangate45 collateral. The small evaluator zip carries
 code, policy, manifests and private inputs. Public model and dataset assets are
-listed there by URL + SHA256 and fetched by the later install loader; they are
+listed there by URL + SHA256 and fetched automatically by the install loader; they are
 not baked into this image. Preprocessed tensors are regenerated at install.
 
-`entrypoint.sh` is a **placeholder**: verify/print VERSIONS.txt and sleep. It does
-not serve HTTP, load a zip or establish cgroup nesting. C2 supplies the cgroup
-scope implementation; C6 supplies installation/supervision. Port 18080 is reserved.
+`entrypoint.sh` verifies VERSIONS.txt, establishes delegated cgroup-v2 nesting,
+and starts the loader on port 18080 (compose-internal only). The loader accepts
+`design_zip` plus `evaluator_zip`/`evaluator_sig` on the first request, or an
+already cached `evaluator_sha256`. It installs asynchronously, then runs the
+evaluator's loopback service. See [EVALUATOR_ZIP.md](EVALUATOR_ZIP.md) for the
+archive/signature contract, lifecycle, configuration and tests.
+
+Set `CF_V2_EVALUATOR_PUBLIC_KEY` to the publisher's OpenSSH Ed25519 public key.
+Unsigned evaluators are refused unless `CF_V2_ALLOW_UNSIGNED=1` is explicitly set;
+the override is recorded in every response's headers. Start with
+`docker compose --profile v2 up -d --build`.
 
 On a shared laptop, build the images sequentially with the site's `cfjob` wrapper:
 
@@ -46,12 +54,12 @@ public-library integration patch used by the native backend. The shared library
 can differ in bytes across build toolchains.
 
 Compose requires privileged operation, host PID/cgroup namespaces and the Docker
-socket for the later evaluator. `CF_V2_ROOT` is mounted at exactly the same path
+socket for the evaluator. `CF_V2_ROOT` is mounted at exactly the same path
 on host and container for sibling Docker bind mounts. Secrets have a separate
 container destination `/run/cf-secrets`; they do not belong under the data root.
 No running service needs to be restarted to build or smoke-test these images.
 
-Installed tool paths for the later loader/path integration:
+Installed tool paths:
 
 | Tool | Image path |
 | --- | --- |
@@ -62,6 +70,6 @@ Installed tool paths for the later loader/path integration:
 | Backend pin | `/opt/cf/platform/backend-pin.json` |
 | Verilator runtime headers | `/usr/local/share/verilator` |
 
-C4/C6 must seed any collateral used in sibling-container bind mounts under
+The loader seeds collateral used in sibling-container bind mounts under
 `CF_V2_ROOT`; a path existing only inside this image cannot be mounted by the
-host Docker daemon. This C1 placeholder does not perform that installation.
+host Docker daemon. Native-only tools remain at the image paths above.

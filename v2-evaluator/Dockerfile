@@ -96,5 +96,8 @@ COPY --from=collateral /out/ /
 COPY --from=venvs /opt/cf/venv/ /opt/cf/venv/
 COPY locks/ /opt/cf/locks/
 COPY nangate45.sha256 VERSIONS.sh entrypoint.sh smoke.sh /opt/cf/
+COPY loader/ /opt/cf/loader/
+# Deliberate systemd-run --scope replacement: no systemd daemon runs in this image.
+COPY cfscope /usr/local/bin/systemd-run
 RUN /opt/cf/VERSIONS.sh > /opt/cf/VERSIONS.txt && cat /opt/cf/VERSIONS.txt
 ENTRYPOINT ["/opt/cf/entrypoint.sh"]

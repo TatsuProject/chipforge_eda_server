@@ -72,4 +72,5 @@ Installed tool paths:
 
 The loader seeds collateral used in sibling-container bind mounts under
 `CF_V2_ROOT`; a path existing only inside this image cannot be mounted by the
-host Docker daemon. Native-only tools remain at the image paths above.
+host Docker daemon (DRAMsim3 is copied to `tools/platform` for that reason).
+Native-only tools remain at the image paths above.

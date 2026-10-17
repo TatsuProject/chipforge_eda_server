@@ -192,8 +192,9 @@ leases/checkpoints govern recovery. Queued loader jobs persist across restart.
 
 `CF_V2_ROOT` must be an absolute same-path host/container bind. The loader copies
 bind-mounted image collateral (Verilator/Yosys share, native Verilator runtime
-and libraries, Nangate45) into `tools/`. Native-only CACTI and DRAMsim3 stay in
-`/opt/cf`. All temporary/build/cache bind sources are under the data root.
+and libraries, Nangate45, and the DRAMsim3 platform tree that simulators built in RTL
+boxes link and load) into `tools/`, and points `CF_DRAM_ROOT` at `tools/platform`.
+Native-only CACTI stays in `/opt/cf`. All temporary/build/cache bind sources are under the data root.
 The evaluator must honor `CF_V2_ROOT`, `CF_ORCH_SSD`, `CF_ORCH_POSIX` and the
 shared path configuration established by the loader before any imports.
 

@@ -41,7 +41,11 @@ def environment(root, sha, salt):
                CF_PLATFORM_SIM_CACHE=str(root / 'cache/platform-sim'),
                CF_DOCKER_RATE_FILE=str(root / 'locks/docker-rate.lock'), CF_DOCKER_REQUIRED_SERVICES='',
                CF_SCOPE_BACKEND='cfscope', PYTHONDONTWRITEBYTECODE='1')
-    if Path('/opt/cf/platform').is_dir():
+    # The DRAM model library is linked into, and loaded by, simulators built in sibling RTL boxes:
+    # it must be a same-path bind source, so the provisioned copy under tools/ is the one used.
+    if (root / 'tools/platform').is_dir():
+        env.setdefault('CF_DRAM_ROOT', str(root / 'tools/platform'))
+    elif Path('/opt/cf/platform').is_dir():
         env.setdefault('CF_DRAM_ROOT', '/opt/cf/platform')
     if Path('/opt/cf/cacti/cacti').is_file():
         env.setdefault('CF_CACTI', '/opt/cf/cacti/cacti')
@@ -55,7 +59,7 @@ def provision_tools(root):
         return  # Source-only unit tests have no tools image.
     tools = root / 'tools'
     with file_lock(root / 'locks/tools.lock'):
-        want = digest(versions) + ':c6-runtime-1'
+        want = digest(versions) + ':c6-runtime-2'
         marker = tools / '.cf-image-sha256'
         if marker.is_file() and marker.read_text() == want:
             return
@@ -65,7 +69,8 @@ def provision_tools(root):
         try:
             for src, dest in (('/usr/local/share/verilator', 'verilator/share'),
                               ('/usr/local/share/yosys', 'yosys/share'),
-                              ('/opt/cf/pdk/nangate45', 'nangate45')):
+                              ('/opt/cf/pdk/nangate45', 'nangate45'),
+                              ('/opt/cf/platform', 'platform')):
                 shutil.copytree(src, temp / dest, symlinks=False)
             binary = Path('/usr/local/bin/verilator_bin')
             runtime = temp / 'verilator/runtime'

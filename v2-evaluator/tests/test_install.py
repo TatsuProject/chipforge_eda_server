@@ -209,6 +209,10 @@ def test_image_tools_provisioned_for_sibling_runtime(tmp_path):
     result = subprocess.run([str(runtime / 'ld.so'), '--library-path', str(runtime / 'lib'),
                              str(runtime / 'verilator_bin'), '--version'], capture_output=True)
     assert result.returncode == 0 and b'Verilator' in result.stdout
+    # Simulators built in sibling RTL boxes link and load the DRAM model: same-path copy, used by env.
+    from loader.install import environment
+    assert list((tmp_path / 'tools/platform').glob('DRAMsim3-*/libdramsim3.so'))
+    assert environment(tmp_path, 'a' * 64, tmp_path / 'salt')['CF_DRAM_ROOT'] == str(tmp_path / 'tools/platform')
 
 
 def test_minimal_layout_compatibility(tmp_path):

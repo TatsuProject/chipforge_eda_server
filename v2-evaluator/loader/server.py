@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from .multipart import HTTPError, parse
 from .runtime import ID, Runtime
-from .security import SHA
+from .security import SHA, PrivateModeError
 
 
 class Server(ThreadingHTTPServer):
@@ -173,9 +173,12 @@ def main():
     min_disk = os.environ.get('CF_V2_PREFLIGHT_MIN_DISK_GIB', '').strip()
     if min_disk and not (min_disk.isdigit() and 1 <= int(min_disk) <= 100000):
         ap.error('CF_V2_PREFLIGHT_MIN_DISK_GIB must be empty or a whole number of GiB')
-    runtime = Runtime(root, salt, public_key, os.environ.get('CF_V2_ALLOW_UNSIGNED') == '1', modes,
-                      os.environ.get('CF_V2_ALLOW_RUNC') == '1', workers, cores,
-                      int(min_disk) if min_disk else None)
+    try:
+        runtime = Runtime(root, salt, public_key, os.environ.get('CF_V2_ALLOW_UNSIGNED') == '1', modes,
+                          os.environ.get('CF_V2_ALLOW_RUNC') == '1', workers, cores,
+                          int(min_disk) if min_disk else None)
+    except PrivateModeError as exc:
+        ap.error(str(exc))
     server = Server((args.host, args.port), runtime)
     runtime.start()
 

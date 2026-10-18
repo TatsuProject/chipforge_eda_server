@@ -50,6 +50,58 @@ def atomic_json(path, obj):
     sync_dir(path.parent)
 
 
+class PrivateModeError(RuntimeError):
+    """A private location still admits group/other access after the loader tried to close it."""
+
+
+def owner_only(path, mode, *, label=None):
+    """Close `path` to group and other (a directory 0700, a file 0600) and verify it took effect.
+
+    Only the TOP of a private tree is closed: what lies below is then unreachable whatever its own
+    modes, so the files the uid-65534 boxes must read can stay 0644/0755. The boxes never traverse
+    these host parents: Docker bind-mounts each input by path as root, and inside the box only the
+    mount point's own mode applies. `label` replaces the path in errors (the secrets location is
+    never printed)."""
+    path = Path(path)
+    current = stat.S_IMODE(path.stat().st_mode)
+    if current != mode:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass     # A read-only mount that is already private is fine; anything else fails below.
+        current = stat.S_IMODE(path.stat().st_mode)
+    if current & 0o077:
+        raise PrivateModeError(f'{label or path} is mode {current:04o}; it must admit no group/other access '
+                               f'(chmod {mode:o} failed or was ignored: use a local POSIX filesystem owned by the '
+                               'evaluator user)')
+    return current
+
+
+def private_locations(root, salt):
+    """Start-up: the data root and the secrets directory are owner-only (0700), an existing salt 0600.
+
+    The data root holds hidden evaluation inputs, private tensors, escrow, miner uploads and the
+    queue databases; the evaluator's umask leaves the files below it box-readable (0644/0755), so
+    this one mode is what keeps them from other local users. 0711 is not needed: no process other
+    than the evaluator (root here) and the Docker daemon resolves paths through it.
+
+    Running as root, the loader also takes ownership of a root the operator created: an evaluator's
+    preflight probes the bind sources from a box as uid 0 with every capability dropped, which is
+    "other" to an operator-owned 0700 directory. The operator inspects it with sudo."""
+    root, salt = Path(root), Path(salt)
+    euid = os.geteuid()
+    if euid == 0 and root.stat().st_uid != euid:
+        try:
+            os.chown(root, euid, os.getegid())
+        except OSError as exc:
+            raise PrivateModeError(f'{root} could not be made owned by the evaluator user: {exc.strerror}') from None
+    owner_only(root, 0o700)
+    salt.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    owner_only(salt.parent, 0o700, label='the evaluator secrets directory')
+    if salt.is_file() and not salt.is_symlink():
+        owner_only(salt, 0o600, label='the evaluator salt')
+
+
 @contextmanager
 def file_lock(path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -237,6 +289,10 @@ def salt_once(path, root):
     if not path.is_absolute() or path.resolve().is_relative_to(root.resolve()) or path.is_symlink():
         raise InstallError('UNSAFE_SALT_LOCATION')
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        owner_only(path.parent, 0o700)
+    except PrivateModeError:
+        raise InstallError('UNSAFE_SALT_LOCATION') from None
     with file_lock(path.parent / '.salt.lock'):
         if not path.exists():
             # Publish a fully fsynced file atomically; a crash cannot leave a short salt.
@@ -254,7 +310,10 @@ def salt_once(path, root):
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_size < 32 or info.st_nlink != 1:
             raise InstallError('INVALID_SALT_FILE')
-        path.chmod(0o600)
+        try:
+            owner_only(path, 0o600)
+        except PrivateModeError:
+            raise InstallError('INVALID_SALT_FILE') from None
 
 
 def readonly(tree):

@@ -320,6 +320,7 @@ class Installer:
         # Evaluator code is authenticated but may print private provisioning details: its output goes
         # to an operator-only log under the data root, never to the HTTP caller (which sees the code).
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)     # O_CREAT's mode does not apply to a log left by an earlier attempt.
         try:
             with os.fdopen(fd, 'wb') as out:
                 proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,

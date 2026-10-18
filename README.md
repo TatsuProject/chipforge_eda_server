@@ -109,8 +109,12 @@ Apply a change with `docker compose up -d`.
 - `CF_V2_ROOT`: the data root, an absolute path on a local POSIX filesystem with at least 100 GiB
   free, mounted at the same path inside the evaluator (sibling boxes bind-mount from it). The
   evaluator's preflight checks the space; `CF_V2_PREFLIGHT_MIN_DISK_GIB` lowers it on a testnet host.
+  The loader makes it owner-only (0700, owned by the evaluator's root user) at start and refuses to
+  start if that does not take effect: it holds hidden inputs, escrow, uploads and the queue
+  database. Sibling boxes do not need to traverse it (each input is bind-mounted by path), so
+  nothing below it is opened up. Inspect it with `sudo`.
 - `CF_V2_SECRETS`: a directory outside the data root; the salt is generated there on first install,
-  or place an existing one first (see the archive contract).
+  or place an existing one first (see the archive contract). Made 0700 at start, the salt 0600.
 - `CF_V2_CORES`: a count of CPUs the evaluator may use (a positive integer, e.g. `8`; empty = every
   CPU the container can see). It is not a CPU list: `16-31` is refused at start with a message
   naming the variable. To confine the evaluator to specific CPUs, add a compose override such as

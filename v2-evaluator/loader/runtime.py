@@ -16,7 +16,7 @@ import uuid
 from . import cgroups
 from .install import Installer, provision_tools
 from .multipart import HTTPError
-from .security import InstallError, SHA, digest, sync_dir
+from .security import InstallError, SHA, digest, private_locations, sync_dir
 from .supervisor import Service
 
 ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z')
@@ -51,6 +51,7 @@ class Runtime:
                  workers=1, cores=None, min_disk_gib=None):
         self.root = Path(root).absolute()
         (self.root / 'loader').mkdir(parents=True, exist_ok=True)
+        private_locations(self.root, salt)
         (self.root / 'loader/uploads').mkdir(exist_ok=True)
         self.lock = (self.root / 'loader/loader.lock').open('a')
         fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

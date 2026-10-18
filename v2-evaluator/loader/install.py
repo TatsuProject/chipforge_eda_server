@@ -107,7 +107,9 @@ SUMMARY_LINES = 12
 SIGNAL = re.compile(rb'FAIL|ERROR|Traceback|Exception|Assertion|Segmentation|Killed|Timeout|timed out|'
                     rb'exit(?:ed)?(?: with)?(?: status| code)?[ =:]+[1-9]|returncode[ =:]+-?[1-9]|'
                     rb'"(?:ok|passed|pass|success)"\s*:\s*false|not found|No such file|Permission denied|'
-                    rb'fatal|refused|mismatch', re.I)
+                    rb'fatal|refused|mismatch|'
+                    # preflight.py: a failed check prints as MISSING (text) or "status": "MISSING" (--json)
+                    rb'(?-i:\bMISSING\b)', re.I)
 
 
 def _clip(line):
@@ -125,24 +127,43 @@ def trim_log(path, step='', code=None):
         head_n = tail_n = signal_n = 0
         omitted = dropped = 0
         found = []
+        last = b''
+        prev, keep_next = None, False   # one line of context each side of a kept line (--json: the "check" name)
+
+        def keep(line):
+            nonlocal signal_n, dropped
+            if signal_n + len(line) <= LOG_SIGNAL_BYTES:
+                signal_lines.append(line); signal_n += len(line)
+                return True
+            dropped += 1
+            return False
+
         with open(path, 'rb') as f:
             for raw in f:
                 line = _clip(raw if raw.endswith(b'\n') else raw + b'\n')
                 if SIGNAL.search(line):
-                    found.append(line.strip())
+                    # The line before names what failed (preflight --json: "check": ... precedes "status").
+                    found.append((last.strip() + b' ' if last.strip().startswith(b'"check"') else b'') + line.strip())
                     if len(found) > 4 * SUMMARY_LINES:
                         del found[SUMMARY_LINES:-SUMMARY_LINES]
+                last = line
                 if head_n < LOG_HEAD_BYTES:
                     head.append(line); head_n += len(line)
                     continue
                 tail.append(line); tail_n += len(line)
                 while tail_n > LOG_TAIL_BYTES:
                     old = tail.pop(0); tail_n -= len(old)
-                    if SIGNAL.search(old) and signal_n + len(old) <= LOG_SIGNAL_BYTES:
-                        signal_lines.append(old); signal_n += len(old)
-                    elif SIGNAL.search(old):
-                        dropped += 1
+                    if SIGNAL.search(old):
+                        if prev is not None and keep(prev):
+                            omitted -= 1
+                        prev = None
+                        keep(old)
+                        keep_next = True
+                    elif keep_next:
+                        keep(old)
+                        keep_next = False
                     else:
+                        prev = old
                         omitted += 1
         out = list(head)
         if signal_lines or omitted or dropped:

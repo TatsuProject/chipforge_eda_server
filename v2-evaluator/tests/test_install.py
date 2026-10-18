@@ -317,3 +317,25 @@ def test_failure_logs_listed_by_installer(tmp_path):
     logs = installer.failure_logs(sha)
     assert [p.name for p in logs] == [f'{sha}.preflight-T2.log']
     assert installer.failure_logs('0' * 64) == []
+
+
+def test_preflight_json_missing_check_kept_with_its_name(tmp_path):
+    """The loader runs preflight with --json: a failed check is an indented `"status": "MISSING",`
+    line whose name is on the `"check"` line before it. Buried among many PASS checks, the log
+    still keeps both lines and the summary names the check."""
+    from loader.install import Installer
+    log = tmp_path / 'sha.preflight-T2.log'
+    script = ('import json, sys\n'
+              'checks = [dict(check=f"image probe {i}", status="PASS", detail="ok " * 20) for i in range(1500)]\n'
+              'checks.insert(700, dict(check="data-root free space", status="MISSING", detail="14.0 GiB free, 15 GiB required"))\n'
+              'print(json.dumps(dict(ok=False, mode="T2", checks=checks), indent=2))\n'
+              'sys.exit(1)')
+    with pytest.raises(InstallError, match='EVALUATOR_PREFLIGHT_FAILED'):
+        Installer.run([sys.executable, '-c', script], tmp_path, os.environ, 30, 'EVALUATOR_PREFLIGHT_FAILED', log)
+    lines = log.read_text().splitlines()
+    i = lines.index('      "status": "MISSING",')
+    assert lines[i - 1] == '      "check": "data-root free space",'
+    assert lines[i + 1] == '      "detail": "14.0 GiB free, 15 GiB required"'
+    assert any('omitted' in l for l in lines[:i])         # it was in the trimmed middle, not head/tail
+    assert '"check": "image probe 900"' not in '\n'.join(lines)
+    assert '"check": "data-root free space", "status": "MISSING"' in lines[-1]

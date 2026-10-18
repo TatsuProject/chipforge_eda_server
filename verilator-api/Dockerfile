@@ -1,7 +1,7 @@
 FROM python:3.11.9-slim
 
 # Install system dependencies (for Verilator build + runtime)
-RUN apt-get update && apt-get install -y \
+RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y \
     build-essential \
     git \
     perl \
@@ -25,7 +25,10 @@ WORKDIR /tmp
 # Pinned to the exact revision EXPECTED.json was measured on. `stable` moves: the PC built 5.052 while
 # this box ran 5.046, so two servers built a week apart were not running the same simulator.
 ARG VERILATOR_REV=1264184fbbf44bbab9f41f9b83fbc5f04e291dc5
-RUN git clone https://github.com/verilator/verilator \
+RUN for i in 1 2 3 4 5; do \
+        rm -rf verilator && git clone https://github.com/verilator/verilator && break; \
+        [ "$i" -lt 5 ] || exit 1; sleep $((i * 10)); \
+    done \
     && cd verilator \
     && git checkout "$VERILATOR_REV" \
     && autoconf \
@@ -42,9 +45,9 @@ RUN git clone https://github.com/verilator/verilator \
 # ----------------------------------------------------------------------------
 ARG RISCV_TOOLCHAIN_URL="https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v14.2.0-3/xpack-riscv-none-elf-gcc-14.2.0-3-linux-x64.tar.gz"
 ARG RISCV_TOOLCHAIN_SHA256=f574415b63f12b09bdd3475223ab492a465d23810646c90c13a4c3b676c83503
-RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/* \
+RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y wget && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /opt/riscv && cd /tmp \
-    && wget -q "${RISCV_TOOLCHAIN_URL}" -O riscv-toolchain.tar.gz \
+    && wget -q --tries=5 --waitretry=15 --retry-connrefused --timeout=60 "${RISCV_TOOLCHAIN_URL}" -O riscv-toolchain.tar.gz \
     && echo "${RISCV_TOOLCHAIN_SHA256}  riscv-toolchain.tar.gz" | sha256sum -c - \
     && tar xzf riscv-toolchain.tar.gz -C /opt/riscv --strip-components=1 \
     && rm riscv-toolchain.tar.gz \

@@ -5,7 +5,9 @@ import os
 import hashlib
 import json
 import subprocess
+import sys
 import tarfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -19,7 +21,16 @@ def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     archive = ROOT / f'DRAMsim3-{PIN}.tar.gz'
     if not archive.exists():
-        urllib.request.urlretrieve(f'https://codeload.github.com/umd-memsys/DRAMsim3/tar.gz/{PIN}', archive)
+        for attempt in range(1, 6):
+            try:
+                urllib.request.urlretrieve(f'https://codeload.github.com/umd-memsys/DRAMsim3/tar.gz/{PIN}', archive)
+                break
+            except OSError as exc:
+                archive.unlink(missing_ok=True)
+                if attempt == 5:
+                    raise
+                print(f'DRAMsim3 download failed ({exc}); retry {attempt}', file=sys.stderr)
+                time.sleep(10 * attempt)
     if hashlib.sha256(archive.read_bytes()).hexdigest() != ARCHIVE_SHA256:
         raise ValueError('pinned source archive hash mismatch')
     src = ROOT / f'DRAMsim3-{PIN}'

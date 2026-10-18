@@ -33,7 +33,8 @@ RUN . /opt/cf/pins.env \
 
 FROM base AS verilator
 RUN . /opt/cf/pins.env \
- && git clone https://github.com/verilator/verilator /src \
+ && retry() { n=0; until "$@"; do n=$((n+1)); [ "$n" -lt 5 ] || return 1; echo "retry $n: $*" >&2; sleep $((n*10)); done; } \
+ && retry sh -c 'rm -rf /src && git clone https://github.com/verilator/verilator /src' \
  && cd /src && git checkout "$VERILATOR_COMMIT" \
  && test "$(git rev-parse HEAD)" = "$VERILATOR_COMMIT" \
  && autoconf && ./configure --prefix=/usr/local \
@@ -43,10 +44,11 @@ RUN . /opt/cf/pins.env \
 
 FROM base AS yosys
 RUN . /opt/cf/pins.env \
- && git clone https://github.com/YosysHQ/yosys /src \
+ && retry() { n=0; until "$@"; do n=$((n+1)); [ "$n" -lt 5 ] || return 1; echo "retry $n: $*" >&2; sleep $((n*10)); done; } \
+ && retry sh -c 'rm -rf /src && git clone https://github.com/YosysHQ/yosys /src' \
  && cd /src && git checkout "$YOSYS_COMMIT" \
  && test "$(git rev-parse HEAD)" = "$YOSYS_COMMIT" \
- && git submodule update --init --recursive \
+ && retry git submodule update --init --recursive \
  && make -j2 CONFIG=gcc PREFIX=/usr/local \
  && make install CONFIG=gcc PREFIX=/usr/local DESTDIR=/out \
  && mkdir -p /out/opt/cf/git \
@@ -60,14 +62,15 @@ RUN . /opt/cf/pins.env \
  && git init /orfs && cd /orfs \
  && git remote add origin https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts \
  && git sparse-checkout init --cone && git sparse-checkout set flow/platforms/nangate45 \
- && git fetch --depth 1 --filter=blob:none origin "$ORFS_COMMIT" && git checkout FETCH_HEAD \
+ && retry git fetch --depth 1 --filter=blob:none origin "$ORFS_COMMIT" && git checkout FETCH_HEAD \
  && test "$(git rev-parse HEAD)" = "$ORFS_COMMIT" \
  && cd flow/platforms && sha256sum -c /opt/cf/nangate45.sha256 \
  && mkdir -p /out/opt/cf/pdk /out/opt/cf/git \
  && cp -a nangate45 /out/opt/cf/pdk/ \
  && printf '%s\n' "$ORFS_COMMIT" > /out/opt/cf/git/orfs
 RUN . /opt/cf/pins.env \
- && git clone https://github.com/HewlettPackard/cacti /cacti && cd /cacti \
+ && retry() { n=0; until "$@"; do n=$((n+1)); [ "$n" -lt 5 ] || return 1; echo "retry $n: $*" >&2; sleep $((n*10)); done; } \
+ && retry sh -c 'rm -rf /cacti && git clone https://github.com/HewlettPackard/cacti /cacti' && cd /cacti \
  && git checkout "$CACTI_COMMIT" && test "$(git rev-parse HEAD)" = "$CACTI_COMMIT" \
  && make -j2 && install -D cacti /out/opt/cf/cacti/cacti \
  && cp -a tech_params cache.cfg /out/opt/cf/cacti/ \

@@ -15,7 +15,12 @@ RUN pip install --no-cache-dir \
     aiofiles==25.1.0
 
 # Install PDK (Sky130) at build time and create alias "sky130A"
-RUN volare enable --pdk sky130 --pdk-root /openlane/pdks && \
+# The download comes from GitHub and can time out: retry with backoff (same pinned PDK each time).
+RUN for i in 1 2 3 4 5; do \
+        volare enable --pdk sky130 --pdk-root /openlane/pdks && break; \
+        [ "$i" -lt 5 ] || exit 1; \
+        echo "volare enable failed (attempt $i); retrying" >&2; sleep $((i * 15)); \
+    done && \
     ln -sf /openlane/pdks/volare/sky130/versions/*/sky130A /openlane/pdks/sky130A
 
 # Set ENV for all processes (FastAPI + subprocess + flow.tcl)

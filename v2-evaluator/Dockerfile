@@ -59,6 +59,7 @@ RUN . /opt/cf/pins.env \
 FROM base AS collateral
 COPY nangate45.sha256 build_dram.py /opt/cf/
 RUN . /opt/cf/pins.env \
+ && retry() { n=0; until "$@"; do n=$((n+1)); [ "$n" -lt 5 ] || return 1; echo "retry $n: $*" >&2; sleep $((n*10)); done; } \
  && git init /orfs && cd /orfs \
  && git remote add origin https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts \
  && git sparse-checkout init --cone && git sparse-checkout set flow/platforms/nangate45 \

@@ -101,8 +101,9 @@ OpenSTA version or embedded git SHA, or a toolchain hash, does not match the pin
 ## Install failures
 
 A failed install returns only a stable code (for example `POST_INSTALL_FAILED`); step output can
-contain private evaluator content and is never sent to callers. For operators, the last 200 lines
-of each failing `post_install` or preflight step are kept in
+contain private evaluator content and is never sent to callers. For operators, each failing `post_install` or preflight step keeps a size-bounded log (head, tail, every
+failure-signalling line in between, and a final `[loader] summary:` line naming the step, exit code
+and failed checks) in
 `$CF_V2_ROOT/logs/install/<sha>.<step>.log` (mode 0600). The container log prints the log's path
 (`install failed: ... log=...`) and `GET /health` lists it under `install_failures`; neither
 contains the output itself.

@@ -287,15 +287,24 @@ def test_failed_step_output_kept_in_operator_only_log(tmp_path):
     assert stat.S_IMODE(log.parent.stat().st_mode) == 0o700
 
 
-def test_failure_log_is_tail_only_and_success_log_removed(tmp_path):
-    from loader.install import Installer, LOG_TAIL_LINES
-    log = tmp_path / 'step.log'
-    script = 'import sys\nfor i in range(1000): print("line", i)\nsys.exit(3)'
-    with pytest.raises(InstallError, match='POST_INSTALL_FAILED'):
-        Installer.run([sys.executable, '-c', script], tmp_path, os.environ, 30, 'POST_INSTALL_FAILED', log)
-    lines = log.read_text().splitlines()
-    assert len(lines) == LOG_TAIL_LINES and lines[-1] == 'line 999' and lines[0] == 'line 800'
+def test_failure_log_is_size_bounded_keeps_failure_and_summary(tmp_path):
+    from loader.install import Installer, LOG_HEAD_BYTES, LOG_TAIL_BYTES, LOG_SIGNAL_BYTES
+    log = tmp_path / 'sha.preflight-T2.log'
+    script = ('import sys\nfor i in range(50): print("PASS early", i)\n'
+              'print("FAIL check_dram_bind: boom")\n'
+              'for i in range(50000): print("PASS later", i)\nsys.exit(3)')
+    with pytest.raises(InstallError, match='EVALUATOR_PREFLIGHT_FAILED'):
+        Installer.run([sys.executable, '-c', script], tmp_path, os.environ, 30, 'EVALUATOR_PREFLIGHT_FAILED', log)
+    text = log.read_text()
+    lines = text.splitlines()
+    assert len(lines) > 200 and lines.index('FAIL check_dram_bind: boom') < len(lines) - 200
+    assert 'PASS early 0' in text and lines[-2] == 'PASS later 49999'
+    assert 'PASS later 20000' not in text            # the routine middle is dropped
+    assert lines[-1].startswith('[loader] summary: step=preflight-T2 exit=3')
+    assert 'FAIL check_dram_bind: boom' in lines[-1]
+    assert log.stat().st_size < LOG_HEAD_BYTES + LOG_TAIL_BYTES + LOG_SIGNAL_BYTES
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
+    assert not Path(str(log) + '.tmp').exists()
     ok = tmp_path / 'ok.log'
     Installer.run([sys.executable, '-c', 'print(1)'], tmp_path, os.environ, 30, 'POST_INSTALL_FAILED', ok)
     assert not ok.exists()

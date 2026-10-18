@@ -98,22 +98,69 @@ def provision_tools(root):
             remove_tree(temp)
 
 
-LOG_TAIL_LINES = 200
-LOG_TAIL_BYTES = 256 * 1024
+LOG_HEAD_BYTES = 32 * 1024
+LOG_TAIL_BYTES = 64 * 1024
+LOG_SIGNAL_BYTES = 128 * 1024   # lines between head and tail that signal failure
+LOG_LINE_BYTES = 2048           # one line is cut to this
+SUMMARY_LINES = 12
+# What preflight, post_install steps and the tools under them print when something is wrong.
+SIGNAL = re.compile(rb'FAIL|ERROR|Traceback|Exception|Assertion|Segmentation|Killed|Timeout|timed out|'
+                    rb'exit(?:ed)?(?: with)?(?: status| code)?[ =:]+[1-9]|returncode[ =:]+-?[1-9]|'
+                    rb'"(?:ok|passed|pass|success)"\s*:\s*false|not found|No such file|Permission denied|'
+                    rb'fatal|refused|mismatch', re.I)
 
 
-def trim_log(path, lines=LOG_TAIL_LINES):
-    """Keep only the last `lines` lines (and at most LOG_TAIL_BYTES) of a step log; keep mode 0600."""
+def _clip(line):
+    return line if len(line) <= LOG_LINE_BYTES else line[:LOG_LINE_BYTES] + b' [line cut]\n'
+
+
+def trim_log(path, step='', code=None):
+    """Bound a failed step's log by total size, never by "last N lines": keep the head, the tail and, between
+    them, every line that signals failure (so a check that scrolled out under later PASS lines is still
+    there). Append a one-line loader summary naming the step, the exit code and the failure lines found.
+    Written to a temporary file and moved over the log; mode 0600."""
+    path = str(path)
     try:
+        head, signal_lines, tail = [], [], []
+        head_n = tail_n = signal_n = 0
+        omitted = dropped = 0
+        found = []
         with open(path, 'rb') as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - LOG_TAIL_BYTES))
-            tail = b''.join(f.read().splitlines(keepends=True)[-lines:])
-        fd = os.open(path, os.O_WRONLY | os.O_TRUNC, 0o600)
+            for raw in f:
+                line = _clip(raw if raw.endswith(b'\n') else raw + b'\n')
+                if SIGNAL.search(line):
+                    found.append(line.strip())
+                    if len(found) > 4 * SUMMARY_LINES:
+                        del found[SUMMARY_LINES:-SUMMARY_LINES]
+                if head_n < LOG_HEAD_BYTES:
+                    head.append(line); head_n += len(line)
+                    continue
+                tail.append(line); tail_n += len(line)
+                while tail_n > LOG_TAIL_BYTES:
+                    old = tail.pop(0); tail_n -= len(old)
+                    if SIGNAL.search(old) and signal_n + len(old) <= LOG_SIGNAL_BYTES:
+                        signal_lines.append(old); signal_n += len(old)
+                    elif SIGNAL.search(old):
+                        dropped += 1
+                    else:
+                        omitted += 1
+        out = list(head)
+        if signal_lines or omitted or dropped:
+            out.append(f'[loader] ... {omitted} routine lines omitted; failure-signalling lines kept below'
+                       f'{f" ({dropped} more not kept)" if dropped else ""} ...\n'.encode())
+            out += signal_lines
+            out.append(b'[loader] ... end of omitted section ...\n')
+        out += tail
+        shown = found[:SUMMARY_LINES // 2] + found[-(SUMMARY_LINES - SUMMARY_LINES // 2):] if len(found) > SUMMARY_LINES else found
+        text = b' | '.join(x[:300] for x in dict.fromkeys(shown))
+        out.append(f'[loader] summary: step={step or Path(path).name} exit={code if code is not None else "unknown"} '
+                   f'failed_checks={len(found)}: '.encode() + (text or b'none matched') + b'\n')
+        tmp = path + '.tmp'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'wb') as f:
-            f.write(tail)
-        os.chmod(path, 0o600)
+            f.write(b''.join(out))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
     except OSError:
         pass
 
@@ -245,9 +292,10 @@ class Installer:
     @staticmethod
     def run(command, cwd, env, timeout, code, log):
         """Run one install step. Its output goes to `log` (operator-only); on failure the log is cut to its
-        last LOG_TAIL_LINES lines, on success it is removed. The caller only ever sees `code`."""
+        bounded by size (head, tail and every failure-signalling line, plus a summary), on success it is removed. The caller only ever sees `code`."""
         proc = None
         failed = True
+        status = 'timeout/spawn-error'
         # Evaluator code is authenticated but may print private provisioning details: its output goes
         # to an operator-only log under the data root, never to the HTTP caller (which sees the code).
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -255,14 +303,15 @@ class Installer:
             with os.fdopen(fd, 'wb') as out:
                 proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                         stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
-                failed = bool(proc.wait(timeout=timeout))
+                status = proc.wait(timeout=timeout)
+                failed = bool(status)
         except (OSError, subprocess.TimeoutExpired):
             if proc and proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
         finally:
             if failed:
-                trim_log(log, LOG_TAIL_LINES)
+                trim_log(log, Path(log).stem.split('.', 1)[-1], status)
             else:
                 Path(log).unlink(missing_ok=True)
         if failed:

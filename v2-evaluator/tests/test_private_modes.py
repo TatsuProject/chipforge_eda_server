@@ -129,3 +129,22 @@ def test_running_as_root_the_loader_takes_ownership_of_an_operator_created_root(
     monkeypatch.setattr(os, 'chown', lambda path, uid, gid: calls.append((Path(path), uid, gid)))
     Runtime(root, tmp_path / 'secrets' / 'salt').close()
     assert calls == [(root, 0, 0)] and mode(root) == 0o700
+
+
+def test_data_root_on_non_posix_filesystem_is_refused(tmp_path):
+    """NTFS/FUSE/SMB/NFS-like data roots are refused at start even when mounted to accept chmod:
+    owner-only modes and the flock-based permits are not reliable there."""
+    from loader.security import PrivateModeError, filesystem_type, local_posix
+    mi = tmp_path / 'mountinfo'
+    mi.write_text(
+        '22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n'
+        '90 22 259:3 / /mnt/ssd rw,relatime shared:50 - fuseblk /dev/nvme1n1p1 rw,user_id=0\n'
+        '91 22 0:55 / /srv/share rw shared:51 - cifs //nas/share rw\n'
+        '92 22 259:4 / /data\\040root rw shared:52 - xfs /dev/sdb1 rw\n')
+    assert filesystem_type('/var/lib/chipforge-v2', mi) == 'ext4'
+    assert filesystem_type('/data root/cf', mi) == 'xfs'
+    assert local_posix('/var/lib/chipforge-v2', mi) == 'ext4'
+    for bad in ('/mnt/ssd/cf-v2', '/srv/share/root'):
+        with pytest.raises(PrivateModeError, match='local POSIX filesystem'):
+            local_posix(bad, mi)
+    assert local_posix('/anything', tmp_path / 'missing') is None   # no mountinfo: the mode check still applies

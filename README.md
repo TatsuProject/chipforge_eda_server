@@ -38,7 +38,8 @@ pinned sources (`pull_policy: build`); see `v2-evaluator/README.md` and `v2-comp
 
 1. **Prerequisites:** Linux amd64 with Docker and the Compose plugin, cgroup v2. For a full
    evaluation: 16+ cores and 64 GB RAM recommended, about 15 GB of disk for the images and their
-   build, and a data root with at least 100 GiB free on a local POSIX filesystem (not NTFS/FUSE).
+   build, and a data root with at least 100 GiB free on a local POSIX filesystem (ext4 or xfs; not NTFS,
+   FUSE, SMB or NFS: the loader refuses those).
 
 2. **Clone and configure:**
    ```bash
@@ -152,7 +153,17 @@ evaluator code, so anyone who can reach port 8080 can make the machine work for 
 - `make logs` follows the gateway and evaluator logs; `make ps` shows every service, including
   the three image-only ones (`Exited (0)` is normal for them).
 - A failed evaluator install returns only a stable code; operators find the step output under
-  `$CF_V2_ROOT/logs/install/` (see `v2-evaluator/README.md`).
+  `$CF_V2_ROOT/logs/install/` (see `v2-evaluator/README.md`). Reading it needs `sudo`.
+- **The data root is root-owned and private.** At start the loader chowns `CF_V2_ROOT` to the
+  evaluator's root user and makes it `0700`, and makes `CF_V2_SECRETS` `0700` and the salt `0600`.
+  Read results through the gateway API (`GET /v2/status/<request_id>` returns the full final
+  response), not from files. Install logs and job directories on the host need `sudo`.
+- **The evaluator keeps restarting with "... must be on a local POSIX filesystem" or "... is mode
+  0777; it must admit no group/other access"** (`make logs`): `CF_V2_ROOT` or `CF_V2_SECRETS` is on
+  NTFS, FUSE, SMB/CIFS, NFS, a VirtualBox/9p share or a similar filesystem. Those ignore or emulate
+  owner-only modes, and their file locks (used for the job queue and the simulation box permits)
+  are not reliable, so the loader refuses them, even when mounted to accept `chmod`. Move both to a
+  local ext4 or xfs filesystem, update `.env`, and restart.
 
 ## Tests
 

@@ -208,6 +208,11 @@ default: a sibling `<root-name>-secrets/evaluator-salt.bin` outside `CF_V2_ROOT`
 To keep an existing salt (moving a validator, or comparing with earlier runs), place
 it as `$CF_V2_SECRETS/evaluator-salt.bin` before the first install: a regular file of
 at least 32 bytes, one link, mode 0600. An existing salt is never regenerated.
+At start the loader refuses a data root on NTFS/FUSE/SMB/NFS-like filesystems (local ext4/xfs
+only), chowns `CF_V2_ROOT` to its own root user and makes it and the secrets directory 0700 (the
+salt 0600), and refuses to start if a mode does not take effect. Everything below the root keeps
+box-readable modes and is unreachable to other local users through it; operators read results
+through the gateway (`/v2/status/<id>`) and use `sudo` for logs and job directories.
 Secrets must never appear in a miner box mount, asset, response or log. The
 loader does not log request paths, evaluator output, salts or exception details.
 A trusted evaluator must uphold the same rule in its own responses/logs.

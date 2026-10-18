@@ -77,6 +77,39 @@ def owner_only(path, mode, *, label=None):
     return current
 
 
+# Filesystems the data root must not live on: they ignore or emulate POSIX modes, or their flock
+# (the simulate box permit, the queue and install locks) is not reliable across processes.
+NON_POSIX_FS = frozenset({'fuseblk', 'ntfs', 'ntfs3', 'vfat', 'msdos', 'exfat', 'cifs', 'smb3', 'smbfs',
+                          'nfs', 'nfs4', '9p', 'vboxsf', 'virtiofs', 'sshfs'})
+
+
+def filesystem_type(path, mountinfo='/proc/self/mountinfo'):
+    """-> the filesystem type of the mount holding `path` (longest mount-point prefix), or None."""
+    target, best, kind = str(Path(path).resolve()), -1, None
+    try:
+        lines = Path(mountinfo).read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        left, sep, right = line.partition(' - ')
+        fields = left.split()
+        if not sep or len(fields) < 5 or not right.split():
+            continue
+        point = fields[4].replace('\\040', ' ')
+        if (target == point or target.startswith(point.rstrip('/') + '/')) and len(point) > best:
+            best, kind = len(point), right.split()[0]
+    return kind
+
+
+def local_posix(root, mountinfo='/proc/self/mountinfo'):
+    """Start-up: refuse a data root on NTFS/FUSE/SMB/NFS-like filesystems, even ones mounted to accept chmod."""
+    kind = filesystem_type(root, mountinfo)
+    if kind and (kind in NON_POSIX_FS or kind.startswith('fuse')):
+        raise PrivateModeError(f'{root} is on a {kind} filesystem; the data root must be on a local POSIX '
+                               'filesystem (ext4 or xfs): owner-only modes and file locks are not reliable there')
+    return kind
+
+
 def private_locations(root, salt):
     """Start-up: the data root and the secrets directory are owner-only (0700), an existing salt 0600.
 
@@ -89,6 +122,7 @@ def private_locations(root, salt):
     preflight probes the bind sources from a box as uid 0 with every capability dropped, which is
     "other" to an operator-owned 0700 directory. The operator inspects it with sudo."""
     root, salt = Path(root), Path(salt)
+    local_posix(root)
     euid = os.geteuid()
     if euid == 0 and root.stat().st_uid != euid:
         try:

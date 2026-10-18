@@ -1,126 +1,54 @@
 name: chipforge_eda_server
 
+# ChipForge EDA server, npu-v2 only (Nangate45; no sky130, no OpenLane, no PDK download).
+#
+#   docker compose up -d --build
+#
+# Five services. Two are long-running (eda-gateway, v2-evaluator). Three only build the images the
+# evaluator starts as no-network sibling boxes (cf-compiler, cf-rtl, cf-sta); each runs `true`
+# once and shows "Exited (0)" in `docker compose ps -a`, by design. The evaluator starts after all
+# three have built. Every image is built locally from pinned sources (pull_policy: build).
+
 services:
-  verilator-api:
-    image: chipforge_eda_server-verilator-api:latest
-    build:
-      context: ./verilator-api
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    # NOT published. The gateway reaches this service by compose DNS (gateway/main.py names
-    # verilator-api:8001); publishing it too meant /simulate_and_evaluate was reachable from
-    # outside with no gateway and no auth, on a service that executes run.py from the uploaded
-    # evaluator zip as root. Audit 2026-09-23.
-    volumes:
-      - ./shared:/shared
-      - ./results:/app/results                # unified results path
-    environment:
-      - SERVICE_NAME=verilator-simulation
-      # Two clocks since 2026-09-24. What judges a submission is EVAL_TIMEOUT_S in each service:
-      # 45 minutes of RUN time, counted after the job leaves the queue, fault miner. This ceiling
-      # covers queue + run, so it is only a backstop for a long queue (fault system, retryable).
-      # It is the DEFAULT, not an export, because an exported value is lost on a daemon restart
-      # (it was, 2026-09-22).
-      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
-      # Settings from .env (see .env.example); empty = automatic / built-in default
-      - EVAL_TIMEOUT_S=${EVAL_TIMEOUT_S:-}
-      - OPENLANE_LANES=${OPENLANE_LANES:-}
-      - VERILATOR_SIM_SLOTS=${VERILATOR_SIM_SLOTS:-}
-      - VERILATOR_EVAL_LANES=${VERILATOR_EVAL_LANES:-}
-      - VERILATOR_FANOUT=${VERILATOR_FANOUT:-}
-    healthcheck:
-      # NOT curl: the verilator-api image does not carry it, so the check failed 113
-      # times in a row on a service that was answering /health in 1.4 ms. A health
-      # signal that is always red is a health signal nobody reads.
-      test: ["CMD", "python3", "-c",
-             "import urllib.request as u; u.urlopen('http://localhost:8001/health', timeout=10)"]
-      interval: 300s
-      timeout: 20s
-      retries: 2
-      start_period: 30s
-
-  openlane-api:
-    image: chipforge_eda_server-openlane-api:latest
-    build:
-      context: ./openlane-api
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    # NOT published. The gateway reaches this service by compose DNS (gateway/main.py names
-    # verilator-api:8003); publishing it too meant /simulate_and_evaluate was reachable from
-    # outside with no gateway and no auth, on a service that executes run.py from the uploaded
-    # evaluator zip as root. Audit 2026-09-23.
-    volumes:
-      - ./shared:/shared
-      - ./results:/app/results                # unified results path
-      # Optional for local debug (not required if using POST /run_openlane):
-      # - ./test_designs/rv32i:/openlane/designs/rv32i
-    environment:
-      - SERVICE_NAME=openlane-implementation
-      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
-      # Settings from .env (see .env.example); empty = automatic / built-in default
-      - EVAL_TIMEOUT_S=${EVAL_TIMEOUT_S:-}
-      - OPENLANE_LANES=${OPENLANE_LANES:-}
-      - OPENLANE_MEM_PER_RUN_MB=${OPENLANE_MEM_PER_RUN_MB:-}
-      - VERILATOR_SIM_SLOTS=${VERILATOR_SIM_SLOTS:-}
-      - OPENLANE_SYNTH_CACHE=${OPENLANE_SYNTH_CACHE:-}
-      - OPENLANE_SYNTH_CACHE_KEEP=${OPENLANE_SYNTH_CACHE_KEEP:-}
-      - PDK_ROOT=/openlane/pdks
-      - PDK=sky130A
-      - STD_CELL_LIBRARY=sky130_fd_sc_hd
-      - PDKPATH=/openlane/pdks/sky130A
-    # Remove these unless you truly run docker-in-docker:
-    # privileged: true
-    # volumes:
-    #   - /var/run/docker.sock:/var/run/docker.sock
-    healthcheck:
-      # NOT curl: the verilator-api image does not carry it, so the check failed 113
-      # times in a row on a service that was answering /health in 1.4 ms. A health
-      # signal that is always red is a health signal nobody reads.
-      test: ["CMD", "python3", "-c",
-             "import urllib.request as u; u.urlopen('http://localhost:8003/health', timeout=10)"]
-      interval: 300s
-      timeout: 20s
-      retries: 2
-      start_period: 30s
-
   eda-gateway:
     build:
       context: ./gateway
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      # 127.0.0.1 by default: /evaluate executes code from the uploaded evaluator ZIP and has no
-      # API key. Set EDA_BIND_ADDRESS=0.0.0.0 in .env only behind a firewall (see .env.example).
+      # 127.0.0.1 by default: /v2/evaluate runs evaluator code. Set EDA_BIND_ADDRESS=0.0.0.0 in
+      # .env only behind a firewall (see .env.example).
       - "${EDA_BIND_ADDRESS:-127.0.0.1}:8080:8080"
     depends_on:
-      - verilator-api
-      - openlane-api
-    volumes:
-      - ./results:/app/results                # unified results path
-      - ./shared:/shared
+      - v2-evaluator
     environment:
-      - VERILATOR_URL=http://verilator-api:8001
-      - OPENLANE_URL=http://openlane-api:8003
-      # TESTING ONLY: path to a mock result JSON (e.g. /shared/eda_mock.json). When set, /evaluate
-      # skips Verilator and OpenLane and returns that result. Empty (the default) evaluates normally.
-      - EDA_MOCK_FILE=${EDA_MOCK_FILE:-}
-      - C15_MAX_SUBMISSION_MB=${C15_MAX_SUBMISSION_MB:-300}
-      - C15_MAX_UNCOMPRESSED_MB=${C15_MAX_UNCOMPRESSED_MB:-4096}
-      # How long to wait for both services. Raise it when a validator runs several evaluations at
-      # once: openlane-api serialises synthesis behind a Semaphore(1), so concurrent requests queue
-      # their synthesis end to end rather than overlapping.
-      - EDA_REQUEST_TIMEOUT_S=${EDA_REQUEST_TIMEOUT_S:-14400}
-      # Start the optional upstream with `docker compose --profile v2 up -d --build`.
-      # Without that profile /v2/* returns 503; v1 routes work independently.
       - V2_SERVICE_URL=${V2_SERVICE_URL:-http://v2-evaluator:18080}
       - V2_ADMIN_TOKEN=${V2_ADMIN_TOKEN:-}
 
-  # Locally rebuilt and content-pinned; never pull a private compiler image.
+  # The box every miner compiler is built and run in. Locally rebuilt and content-pinned.
   cf-compiler:
     platform: linux/amd64
-    profiles: ["v2"]
     build: { context: ./v2-compiler }
     image: cf-compiler:v2.1-public
+    pull_policy: build
+    entrypoint: ["true"]
+    restart: "no"
+
+  # RTL tool, simulator and firmware boxes: Ubuntu g++/make/python3 + the xPack RISC-V toolchain.
+  # Verilator itself is the evaluator's own (5.038), staged into each box at run time.
+  cf-rtl:
+    platform: linux/amd64
+    build: { context: ./v2-evaluator, target: rtl }
+    image: cf-rtl:v2.0
+    pull_policy: build
+    entrypoint: ["true"]
+    restart: "no"
+
+  # OpenSTA box (post-synthesis timing on Nangate45). OpenSTA only: no OpenROAD, no PDK.
+  cf-sta:
+    platform: linux/amd64
+    build: { context: ./v2-evaluator, target: sta }
+    image: cf-sta:v2.0
     pull_policy: build
     entrypoint: ["true"]
     restart: "no"
@@ -128,10 +56,13 @@ services:
   # Automatic authenticated evaluator install and cgroup-v2 stage scopes.
   v2-evaluator:
     platform: linux/amd64
-    profiles: ["v2"]
     build: { context: ./v2-evaluator }
     image: chipforge_eda_server-v2-evaluator:2.0
     pull_policy: build
+    depends_on:
+      cf-compiler: { condition: service_completed_successfully }
+      cf-rtl: { condition: service_completed_successfully }
+      cf-sta: { condition: service_completed_successfully }
     restart: unless-stopped
     privileged: true
     pid: host
@@ -150,9 +81,10 @@ services:
     environment:
       - CF_V2_ROOT=${CF_V2_ROOT:-/var/lib/chipforge-v2}
       - CF_EVALUATOR_SALT_FILE=/run/cf-secrets/evaluator-salt.bin
+      # The sibling box images, by the tags the services above build.
       - CF_COMPILER_IMAGE=cf-compiler:v2.1-public
-      - CF_RTL_IMAGE=chipforge_eda_server-verilator-api:latest
-      - CF_OPENLANE_IMAGE=chipforge_eda_server-openlane-api:latest
+      - CF_RTL_IMAGE=cf-rtl:v2.0
+      - CF_STA_IMAGE=cf-sta:v2.0
       - CF_DOCKER_REQUIRED_SERVICES=
       - CF_V2_CORES=${CF_V2_CORES:-}
       - CF_V2_WORKERS=${CF_V2_WORKERS:-1}

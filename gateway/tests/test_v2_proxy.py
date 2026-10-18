@@ -1,5 +1,6 @@
 """Gateway /v2 proxy against a fake upstream (local HTTP server). Run: pytest gateway/tests"""
 import hashlib, json, os, sys, threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -125,8 +126,25 @@ def test_admin_token(client, monkeypatch):
     assert r.status_code == 202
 
 
-def test_v1_health_unchanged(client):
+def test_gateway_health(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_v1_evaluate_is_gone_and_never_forwarded(client, method):
+    kw = {"files": {"design_zip": ("d.zip", b"x" * 10)}} if method == "post" else {}
+    r = getattr(client, method)("/evaluate", **kw)
+    assert r.status_code == 410
+    body = r.json()
+    assert body["error"]["code"] == "V1_RETIRED" and body["error"]["retryable"] is False
+    assert "/v2/evaluate" in body["error"]["message"]
+    assert SEEN == []      # nothing reached the v2 service
+
+
+def test_no_v1_services_referenced():
+    src = (Path(main.__file__)).read_text()
+    for name in ("verilator-api", "openlane-api", ":8001", ":8003"):
+        assert name not in src
 
 
 def test_evaluate_streams_evaluator_zip_with_design(client):

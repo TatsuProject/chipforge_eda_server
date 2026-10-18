@@ -1,65 +1,30 @@
-.PHONY: build up down logs clean test
+.PHONY: start build up down logs ps health test
 
+# Build every image and start the server (the gateway and the v2 evaluator)
+start:
+	docker compose up -d --build --remove-orphans
+	@echo "Gateway: http://localhost:8080  (v2 routes under /v2/*)"
 
-# Build all services
+# Build all images. On a small machine: COMPOSE_PARALLEL_LIMIT=1 DOCKER_BUILDKIT=0 make build
 build:
 	docker compose build
 
-# Start all services
 up:
-	docker compose up -d
+	docker compose up -d --remove-orphans
 
-# Stop all services  
 down:
 	docker compose down
 
-# View logs
 logs:
-	docker compose logs -f
+	docker compose logs -f eda-gateway v2-evaluator
 
-# Clean up everything
-clean:
-	docker compose down -v
-	docker system prune -f
+# cf-compiler, cf-rtl and cf-sta show "Exited (0)": they only build images
+ps:
+	docker compose ps -a
 
-# Test the services
-test:
-	python example_usage.py
-
-# Fast development: restart only openlane-api after changes
-restart-openlane: build-openlane
-	docker compose up -d openlane-api
-	@echo "OpenLane API restarted at: http://localhost:8003"
-	@echo "Documentation: http://localhost:8003/docs"
-
-# Fast development: restart only gateway after changes
-restart-gateway: build-gateway
-	docker compose up -d eda-gateway
-	@echo "Gateway restarted at: http://localhost:8080"
-	@echo "Documentation: http://localhost:8080/docs"
-
-# Individual service commands
-
-build-verilator:
-	docker compose build verilator-api
-
-build-openlane:
-	docker compose build openlane-api
-
-build-gateway:
-	docker compose build eda-gateway
-
-# Health check
 health:
-	curl http://localhost:8080/health
+	curl -fsS http://localhost:8080/health && echo && curl -sS http://localhost:8080/v2/health && echo
 
-# Quick start (build + run)
-start: build up
-	@echo "EDA Tools API Gateway starting..."
-	@echo "Services will be available at:"
-	@echo "  Gateway: http://localhost:8080"
-	@echo "  Yosys: http://localhost:8000" 
-	@echo "  Verilator: http://localhost:8001"
-	@echo "  Icarus: http://localhost:8002"
-	@echo "  Documentation: http://localhost:8080/docs"
-
+# Unit tests (no Docker needed): pip install fastapi==0.104.1 aiohttp==3.14.5 httpx pytest pyyaml
+test:
+	python3 -m pytest -q gateway/tests v2-evaluator/tests

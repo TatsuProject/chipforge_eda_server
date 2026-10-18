@@ -1,0 +1,4 @@
+d50d61d911dd4dd8a3c393d775aa8adf42be6c52869ba3a9a5358a65f9e5434c  /opt/riscv/bin/riscv-none-elf-gcc-14.2.0
+2adc4a1d3d6a936a78ec568907667ac4beb2644b357a41d83ffc4f16ecf12dff  /opt/riscv/libexec/gcc/riscv-none-elf/14.2.0/cc1
+ff8bf4768ac78d78aa86e92533c0b6c9ac11f3977496d5d5652e29847c22398a  /opt/riscv/bin/riscv-none-elf-as
+682ae5485c7bf9ce4de48a8851112cdf6b134408ab57ef2e5222f2d647295cca  /opt/riscv/bin/riscv-none-elf-ld

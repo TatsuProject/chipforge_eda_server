@@ -22,6 +22,71 @@ RUN . /opt/cf/pins.env \
       python3 strace="$STRACE_VERSION" systemd time="$TIME_VERSION" openssh-client xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
+# ---------------------------------------------------------------------------------------------
+# Box images (compose services cf-rtl and cf-sta). The evaluator starts them as no-network,
+# read-only sibling containers. Both reuse `base`, so on disk they add only their own layers, and
+# they change only when `base` or their own pins change (their image IDs key the simulator cache).
+# Neither carries Verilator or Yosys: the evaluator stages its own pinned binaries and runtime
+# into every box. Neither carries a PDK: Nangate45 is bind-mounted from the evaluator's data root.
+
+# cf-rtl: rootfs for the RTL tool, simulator and firmware boxes. Ubuntu's g++/make compile the
+# Verilator model against the evaluator's own libstdc++ (same snapshot, same GCC), python3 runs the
+# box drivers, and the xPack RISC-V toolchain builds the host firmware. The toolchain is reduced
+# exactly as in the cf-compiler image and its binaries are checked against riscv-gcc.sha256, the
+# same hashes as v2-compiler/target-gcc.sha256 (tests/test_tool_images.py keeps them equal).
+FROM base AS rtl
+LABEL io.chipforge.c1="v2-rtl-box"
+COPY riscv-gcc.sha256 /opt/cf/
+RUN . /opt/cf/pins.env \
+ && python3 /opt/cf/fetch.py "https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v${RISCV_GCC_VERSION}/xpack-riscv-none-elf-gcc-${RISCV_GCC_VERSION}-linux-x64.tar.gz" "$RISCV_GCC_SHA256" /xpack.tgz \
+ && mkdir -p /opt/riscv && tar -xzf /xpack.tgz -C /opt/riscv --strip-components=1 && rm /xpack.tgz \
+ && for d in /opt/riscv/riscv-none-elf/lib /opt/riscv/lib/gcc/riscv-none-elf/*; do \
+        for m in "$d"/rv32* "$d"/rv64*; do [ "$(basename "$m")" = rv32imc ] || rm -rf "$m"; done; \
+        [ -d "$d/rv32imc" ] && for a in "$d"/rv32imc/*; do [ "$(basename "$a")" = ilp32 ] || rm -rf "$a"; done; \
+    done \
+ && rm -rf /opt/riscv/bin/riscv-none-elf-gdb* /opt/riscv/share/doc /opt/riscv/share/info /opt/riscv/share/man \
+           /opt/riscv/share/gcc-*/python /opt/riscv/riscv-none-elf/share \
+ && /opt/riscv/bin/riscv-none-elf-gcc -march=rv32imc_zicsr -mabi=ilp32 -print-multi-directory | grep -qx rv32imc/ilp32 \
+ && sha256sum -c /opt/cf/riscv-gcc.sha256 \
+ && for t in /opt/riscv/bin/riscv-none-elf-*; do \
+        ln -s "$t" "/usr/local/bin/riscv64-unknown-elf-${t##*/riscv-none-elf-}"; \
+    done \
+ && { /opt/riscv/bin/riscv-none-elf-gcc --version | head -n1; g++ --version | head -n1; \
+      make --version | head -n1; python3 --version; } > /opt/cf/VERSIONS.txt \
+ && cat /opt/cf/VERSIONS.txt
+
+# OpenSTA, built alone (no OpenROAD, no PDK). OPENSTA_COMMIT is the src/sta submodule of the
+# OpenROAD revision whose sta binary v2's STA numbers were measured with; that binary was built
+# without CUDD and without tclreadline, and so is this one.
+FROM base AS opensta
+RUN . /opt/cf/pins.env \
+ && retry() { n=0; until "$@"; do n=$((n+1)); [ "$n" -lt 5 ] || return 1; echo "retry $n: $*" >&2; sleep $((n*10)); done; } \
+ && apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update \
+ && apt-get install -y --no-install-recommends swig \
+ && rm -rf /var/lib/apt/lists/* \
+ && git init /src && cd /src \
+ && git remote add origin https://github.com/The-OpenROAD-Project/OpenSTA \
+ && retry git fetch --depth 1 origin "$OPENSTA_COMMIT" && git checkout FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "$OPENSTA_COMMIT" \
+ && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_CUDD=OFF -DUSE_TCL_READLINE=OFF \
+ && make -C build -j2 sta \
+ && install -D -m 0755 app/sta /out/build/bin/sta \
+ && mkdir -p /out/opt/cf/git \
+ && printf '%s\n' "$OPENSTA_COMMIT" > /out/opt/cf/git/opensta
+
+# cf-sta: rootfs for the OpenSTA box (python3 runs the box's measuring wrapper).
+FROM base AS sta
+LABEL io.chipforge.c1="v2-sta-box"
+COPY --from=opensta /out/ /
+RUN . /opt/cf/pins.env \
+ && test "$(cat /opt/cf/git/opensta)" = "$OPENSTA_COMMIT" \
+ && printf 'puts "CF [sta::git_sha1]"\n' > /tmp/v.tcl \
+ && test "$(/build/bin/sta -version)" = "$OPENSTA_VERSION" \
+ && test "$(/build/bin/sta -no_init -exit /tmp/v.tcl | sed -n 's/^CF //p')" = "$OPENSTA_COMMIT" \
+ && { echo "opensta $(/build/bin/sta -version)"; echo "opensta.git $OPENSTA_COMMIT"; python3 --version; } \
+      > /opt/cf/VERSIONS.txt \
+ && rm /tmp/v.tcl && cat /opt/cf/VERSIONS.txt
+
 FROM base AS python
 RUN . /opt/cf/pins.env \
  && python3 /opt/cf/fetch.py "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz" "$PYTHON_SHA256" /python.tar.xz \

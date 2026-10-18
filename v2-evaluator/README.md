@@ -15,8 +15,8 @@ archive/signature contract, lifecycle, configuration and tests.
 
 Set `CF_V2_EVALUATOR_PUBLIC_KEY` to the publisher's OpenSSH Ed25519 public key.
 Unsigned evaluators are refused unless `CF_V2_ALLOW_UNSIGNED=1` is explicitly set;
-the override is recorded in every response's headers. Start with
-`docker compose --profile v2 up -d --build`.
+the override is recorded in every response's headers. Start the server from the repository
+root with `docker compose up -d --build`.
 
 On a shared laptop, build the images sequentially with the site's `cfjob` wrapper:
 
@@ -28,7 +28,7 @@ docker run --rm --network none chipforge_eda_server-v2-evaluator:2.0 /opt/cf/smo
 
 The build scripts check root-disk free space and use the legacy builder with
 `--no-cache`; all compilation uses at most two jobs. For compose builds use
-`COMPOSE_PARALLEL_LIMIT=1 DOCKER_BUILDKIT=0 docker compose --profile v2 build`.
+`COMPOSE_PARALLEL_LIMIT=1 DOCKER_BUILDKIT=0 docker compose build`.
 Do not run a compose build concurrently with another image build.
 
 `pins.env` is the reviewed pin list; the Dockerfile repeats only the FROM digests
@@ -74,6 +74,29 @@ The loader seeds collateral used in sibling-container bind mounts under
 `CF_V2_ROOT`; a path existing only inside this image cannot be mounted by the
 host Docker daemon (DRAMsim3 is copied to `tools/platform` for that reason).
 Native-only tools remain at the image paths above.
+
+## Box images (targets `rtl` and `sta`)
+
+The same Dockerfile builds the two images the evaluator starts as no-network, read-only sibling
+boxes. Compose builds them as services `cf-rtl` and `cf-sta` and passes their tags to the
+evaluator as `CF_RTL_IMAGE` and `CF_STA_IMAGE`. Both are `FROM base`, so they share its layers.
+
+| Image | Contents | Used for |
+| --- | --- | --- |
+| `cf-rtl:v2.0` | Ubuntu g++/make/python3 from the pinned snapshot; xPack `riscv-none-elf-gcc` `RISCV_GCC_VERSION` at `/opt/riscv` (reduced to the rv32imc/ilp32 multilib, binaries checked against `riscv-gcc.sha256`) | RTL tool box (Verilator/Yosys frontends), Verilator model compile, simulator box, host firmware build |
+| `cf-sta:v2.0` | OpenSTA `OPENSTA_COMMIT` at `/build/bin/sta` (no CUDD, no tclreadline); python3 | post-synthesis STA, hierarchical STA, clock-domain STA |
+
+Neither image carries Verilator or Yosys: the evaluator stages its own pinned `verilator_bin`,
+Yosys and their runtime libraries into each box, so the tool version is always this image's.
+Neither carries a PDK: the Nangate45 views are bind-mounted from `CF_V2_ROOT/tools/nangate45`.
+`riscv-gcc.sha256` must equal `../v2-compiler/target-gcc.sha256` (the miner compiler box and the
+firmware build use byte-identical target toolchains); `tests/test_tool_images.py` checks it.
+OpenROAD is not built: v2.0 runs no placement or routing (the EN4 power path that would use it is
+recorded as UNRESOLVED and is display-only). A host that wants it supplies an image and sets
+`CF_OPENROAD_IMAGE`.
+
+Each box image's `/opt/cf/VERSIONS.txt` records its tool versions; the build fails if the
+OpenSTA version or embedded git SHA, or a toolchain hash, does not match the pins.
 
 ## Install failures
 

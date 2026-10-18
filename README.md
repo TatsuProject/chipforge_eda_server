@@ -101,6 +101,18 @@ When v2 is not configured or the service is down, every route returns 503 with a
 - `CF_V2_ROOT`: the data root, an absolute path on a local POSIX filesystem (not NTFS/FUSE)
   with at least 100 GiB free, which the evaluator's preflight checks
   (`CF_V2_PREFLIGHT_MIN_DISK_GIB` lowers it on a testnet host);
+- `CF_V2_CORES`: a count of CPUs the evaluator may use (a positive integer, e.g. `8`; empty =
+  every CPU the container can see). It is not a CPU list: `16-31` is refused at start with a
+  message naming the variable. To confine the evaluator to specific CPUs, add a compose
+  override such as `docker-compose.override.yml`:
+
+  ```yaml
+  services:
+    v2-evaluator:
+      cpuset: "16-31"
+  ```
+
+  and set `CF_V2_CORES=16` (the number of CPUs in that set) or leave it empty;
 - `CF_V2_SECRETS`: a directory outside the data root; the salt is generated there on first
   install, or place an existing one first (see the archive contract).
 

@@ -235,3 +235,21 @@ def test_tool_provision_failure_is_system_error_not_stuck_install(tmp_path, monk
         assert body['status'] == 'ERROR' and body['score'] is None
         assert body['problems'][0]['fault'] == 'system'
         assert b'private diagnostic' not in raw
+
+
+def test_cf_v2_cores_validation():
+    from loader.server import parse_cores
+    assert parse_cores(None, 6) == 6 and parse_cores('', 6) == 6 and parse_cores(' 4 ', 6) == 4
+    for bad in ('16-31', '0', '-1', 'abc', '1.5', '2,3'):
+        with pytest.raises(ValueError, match='CF_V2_CORES must be a positive integer'):
+            parse_cores(bad, 64)
+    with pytest.raises(ValueError, match='exceeds'):
+        parse_cores('9', 8)
+
+
+def test_cf_v2_cores_range_fails_fast_with_clear_message(tmp_path):
+    import subprocess, sys
+    env = dict(os.environ, CF_V2_ROOT=str(tmp_path / 'root'), CF_V2_CORES='16-31')
+    proc = subprocess.run([sys.executable, '-m', 'loader.server'], cwd=Path(__file__).resolve().parents[1],
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 2 and 'CF_V2_CORES must be a positive integer' in proc.stderr

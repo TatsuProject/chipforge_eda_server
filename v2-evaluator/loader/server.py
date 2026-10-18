@@ -137,6 +137,19 @@ class Handler(BaseHTTPRequestHandler):
                             status_url='/v2/status/' + job['request_id'], mode=job['mode']), headers)
 
 
+def parse_cores(value, available):
+    """CF_V2_CORES is a count of CPUs to use (empty = all available), not a CPU list or range."""
+    text = (value or '').strip()
+    if not text:
+        return available
+    if not (text.isascii() and text.isdigit() and int(text) >= 1):
+        raise ValueError(f'CF_V2_CORES must be a positive integer (a number of CPUs, e.g. 8), got {value!r}; '
+                         'to restrict the loader to specific CPUs use a compose override "cpuset:" instead')
+    if int(text) > available:
+        raise ValueError(f'CF_V2_CORES={text} exceeds the {available} CPUs available to this container')
+    return int(text)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--host', default='0.0.0.0')
@@ -150,7 +163,11 @@ def main():
     if key_file := os.environ.get('CF_V2_EVALUATOR_PUBLIC_KEY_FILE'):
         public_key = Path(key_file).read_text().strip()
     modes = tuple(x for x in os.environ.get('CF_V2_ALLOWED_MODES', 'T2').replace(',', ' ').split() if x)
-    workers, cores = int(os.environ.get('CF_V2_WORKERS') or '1'), int(os.environ.get('CF_V2_CORES') or len(os.sched_getaffinity(0)))
+    workers = int(os.environ.get('CF_V2_WORKERS') or '1')
+    try:
+        cores = parse_cores(os.environ.get('CF_V2_CORES'), len(os.sched_getaffinity(0)))
+    except ValueError as exc:
+        ap.error(str(exc))
     if not modes or set(modes) - {'DEV', 'T1', 'T2'} or not 1 <= workers <= 2 or not 1 <= cores <= len(os.sched_getaffinity(0)):
         ap.error('invalid modes, workers or CPU allocation')
     min_disk = os.environ.get('CF_V2_PREFLIGHT_MIN_DISK_GIB', '').strip()

@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import stat
+import sys
 import threading
 import zipfile
 
@@ -284,3 +285,26 @@ def test_failed_step_output_kept_in_operator_only_log(tmp_path):
     assert 'AssertionError' in log.read_text()
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
     assert stat.S_IMODE(log.parent.stat().st_mode) == 0o700
+
+
+def test_failure_log_is_tail_only_and_success_log_removed(tmp_path):
+    from loader.install import Installer, LOG_TAIL_LINES
+    log = tmp_path / 'step.log'
+    script = 'import sys\nfor i in range(1000): print("line", i)\nsys.exit(3)'
+    with pytest.raises(InstallError, match='POST_INSTALL_FAILED'):
+        Installer.run([sys.executable, '-c', script], tmp_path, os.environ, 30, 'POST_INSTALL_FAILED', log)
+    lines = log.read_text().splitlines()
+    assert len(lines) == LOG_TAIL_LINES and lines[-1] == 'line 999' and lines[0] == 'line 800'
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+    ok = tmp_path / 'ok.log'
+    Installer.run([sys.executable, '-c', 'print(1)'], tmp_path, os.environ, 30, 'POST_INSTALL_FAILED', ok)
+    assert not ok.exists()
+
+
+def test_failure_logs_listed_by_installer(tmp_path):
+    installer, sha = prepare(tmp_path, fail_preflight=True)
+    with pytest.raises(InstallError):
+        installer.install(sha, b'')
+    logs = installer.failure_logs(sha)
+    assert [p.name for p in logs] == [f'{sha}.preflight-T2.log']
+    assert installer.failure_logs('0' * 64) == []

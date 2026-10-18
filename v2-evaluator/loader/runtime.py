@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import sqlite3
 import threading
 import time
@@ -178,6 +179,10 @@ class Runtime:
             code = exc.code if isinstance(exc, InstallError) else 'EVALUATOR_INSTALL_FAILED'
             with self.db() as db:
                 db.execute('UPDATE installs SET phase=?,error=? WHERE sha=? AND attempt=?', ('failed', code, sha, attempt))
+            # Operator diagnostics: the code and where the private step log is, never its content.
+            logs = self.installer.failure_logs(sha)
+            print(f'install failed: evaluator={sha} code={code} log={logs[0] if logs else "none"}',
+                  file=sys.stderr, flush=True)
         finally:
             self.wakeup.set()
 
@@ -314,10 +319,17 @@ class Runtime:
     def health(self):
         with self.db() as db:
             ready = db.execute("SELECT COUNT(*) FROM installs WHERE phase='ready'").fetchone()[0]
+        with self.db() as db:
+            failed = db.execute("SELECT sha, error FROM installs i WHERE phase='failed' AND attempt="
+                                "(SELECT MAX(attempt) FROM installs WHERE sha=i.sha) ORDER BY sha LIMIT 10").fetchall()
+        install_failures = []
+        for sha, code in failed:
+            logs = self.installer.failure_logs(sha)
+            install_failures.append(dict(evaluator_sha256=sha, error=code, log=str(logs[0]) if logs else None))
         alive = self.thread is not None and self.thread.is_alive() and not self.stop_event.is_set()
         service_alive = self.service.proc is not None and self.service.proc.poll() is None and self.service.healthy
         return dict(ready=bool(ready and alive and service_alive and self.tools_ready and not self.tools_error),
                     status='ok' if alive else 'degraded', active_evaluator=self.service.sha,
                     modes=list(self.installer.modes), allow_unsigned=self.allow_unsigned,
                     sandbox_override=self.installer.allow_runc, preflight_min_disk_gib=self.installer.min_disk_gib,
-                    scope_backend='cfscope')
+                    scope_backend='cfscope', install_failures=install_failures)

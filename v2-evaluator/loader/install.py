@@ -98,6 +98,26 @@ def provision_tools(root):
             remove_tree(temp)
 
 
+LOG_TAIL_LINES = 200
+LOG_TAIL_BYTES = 256 * 1024
+
+
+def trim_log(path, lines=LOG_TAIL_LINES):
+    """Keep only the last `lines` lines (and at most LOG_TAIL_BYTES) of a step log; keep mode 0600."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - LOG_TAIL_BYTES))
+            tail = b''.join(f.read().splitlines(keepends=True)[-lines:])
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(tail)
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 class Installer:
     def __init__(self, root, salt, public_key='', allow_unsigned=False, modes=('T2',), allow_runc=False,
                  min_disk_gib=None):
@@ -209,6 +229,11 @@ class Installer:
             finally:
                 remove_tree(stage)
 
+    def failure_logs(self, sha):
+        """Paths of the (trimmed) step logs left by failed install steps of `sha`, newest first."""
+        d = self.root / 'logs' / 'install'
+        return sorted(d.glob(f'{sha}.*.log'), key=lambda p: p.stat().st_mtime, reverse=True)
+
     def log_path(self, sha, step):
         """Operator-only install log: <root>/logs/install/<sha>.<step>.log, 0600 in a 0700 directory."""
         d = self.root / 'logs' / 'install'
@@ -219,7 +244,10 @@ class Installer:
 
     @staticmethod
     def run(command, cwd, env, timeout, code, log):
+        """Run one install step. Its output goes to `log` (operator-only); on failure the log is cut to its
+        last LOG_TAIL_LINES lines, on success it is removed. The caller only ever sees `code`."""
         proc = None
+        failed = True
         # Evaluator code is authenticated but may print private provisioning details: its output goes
         # to an operator-only log under the data root, never to the HTTP caller (which sees the code).
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -227,10 +255,15 @@ class Installer:
             with os.fdopen(fd, 'wb') as out:
                 proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                         stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
-                if proc.wait(timeout=timeout):
-                    raise InstallError(code)
+                failed = bool(proc.wait(timeout=timeout))
         except (OSError, subprocess.TimeoutExpired):
             if proc and proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
-            raise InstallError(code) from None
+        finally:
+            if failed:
+                trim_log(log, LOG_TAIL_LINES)
+            else:
+                Path(log).unlink(missing_ok=True)
+        if failed:
+            raise InstallError(code)

@@ -74,3 +74,12 @@ The loader seeds collateral used in sibling-container bind mounts under
 `CF_V2_ROOT`; a path existing only inside this image cannot be mounted by the
 host Docker daemon (DRAMsim3 is copied to `tools/platform` for that reason).
 Native-only tools remain at the image paths above.
+
+## Install failures
+
+A failed install returns only a stable code (for example `POST_INSTALL_FAILED`); step output can
+contain private evaluator content and is never sent to callers. For operators, the last 200 lines
+of each failing `post_install` or preflight step are kept in
+`$CF_V2_ROOT/logs/install/<sha>.<step>.log` (mode 0600). The container log prints the log's path
+(`install failed: ... log=...`) and `GET /health` lists it under `install_failures`; neither
+contains the output itself.

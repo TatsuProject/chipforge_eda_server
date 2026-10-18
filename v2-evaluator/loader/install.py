@@ -165,7 +165,7 @@ class Installer:
                     raise InstallError('INVALID_POST_INSTALL')
                 values = {'python': interpreter(), 'root': str(self.root), 'evaluator': str(target),
                           'assets': str(self.root / 'assets'), 'state': env['CF_ORCH_SSD'], 'posix': env['CF_ORCH_POSIX']}
-                for step in steps:
+                for i, step in enumerate(steps):
                     if not isinstance(step, dict) or set(step) - {'argv', 'outputs', 'timeout_s'}:
                         raise InstallError('INVALID_POST_INSTALL')
                     argv, outputs = step.get('argv'), step.get('outputs')
@@ -178,7 +178,8 @@ class Installer:
                         command = [a.format_map(values) for a in argv]
                     except (KeyError, ValueError):
                         raise InstallError('INVALID_POST_INSTALL') from None
-                    self.run(command, target, env, timeout, 'POST_INSTALL_FAILED')
+                    self.run(command, target, env, timeout, 'POST_INSTALL_FAILED',
+                             self.log_path(sha, f"post_install-{i}"))
                     for output in outputs:
                         if not isinstance(output, dict) or set(output) != {'path', 'sha256'} or not SHA.fullmatch(output['sha256']):
                             raise InstallError('INVALID_POST_INSTALL_OUTPUT')
@@ -194,7 +195,8 @@ class Installer:
                         command.append('--allow-runc')
                     if self.min_disk_gib is not None:
                         command += ['--min-disk-gib', str(self.min_disk_gib)]
-                    self.run(command, target, env, 300, 'EVALUATOR_PREFLIGHT_FAILED')
+                    self.run(command, target, env, 300, 'EVALUATOR_PREFLIGHT_FAILED',
+                             self.log_path(sha, f'preflight-{mode}'))
                 ready = dict(sha256=sha, unsigned=unsigned, trust=self.trust(), modes=list(self.modes),
                              allow_runc=self.allow_runc, min_disk_gib=self.min_disk_gib, manifest=manifest)
                 atomic_json(target / '.cf-ready.json', ready)
@@ -207,16 +209,26 @@ class Installer:
             finally:
                 remove_tree(stage)
 
+    def log_path(self, sha, step):
+        """Operator-only install log: <root>/logs/install/<sha>.<step>.log, 0600 in a 0700 directory."""
+        d = self.root / 'logs' / 'install'
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+        os.chmod(d.parent, 0o700)
+        return d / f'{sha}.{step}.log'
+
     @staticmethod
-    def run(command, cwd, env, timeout, code):
+    def run(command, cwd, env, timeout, code, log):
         proc = None
+        # Evaluator code is authenticated but may print private provisioning details: its output goes
+        # to an operator-only log under the data root, never to the HTTP caller (which sees the code).
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            # Evaluator code is authenticated but may print private provisioning details.
-            proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    start_new_session=True)
-            if proc.wait(timeout=timeout):
-                raise InstallError(code)
+            with os.fdopen(fd, 'wb') as out:
+                proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                        stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+                if proc.wait(timeout=timeout):
+                    raise InstallError(code)
         except (OSError, subprocess.TimeoutExpired):
             if proc and proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)

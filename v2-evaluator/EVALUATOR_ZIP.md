@@ -145,7 +145,9 @@ Commands are argv arrays, executed without a shell in the evaluator directory.
 Allowed substitutions are `{python}`, `{evaluator}`, `{root}`, `{assets}`, `{state}`,
 `{posix}`. Literal braces must be doubled. `timeout_s` defaults to 7200, bounded
 at 86400. The same target rules apply to declared outputs. Empty `produces` lists are permitted for no-op steps. Step/preflight stdout
-and stderr are discarded so provisioning diagnostics cannot leak secrets.
+and stderr go to an operator-only log, `$CF_V2_ROOT/logs/install/<sha>.<step>.log`
+(file 0600, directory 0700; `<step>` is `post_install-<n>` or `preflight-<mode>`), never to
+the HTTP caller, so provisioning diagnostics cannot leak through the API.
 The evaluator is authenticated, privileged code; these are integrity checks,
 not an isolation boundary for an untrusted evaluator publisher.
 
@@ -167,8 +169,9 @@ minimum (100 GiB for the v2.0 evaluator); a smaller disk fails the install with
 `EVALUATOR_PREFLIGHT_FAILED`. A non-empty `CF_V2_PREFLIGHT_MIN_DISK_GIB=N` appends
 `--min-disk-gib N` to preflight, is bound into the ready marker (changing it re-runs
 preflight) and is reported as `preflight_min_disk_gib` in health. Lower it only on a
-testnet/development host that runs one evaluation at a time. Preflight output is
-discarded (it may name private paths); the install state shows only the failure code.
+testnet/development host that runs one evaluation at a time. Preflight output may
+name private paths: it is kept only in the operator log above, and the install state shows
+only the failure code. On `POST_INSTALL_FAILED` or `EVALUATOR_PREFLIGHT_FAILED`, read that log on the host.
 
 The service runs on a private loopback port, with the native service CLI:
 

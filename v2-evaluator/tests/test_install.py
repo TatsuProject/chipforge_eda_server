@@ -274,3 +274,13 @@ def test_c7_archive_assets_download_and_share_destination(tmp_path):
         assert seen == ['/first', '/second']
     finally:
         server.shutdown(); server.server_close(); thread.join()
+
+
+def test_failed_step_output_kept_in_operator_only_log(tmp_path):
+    installer, sha = prepare(tmp_path, fail_preflight=True)
+    with pytest.raises(InstallError, match='EVALUATOR_PREFLIGHT_FAILED'):
+        installer.install(sha, b'')
+    log = installer.root / 'logs' / 'install' / f'{sha}.preflight-T2.log'
+    assert 'AssertionError' in log.read_text()
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+    assert stat.S_IMODE(log.parent.stat().st_mode) == 0o700

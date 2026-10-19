@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 
-from .security import (InstallError, SHA, atomic_json, digest, extract, fetch_asset, file_lock,
+from .security import (InstallError, SHA, atomic_json, digest, extract, fetch_asset_retrying, file_lock,
                        inside, read_json, readonly, relative, remove_tree, salt_once, sync_dir, verify)
 from . import contract
 from .assets import materialize
@@ -242,7 +242,15 @@ class Installer:
                 assets = contract.assets(read_json(target / manifest['assets']))
                 for asset in assets:
                     dest = public_target(self.root, asset.get('target'))
-                    cached = fetch_asset(self.root / 'assets', asset)
+                    try:
+                        cached = fetch_asset_retrying(self.root / 'assets', asset)
+                    except InstallError as e:
+                        # Asset ids and URLs are public (signed manifest): name the one that failed.
+                        fd = os.open(self.log_path(sha, 'fetch_assets'), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                        os.fchmod(fd, 0o600)
+                        with os.fdopen(fd, 'w') as f:
+                            f.write(f"{e.code}: asset {asset.get('id') or asset.get('target', '?')} {asset.get('url', '')}\n")
+                        raise
                     materialize(self.root, cached, dest, asset['unpack'])
                 phase('salt')
                 salt_once(self.salt, self.root)

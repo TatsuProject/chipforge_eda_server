@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -315,6 +316,22 @@ def fetch_asset(cache, asset, max_bytes=16 << 30):
         os.replace(partial, dest)
         sync_dir(cache)
         return dest
+
+
+FETCH_RETRY_DELAYS = (5, 15, 45, 120)
+
+
+def fetch_asset_retrying(cache, asset, delays=FETCH_RETRY_DELAYS, sleep=time.sleep):
+    """fetch_asset, retried on a network failure. An install fetches hundreds of assets; one dropped
+    connection (Wi-Fi reconnect, router restart) must not fail it. A retry resumes the kept prefix.
+    Hash, size and URL errors are final."""
+    for delay in (*delays, None):
+        try:
+            return fetch_asset(cache, asset)
+        except InstallError as e:
+            if e.code != 'ASSET_FETCH_FAILED' or delay is None:
+                raise
+        sleep(delay)
 
 
 def salt_once(path, root):

@@ -339,3 +339,44 @@ def test_preflight_json_missing_check_kept_with_its_name(tmp_path):
     assert any('omitted' in l for l in lines[:i])         # it was in the trimmed middle, not head/tail
     assert '"check": "image probe 900"' not in '\n'.join(lines)
     assert '"check": "data-root free space", "status": "MISSING"' in lines[-1]
+
+
+def test_asset_fetch_retries_network_failures_only(tmp_path, asset_server):
+    """A dropped connection during install is retried (resuming the prefix); hash errors are final."""
+    from loader import security
+    url, data, _ = asset_server
+    sha = hashlib.sha256(data).hexdigest()
+    real, calls, sleeps = security.fetch_asset, [], []
+    def flaky(cache, asset):
+        calls.append(1)
+        if len(calls) <= 2:
+            raise InstallError('ASSET_FETCH_FAILED')
+        return real(cache, asset)
+    security.fetch_asset = flaky
+    try:
+        dest = security.fetch_asset_retrying(tmp_path, dict(url=url, sha256=sha, size=len(data)), sleep=sleeps.append)
+        assert dest.read_bytes() == data and len(calls) == 3 and sleeps == [5, 15]
+        calls.clear(); sleeps.clear()
+        security.fetch_asset = lambda c, a: calls.append(1) or (_ for _ in ()).throw(InstallError('ASSET_FETCH_FAILED'))
+        with pytest.raises(InstallError, match='ASSET_FETCH_FAILED'):
+            security.fetch_asset_retrying(tmp_path, dict(url=url, sha256='2'*64), delays=(1, 2), sleep=sleeps.append)
+        assert len(calls) == 3 and sleeps == [1, 2]
+    finally:
+        security.fetch_asset = real
+    sleeps.clear()
+    with pytest.raises(InstallError, match='ASSET_HASH_MISMATCH'):
+        security.fetch_asset_retrying(tmp_path, dict(url=url, sha256='0'*64), sleep=sleeps.append)
+    assert sleeps == []
+
+
+def test_failed_asset_is_named_in_operator_only_log(tmp_path, monkeypatch):
+    import loader.install as inst
+    orig = inst.fetch_asset_retrying
+    monkeypatch.setattr(inst, 'fetch_asset_retrying', lambda c, a: orig(c, a, delays=()))
+    asset = dict(url='http://127.0.0.1:9/none', sha256='3'*64, target='data/public')
+    installer, sha = prepare(tmp_path, assets=[asset])
+    with pytest.raises(InstallError, match='ASSET_FETCH_FAILED'):
+        installer.install(sha, b'')
+    log = installer.log_path(sha, 'fetch_assets')
+    assert log.read_text() == 'ASSET_FETCH_FAILED: asset data/public http://127.0.0.1:9/none\n'
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600

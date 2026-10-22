@@ -389,3 +389,43 @@ def test_cf_v2_cores_range_fails_fast_with_clear_message(tmp_path):
     proc = subprocess.run([sys.executable, '-m', 'loader.server'], cwd=Path(__file__).resolve().parents[1],
                           env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 2 and 'CF_V2_CORES must be a positive integer' in proc.stderr
+
+
+FAKE_EVALUATOR_VALUES = FAKE_EVALUATOR_RESOURCES.replace('{"cpus", "memory"}', '{"cpus", "memory", "compile_workers"}') + """
+def compile_workers_setting(environ=None):
+    raw = str(load_config_file()[1].get("compile_workers", "auto"))
+    if raw != "auto" and not (raw.isdigit() and 1 <= int(raw) <= 64):
+        raise ResourceConfigError(f"config: compile_workers must be auto or 1..64, got {raw!r}")
+    return raw, "config"
+"""
+FAKE_EVALUATOR_SIMSPEED = """
+import json, os
+from pathlib import Path
+def load(environ=None):
+    v = json.loads(Path(os.environ["CF_EVALUATOR_CONFIG"]).read_text()).get("simulation", {}).get("continuation_threads", 2)
+    if not isinstance(v, int) or not 1 <= v <= 64:
+        raise ValueError(f"config: simulation.continuation_threads must be auto or 1..64, got {v!r}")
+    return {}
+"""
+
+
+def test_evaluator_config_values_are_checked_by_the_evaluators_own_loaders(tmp_path):
+    """Not only the sections: the installed evaluator's value loaders run too (compile_workers from
+    perf-fix2, the simulation section), so a bad value stops the loader, not every later install."""
+    from loader.server import check_evaluator_config
+    root = tmp_path / 'root'; root.mkdir()
+    cfg = root / 'evaluator.json'
+    tree = tmp_path / 'evaluator'
+    (tree / 'v2/pipeline/orchestrator').mkdir(parents=True)
+    (tree / 'v2/pipeline/orchestrator/__init__.py').write_text('')
+    (tree / 'v2/pipeline/orchestrator/resources.py').write_text(FAKE_EVALUATOR_VALUES)
+    (tree / 'v2/pipeline/orchestrator/simspeed.py').write_text(FAKE_EVALUATOR_SIMSPEED)
+    cfg.write_text(json.dumps({'resources': {'cpus': 8, 'compile_workers': 4},
+                               'simulation': {'continuation_threads': 2}}))
+    assert check_evaluator_config(root, {}, tree) == cfg
+    cfg.write_text(json.dumps({'resources': {'compile_workers': 'lots'}}))
+    with pytest.raises(ValueError, match="refused by the installed evaluator .*compile_workers must be auto or 1..64"):
+        check_evaluator_config(root, {}, tree)
+    cfg.write_text(json.dumps({'simulation': {'continuation_threads': 'x'}}))
+    with pytest.raises(ValueError, match="refused by the installed evaluator .*continuation_threads must be"):
+        check_evaluator_config(root, {}, tree)

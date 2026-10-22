@@ -165,12 +165,16 @@ sys.path[:0] = [sys.argv[1], sys.argv[1] + '/v2/pipeline']
 from orchestrator import resources
 resources.read_config_doc()
 resources.load_config_file()
-try:
-    from orchestrator import waits
-except ImportError:
-    waits = None
-if waits is not None:
-    waits.load()
+# the values, as the evaluator resolves them at start-up (each guarded: older evaluators lack some)
+for name in ('process_budget', 'compile_workers_setting'):
+    if hasattr(resources, name):
+        getattr(resources, name)()
+for name in ('waits', 'simspeed'):
+    try:
+        module = __import__('orchestrator.' + name, fromlist=[name])
+    except ImportError:
+        continue
+    module.load()
 """
 
 

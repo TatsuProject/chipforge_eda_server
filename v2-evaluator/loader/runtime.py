@@ -32,15 +32,19 @@ CREATE TABLE IF NOT EXISTS jobs (
 '''
 
 
-def system_error(job, code):
+# Evaluator progress states that can never become a response by waiting longer.
+TERMINAL_STATES = frozenset({'done', 'failed', 'cancelled', 'error'})
+
+
+def system_error(job, code, detail='Evaluator infrastructure unavailable; retry this request.',
+                 title='Evaluator infrastructure failure'):
     # No scores for infrastructure/provisioning faults. Never include exception text or subprocess output.
     instance = 'urn:chipforge:eval:' + job['request_id']
-    detail = 'Evaluator infrastructure unavailable; retry this request.'
     return json.dumps(dict(schema='cf-response/1', request_id=job['request_id'], instance=instance,
         created_at=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         submission={'submitter': job['submitter']}, mode=job['mode'], status='ERROR', score=None,
         reward_eligible=False, pending=[], tier_reached='T0', summary=detail, stages=[], logs=[], receipt=None,
-        timing={}, problems=[dict(type='urn:chipforge:problem:npu-v2:' + code, title='Evaluator infrastructure failure',
+        timing={}, problems=[dict(type='urn:chipforge:problem:npu-v2:' + code, title=title,
         detail=detail, instance=instance + '#problem-1', code=code, category='infrastructure', fault='system',
         exploit=False, retryable=True, severity='error', where={'tier': 'T0', 'stage': 'evaluator_install'},
         checked='loader provisioning and service supervision', metadata={})])).encode()
@@ -68,6 +72,9 @@ class Runtime:
         self.start_failures = {}
         with self.db() as db:
             db.executescript(SCHEMA)
+            # cf-chain-commit/1 (BEACON.md): forwarded verbatim to the evaluator, which validates it.
+            if 'chain_commit' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute('ALTER TABLE jobs ADD COLUMN chain_commit TEXT')
 
     @contextmanager
     def db(self):
@@ -102,6 +109,12 @@ class Runtime:
             thread.join()
         self.service.stop()
         self.lock.close()
+
+    def latest_ready(self):
+        """The newest installed evaluator whose ready marker is valid here, or None."""
+        with self.db() as db:
+            rows = db.execute("SELECT sha FROM installs WHERE phase='ready' ORDER BY rowid DESC").fetchall()
+        return next((r['sha'] for r in rows if self.installer.ready(r['sha'])), None)
 
     def install_status(self, sha, attempt=None):
         with self.db() as db:
@@ -198,11 +211,23 @@ class Runtime:
         if not design:
             raise HTTPError(400, 'MISSING_DESIGN', 'design_zip is required.')
         design_hash = digest(design)
+        chain = fields.get('chain_commit')
+        if chain is not None:
+            # Canonical text, so a re-sent identical object is the same request; the evaluator checks
+            # the schema and that it names this design.
+            try:
+                obj = json.loads(chain)
+            except ValueError:
+                obj = None
+            if not isinstance(obj, dict):
+                raise HTTPError(400, 'INVALID_CHAIN_COMMIT', 'chain_commit must be a JSON object (cf-chain-commit/1).')
+            chain = json.dumps(obj, sort_keys=True, separators=(',', ':'))
         sha = self.archive(fields)
         with self.mutex:
             old = self.job(rid)
             if old:
-                if (old['sha'], old['mode'], old['submitter'], old['design_hash']) != (sha, mode, submitter, design_hash):
+                if (old['sha'], old['mode'], old['submitter'], old['design_hash'], old['chain_commit']) != (
+                        sha, mode, submitter, design_hash, chain):
                     raise HTTPError(409, 'REQUEST_ID_CONFLICT', 'This request ID already names a different request.')
                 if old['error'] is None:
                     return old
@@ -219,8 +244,8 @@ class Runtime:
                     os.fsync(f.fileno())
                 sync_dir(dest.parent)
                 with self.db() as db:
-                    db.execute('INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created) VALUES(?,?,?,?,?,?,?,?,?)',
-                               (rid, sha, attempt, mode, submitter, design_hash, str(dest), 'installing_evaluator', time.time()))
+                    db.execute('INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,chain_commit) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                               (rid, sha, attempt, mode, submitter, design_hash, str(dest), 'installing_evaluator', time.time(), chain))
         accepted = self.job(rid)
         # Installation can fail/complete before this handler returns. A new acceptance is
         # still 202; terminal state belongs to the subsequent status poll.
@@ -302,11 +327,30 @@ class Runtime:
                     state = json.loads(body).get('state', 'queued')
                 except (ValueError, AttributeError):
                     raise InstallError('INVALID_EVALUATOR_PROGRESS') from None
+                if state in TERMINAL_STATES:
+                    # The evaluator holds the request as finished but sent no response (an older evaluator
+                    # answers a queue row marked done without a result like this forever). Terminal ERROR
+                    # for the caller; the job leaves the active slot, so the next request (and evaluator)
+                    # is not blocked behind it.
+                    self.finish(job, system_error(
+                        job, 'EVALUATOR_RESULT_MISSING', title='Evaluation ended without a recorded result',
+                        detail='The evaluator finished this evaluation without a result. Nothing was scored; '
+                               'resubmit under a new request ID.'), error='EVALUATOR_RESULT_MISSING')
+                    return
                 phase = 'running' if state in ('running', 'leased') else 'queued'
                 with self.db() as db:
                     db.execute('UPDATE jobs SET phase=?,forwarded=1 WHERE request_id=?', (phase, job['request_id']))
             elif status not in (429, 503):
-                self.fail(job, 'EVALUATOR_SERVICE_REJECTED')
+                # Name the evaluator's public refusal code (e.g. CHAIN_COMMIT_REQUIRED), never its text.
+                try:
+                    why = str(json.loads(body)['error']['code'])
+                except (ValueError, KeyError, TypeError):
+                    why = ''
+                why = why if re.fullmatch(r'[A-Z0-9_]{1,64}', why) else f'HTTP {status}'
+                self.finish(job, system_error(job, 'EVALUATOR_SERVICE_REJECTED', title='Evaluator refused the request',
+                                              detail=f'The evaluator refused this request ({why}). Fix the request '
+                                                     'and resubmit under a new request ID.'),
+                            error='EVALUATOR_SERVICE_REJECTED')
         except InstallError as exc:
             if exc.code in ('EVALUATOR_SERVICE_EXITED', 'EVALUATOR_SERVICE_START_FAILED'):
                 failures = self.start_failures.get(job['sha'], 0) + 1

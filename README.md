@@ -116,8 +116,28 @@ Apply a change with `docker compose up -d`.
   nothing below it is opened up. Inspect it with `sudo`.
 - `CF_V2_SECRETS`: a directory outside the data root; the salt is generated there on first install,
   or place an existing one first (see the archive contract). Made 0700 at start, the salt 0600.
-- `CF_V2_CORES`: a count of CPUs the evaluator may use (a positive integer, e.g. `8`; empty = every
-  CPU the container can see). It is not a CPU list: `16-31` is refused at start with a message
+- **Resources** (`CF_CPUS`, `CF_MEMORY`, `CF_EVALUATOR_CONFIG`). Empty = auto: the evaluator uses
+  every CPU the container may use (affinity and any cgroup quota) and the RAM less max(4 GiB, 12.5%)
+  for the OS. Override with `CF_CPUS` (`16`, `75%`) and `CF_MEMORY` (`160GiB`, `75%`), or put them in
+  the evaluator config file, `$CF_V2_ROOT/evaluator.json` by default (`CF_EVALUATOR_CONFIG` names
+  another in-container path):
+
+  ```json
+  {"resources": {"cpus": 32, "memory": "160GiB"},
+   "waits": {"step_bound_factor": 8, "step_idle_s": 3600, "stage_idle_s": 7200,
+             "command_idle_s": 7200, "permit_wait_s": 86400}}
+  ```
+
+  Environment beats the file. `waits` only decides when a run that shows no progress is ended as an
+  unscored system fault (the evaluator's TESTNET.md lists every knob); the defaults suit a dedicated
+  validator. Other sections (e.g. `simulation`) are whatever the installed evaluator version
+  accepts. At start-up the loader runs the newest installed evaluator's own config check and refuses
+  to start, naming the file and the evaluator's message, when it fails (a misspelt section, a bad
+  value, the retired flat `{"cpus": 36}` form); with no evaluator installed yet, the first install's
+  preflight does the same. The evaluator logs one `resources:` line with the plan it derived.
+  Sizing changes wall time, never cycles or scores.
+- `CF_V2_CORES` (deprecated): a count of CPUs, used only when nothing above sets cpus (a positive
+  integer, e.g. `8`). It is not a CPU list: `16-31` is refused at start with a message
   naming the variable. To confine the evaluator to specific CPUs, add a compose override such as
   `docker-compose.override.yml`:
 
@@ -127,12 +147,38 @@ Apply a change with `docker compose up -d`.
       cpuset: "16-31"
   ```
 
-  and set `CF_V2_CORES=16` (the number of CPUs in that set) or leave it empty.
+  and leave `CF_CPUS` empty (auto then sees exactly that set).
+- **Gate B pool** (`CF_GATEB_CACHE`, `CF_GATEB_MIRROR`). Gate B draws its private images per
+  evaluation from a signed public pool and fetches only the drawn ones. Verified bytes are cached
+  in `CF_GATEB_CACHE` (default `$CF_V2_ROOT/gateb-pool-cache`; ~250 KB per image, a few GB in
+  total; set a path to put it on another disk). `CF_GATEB_MIRROR` (default
+  `/var/lib/chipforge-v2-gateb-mirror`, created empty) is an optional read-only pre-seeded copy
+  (`<sha[:2]>/<sha>`). Both are mounted at the identical path. Nothing in them is secret.
+- **drand relays** (`CF_DRAND_RELAYS`, `CF_DRAND_TIMEOUT_S`, `CF_DRAND_DEADLINE_S`): see Network
+  egress. Empty = the signed beacon policy's defaults.
 - `V2_ADMIN_TOKEN`: if set, `POST /v2/evaluator` (optional pre-warm) requires
   `Authorization: Bearer <token>`. Automatic installs verify publisher signatures regardless.
 
 The box images are passed to the evaluator by compose as `CF_COMPILER_IMAGE`, `CF_RTL_IMAGE` and
 `CF_STA_IMAGE`; they match the tags the services above build and need no setting.
+
+## Network egress
+
+Only the `v2-evaluator` container (and the image builds) use the network. Every box it starts to
+compile, simulate or analyse a miner's design runs with `--network none`; keep it that way: the
+evaluation randomness is public once its drand round is out.
+
+| what | when | outbound HTTPS (443) to |
+|---|---|---|
+| drand beacon round (one ~200-byte GET per T1/T2 evaluation, BLS-verified, cached) | every T1/T2 evaluation and its preflight | `api.drand.sh`, `api2.drand.sh`, `api3.drand.sh`, `drand.cloudflare.com` (or your `CF_DRAND_RELAYS`) |
+| Gate B pool images (the drawn ones only; sha256-verified) | T2 evaluations whose images are not in the mirror or cache | `open-images-dataset.s3.amazonaws.com` (the origin URLs in the signed pool index) |
+| evaluator public assets (457 files, ~315 MB: COCO images, model archives; sha256-verified) | once per new evaluator install, then cached in `$CF_V2_ROOT/assets` | the URLs in the zip's `assets.json`; v2.0: `s3.amazonaws.com` (COCO `images.cocodataset.org` bucket), `hailo-model-zoo.s3.eu-west-2.amazonaws.com`, `huggingface.co`, `download.pytorch.org`, `download.openmmlab.com`, `codeload.github.com` |
+| image builds (`docker compose build`) | when building | `snapshot.ubuntu.com`, `www.python.org`, `github.com`, `download.docker.com`, `static.rust-lang.org`, PyPI (`pypi.org`, `files.pythonhosted.org`); all digest- or hash-pinned |
+
+The evaluator's own Python dependencies are **not** fetched: they ship inside the signed zip as
+hash-pinned wheels and install offline (`v2-evaluator/EVALUATOR_ZIP.md`). No inbound access is
+needed beyond the gateway port (see Security). Relays and origins are untrusted transport: every
+byte is checked against a pinned key or hash, so a proxy that cannot alter content is fine.
 
 ## Security
 
@@ -164,6 +210,18 @@ evaluator code, so anyone who can reach port 8080 can make the machine work for 
   owner-only modes, and their file locks (used for the job queue and the simulation box permits)
   are not reliable, so the loader refuses them, even when mounted to accept `chmod`. Move both to a
   local ext4 or xfs filesystem, update `.env`, and restart.
+
+- **Cancel an evaluation** (operator only; there is deliberately no HTTP endpoint):
+
+  ```sh
+  docker compose exec v2-evaluator cf-cancel <request_id> --reason "host maintenance"
+  ```
+
+  The request becomes a terminal `ERROR` (`EVALUATION_CANCELLED`, system fault, never scored); a
+  running stage and its boxes are stopped within about a minute; the caller sees it on its next
+  status poll and the loader moves on. Do **not** stop containers, edit `http.sqlite` or move job
+  directories by hand: a request the loader still believes in-flight blocks every later one.
+  Resubmit under a new `request_id`.
 
 ## Tests
 

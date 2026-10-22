@@ -151,6 +151,21 @@ the HTTP caller, so provisioning diagnostics cannot leak through the API.
 The evaluator is authenticated, privileged code; these are integrity checks,
 not an isolation boundary for an untrusted evaluator publisher.
 
+### Locked Python dependencies
+
+Python packages the evaluator code itself needs beyond the image's base venvs (v2.0: `py_ecc`
+8.0.0 and its dependencies, for the drand beacon) ship **inside the zip** as hash-pinned CPython
+3.13 x86_64 wheels, listed by `v2/deploy/evaluator_zip/pydeps.json` (`cf-pydeps/1`: hashed locks +
+a wheel directory). The first `post_install` step, `pydeps`, checks every wheel against the lock
+hashes and runs `pip install --no-index --no-deps --require-hashes --only-binary=:all: --target
+<evaluator>/.cf-pydeps/site` with the orchestrator interpreter: no network, nothing unpinned. The
+result lives inside the installed evaluator tree, so it is made read-only with it, survives
+container re-creation with its ready marker, and two evaluators never share it. The evaluator puts
+that directory on its own processes' `sys.path` only (never `PYTHONPATH`, so the other venvs and
+the boxes are untouched). Preflight has one check per lock, `locked Python dependencies (<name>)`,
+which is `MISSING` (install refused, step log names the package) when any pinned version does not
+resolve. The image needs no change for a new dependency: a new signed zip carries it.
+
 ## Service, preflight and secrets
 
 The loader invokes preflight once for **each enabled mode**, using the pinned
@@ -223,6 +238,15 @@ The gateway exposes `/v2/*`; the loader accepts these paths and equivalent
 unprefixed paths for the existing proxy. Uploads require Content-Length; the
 gateway forwards multipart bytes as a stream. The loader spools ZIP parts with
 bounded memory (at most two concurrent uploads).
+
+`POST /v2/evaluate` fields: `design_zip`, `request_id`, `mode`, optional `submitter`, the evaluator
+(`evaluator_zip` + `evaluator_sig`, or `evaluator_sha256` once cached) and, for T1/T2 with a
+BEACON evaluator, `chain_commit` (JSON `cf-chain-commit/1`, at most 2048 bytes). The loader keeps
+`chain_commit` in canonical form, makes it part of request idempotency (the same `request_id` with a
+different object is 409) and forwards it unchanged; the evaluator validates it. An evaluator
+refusal (e.g. `CHAIN_COMMIT_REQUIRED`) reaches the caller as a terminal ERROR
+`EVALUATOR_SERVICE_REJECTED` whose detail names that code. A terminal evaluator state without a
+response is a terminal ERROR `EVALUATOR_RESULT_MISSING`; neither blocks later requests.
 
 ```sh
 curl -F design_zip=@design.zip -F evaluator_zip=@evaluator.zip \

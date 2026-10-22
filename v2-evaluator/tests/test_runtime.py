@@ -237,9 +237,145 @@ def test_tool_provision_failure_is_system_error_not_stuck_install(tmp_path, monk
         assert b'private diagnostic' not in raw
 
 
+def test_terminal_evaluator_row_without_response_errors_and_releases_the_loader(tmp_path):
+    # Lab incident: the evaluator marked its queue row done with no response and kept answering 202
+    # "done"; the loader kept the request "forwarded" for 29 min, pinned to that evaluator, and every
+    # newer request waited behind it. Now the caller gets a terminal ERROR and the next request runs.
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=4)
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        request('POST', '/evaluate', dict(design_zip=b'stuck', evaluator_zip=archive, request_id='stuck'))
+        wait_until(lambda: runtime.job('stuck')['forwarded'])
+        request('POST', '/evaluate', dict(design_zip=b'next', evaluator_sha256=sha, request_id='next'))
+        assert runtime.job('next')['forwarded'] == 0                # held behind the active request
+        (runtime.root / 'state' / sha / 'stuck.done-without-response').touch()
+        status, headers, body = wait_until(lambda: terminal(request, 'stuck'))
+        doc = json.loads(body)
+        assert (doc['status'], doc['score'], doc['reward_eligible']) == ('ERROR', None, False)
+        assert doc['problems'][0]['code'] == 'EVALUATOR_RESULT_MISSING' and doc['problems'][0]['fault'] == 'system'
+        assert headers['X-CF-Phase'] == 'done'
+        assert wait_until(lambda: terminal(request, 'next'))[2] == RAW   # the loader is released
+        assert terminal(request, 'stuck')[2] == body                    # and the error is durable
+
+
+def test_operator_cancel_in_the_evaluator_or_the_loader(tmp_path):
+    from loader.cancel import cancel
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=60)
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=archive, request_id='running'))
+        wait_until(lambda: runtime.job('running')['forwarded'])
+        request('POST', '/evaluate', dict(design_zip=b'b', evaluator_sha256=sha, request_id='waiting'))
+        salt = runtime.installer.salt
+        # Not handed to the evaluator yet: the loader finishes it itself.
+        code, out = cancel(runtime.root, salt, 'waiting', 'host maintenance')
+        assert (code, out['by'], out['code']) == (0, 'loader', 'EVALUATION_CANCELLED')
+        doc = json.loads(terminal(request, 'waiting')[2])
+        assert doc['status'] == 'ERROR' and doc['problems'][0]['code'] == 'EVALUATION_CANCELLED'
+        assert 'host maintenance' in doc['problems'][0]['detail']
+        # Running in the evaluator: the evaluator cancels it; the loader picks the ERROR up and is free.
+        code, out = cancel(runtime.root, salt, 'running', 'host maintenance')
+        assert (code, out['by'], out['cancelled']) == (0, 'evaluator', True)
+        status, _, body = wait_until(lambda: terminal(request, 'running'))
+        assert json.loads(body)['problems'][0]['code'] == 'EVALUATION_CANCELLED'
+        assert cancel(runtime.root, salt, 'running', 'x')[1]['reason'].startswith('already finished')
+        assert cancel(runtime.root, salt, 'no-such-request', 'x')[0] == 3
+        request('POST', '/evaluate', dict(design_zip=b'c', evaluator_sha256=sha, request_id='after'))
+        wait_until(lambda: runtime.job('after')['forwarded'])         # the loader is not blocked
+
+
+def test_chain_commit_is_stored_forwarded_and_part_of_idempotency(tmp_path):
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=0.3)
+    cc = {'schema': 'cf-chain-commit/1', 'netuid': 108, 'block_number': 7, 'hotkey': '5F'}
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        fields = dict(design_zip=b'd', evaluator_zip=archive, request_id='chained', chain_commit=json.dumps(cc, indent=2))
+        assert request('POST', '/evaluate', fields)[0] == 202
+        wait_until(lambda: terminal(request, 'chained'))
+        sent = json.loads((runtime.root / 'state' / sha / 'chained.json').read_text())['chain_commit']
+        assert json.loads(sent) == cc and sent == json.dumps(cc, sort_keys=True, separators=(',', ':'))
+        same = dict(fields, chain_commit=json.dumps(cc), evaluator_zip=None)
+        del same['evaluator_zip']; same['evaluator_sha256'] = sha
+        assert request('POST', '/evaluate', same)[0] == 200                       # same object, any spacing
+        assert request('POST', '/evaluate', dict(same, chain_commit=json.dumps(dict(cc, block_number=8))))[0] == 409
+        assert request('POST', '/evaluate', dict(same, request_id='bad', chain_commit='not json'))[0] == 400
+        assert request('POST', '/evaluate', dict(same, request_id='big', chain_commit='{"x":"' + 'a' * 2100 + '"}'))[0] in (400, 413)
+        request('POST', '/evaluate', dict(design_zip=b'd2', evaluator_sha256=sha, request_id='plain'))
+        wait_until(lambda: terminal(request, 'plain'))
+        assert json.loads((runtime.root / 'state' / sha / 'plain.json').read_text())['chain_commit'] is None
+        # An evaluator refusal names its public code to the caller.
+        request('POST', '/evaluate', dict(design_zip=b'refused-by-evaluator', evaluator_sha256=sha, request_id='refused'))
+        doc = json.loads(wait_until(lambda: terminal(request, 'refused'))[2])
+        assert doc['status'] == 'ERROR' and doc['problems'][0]['code'] == 'EVALUATOR_SERVICE_REJECTED'
+        assert 'CHAIN_COMMIT_REQUIRED' in doc['problems'][0]['detail']
+
+
+FAKE_EVALUATOR_RESOURCES = """
+import json, os
+from pathlib import Path
+class ResourceConfigError(ValueError):
+    pass
+SECTIONS = {"resources", "waits", "simulation"}
+def read_config_doc(environ=None):
+    path = os.environ["CF_EVALUATOR_CONFIG"]
+    doc = json.loads(Path(path).read_text())
+    if set(doc) - SECTIONS:
+        raise ResourceConfigError(f"evaluator config {path}: unknown keys {sorted(set(doc) - SECTIONS)}")
+    return path, doc
+def load_config_file(environ=None):
+    path, doc = read_config_doc()
+    if set(doc.get("resources", {})) - {"cpus", "memory"}:
+        raise ResourceConfigError(f'evaluator config {path}: "resources" takes only "cpus" and "memory"')
+    return path, doc.get("resources", {})
+"""
+
+
+def test_evaluator_config_shape_is_checked_at_startup(tmp_path):
+    from loader.server import check_evaluator_config
+    root = tmp_path / 'root'; root.mkdir()
+    assert check_evaluator_config(root, {}) is None                     # absent: every default (auto)
+    cfg = root / 'evaluator.json'
+    cfg.write_text(json.dumps({'resources': {'cpus': 36, 'memory': 'auto'}, 'waits': {'step_idle_s': 7200}}))
+    assert check_evaluator_config(root, {}) == cfg
+    cfg.write_text(json.dumps({'cpus': 36, 'memory': 'auto'}))         # the old flat form (lab r39)
+    with pytest.raises(ValueError, match='old flat'):
+        check_evaluator_config(root, {})
+    with pytest.raises(ValueError, match='no such file'):
+        check_evaluator_config(root, {'CF_EVALUATOR_CONFIG': str(tmp_path / 'missing.json')})
+    # Sections and values are the INSTALLED evaluator's rules (here one that also has "simulation").
+    tree = tmp_path / 'evaluator'
+    (tree / 'v2/pipeline/orchestrator').mkdir(parents=True)
+    (tree / 'v2/pipeline/orchestrator/resources.py').write_text(FAKE_EVALUATOR_RESOURCES)
+    cfg.write_text(json.dumps({'resources': {'cpus': 8}, 'simulation': {'pgo_gate': 1.1}}))
+    assert check_evaluator_config(root, {}, tree) == cfg              # accepted: the evaluator knows it
+    cfg.write_text(json.dumps({'resources': {'cpus': 8}, 'simulaton': {}}))
+    with pytest.raises(ValueError, match="refused by the installed evaluator .*unknown keys \\['simulaton'\\]"):
+        check_evaluator_config(root, {}, tree)
+    cfg.write_text('{"resources": {"cpu": 4}}')
+    with pytest.raises(ValueError, match='only "cpus" and "memory"'):
+        check_evaluator_config(root, {}, tree)
+    cfg.write_text(json.dumps({'cpus': 36, 'memory': 'auto'}))
+    import subprocess, sys
+    env = dict(os.environ, CF_V2_ROOT=str(root), CF_V2_CORES='')
+    proc = subprocess.run([sys.executable, '-m', 'loader.server'], cwd=Path(__file__).resolve().parents[1],
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 2 and 'old flat' in proc.stderr
+
+
+def test_empty_cf_v2_cores_leaves_sizing_to_the_evaluator(tmp_path):
+    archive = tmp_path / 'e.zip'; build_zip(archive, delay=0.2)
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        request('POST', '/evaluate', dict(design_zip=b'd', evaluator_zip=archive, request_id='auto'))
+        wait_until(lambda: terminal(request, 'auto'))
+        cmd = Path(f'/proc/{runtime.service.proc.pid}/cmdline').read_bytes().split(b'\0')
+        assert b'--cores' not in cmd
+    with running(tmp_path, allow_unsigned=True, cores=2) as (runtime, request):
+        request('POST', '/evaluate', dict(design_zip=b'd2', evaluator_zip=archive, request_id='two'))
+        wait_until(lambda: terminal(request, 'two'))
+        cmd = Path(f'/proc/{runtime.service.proc.pid}/cmdline').read_bytes().split(b'\0')
+        assert cmd[cmd.index(b'--cores') + 1] == b'2'
+
+
 def test_cf_v2_cores_validation():
     from loader.server import parse_cores
-    assert parse_cores(None, 6) == 6 and parse_cores('', 6) == 6 and parse_cores(' 4 ', 6) == 4
+    assert parse_cores(None, 6) is None and parse_cores('', 6) is None and parse_cores(' 4 ', 6) == 4
     for bad in ('16-31', '0', '-1', 'abc', '1.5', '2,3'):
         with pytest.raises(ValueError, match='CF_V2_CORES must be a positive integer'):
             parse_cores(bad, 64)

@@ -5,10 +5,13 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 from urllib.parse import urlsplit
 
+from .install import interpreter
 from .multipart import HTTPError, parse
 from .runtime import ID, Runtime
 from .security import SHA, PrivateModeError
@@ -138,16 +141,72 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def parse_cores(value, available):
-    """CF_V2_CORES is a count of CPUs to use (empty = all available), not a CPU list or range."""
+    """CF_V2_CORES is a count of CPUs to use, not a CPU list or range. Empty -> None: the evaluator
+    sizes itself (CF_CPUS / CF_MEMORY / its config file; default auto = every CPU it may use)."""
     text = (value or '').strip()
     if not text:
-        return available
+        return None
     if not (text.isascii() and text.isdigit() and int(text) >= 1):
         raise ValueError(f'CF_V2_CORES must be a positive integer (a number of CPUs, e.g. 8), got {value!r}; '
                          'to restrict the loader to specific CPUs use a compose override "cpuset:" instead')
     if int(text) > available:
         raise ValueError(f'CF_V2_CORES={text} exceeds the {available} CPUs available to this container')
     return int(text)
+
+
+CONFIG_EXAMPLE = '{"resources": {"cpus": "auto", "memory": "auto"}, "waits": {"step_bound_factor": 8}}'
+
+# Run INSIDE the installed evaluator, with its own interpreter: its resources.read_config_doc() is the
+# one list of accepted top-level sections (resources, waits, simulation, ... as that version defines
+# them), and its own loaders validate the values. The loader keeps no second copy that could drift.
+EVALUATOR_CONFIG_CHECK = """
+import sys
+sys.path[:0] = [sys.argv[1], sys.argv[1] + '/v2/pipeline']
+from orchestrator import resources
+resources.read_config_doc()
+resources.load_config_file()
+try:
+    from orchestrator import waits
+except ImportError:
+    waits = None
+if waits is not None:
+    waits.load()
+"""
+
+
+def check_evaluator_config(root, environ, tree=None, python=None):
+    """Fail at start-up, naming the file, when the evaluator config (CF_EVALUATOR_CONFIG, else
+    <CF_V2_ROOT>/evaluator.json) is not what the evaluator reads: otherwise every install fails its
+    preflight, or the service exits, as an unscored system fault. The loader itself checks only that
+    the file exists (when named) and is a JSON object without the retired flat {"cpus": ..} form; the
+    sections and values are validated by the installed evaluator `tree` (the newest ready one) when
+    there is one. Without one the first install's preflight validates it. -> path or None (absent)."""
+    explicit = (environ.get('CF_EVALUATOR_CONFIG') or '').strip()
+    path = Path(explicit) if explicit else Path(root) / 'evaluator.json'
+    if not path.is_file():
+        if explicit:
+            raise ValueError(f'CF_EVALUATOR_CONFIG={explicit}: no such file inside the container '
+                             '(put it under CF_V2_ROOT, which is mounted at the same path)')
+        return None
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f'evaluator config {path}: not readable JSON ({exc})') from None
+    if not isinstance(doc, dict):
+        raise ValueError(f'evaluator config {path}: must be a JSON object; e.g. {CONFIG_EXAMPLE}')
+    if set(doc) & {'cpus', 'memory'}:
+        raise ValueError(f'evaluator config {path}: the old flat {{"cpus": ..}} form is no longer read; '
+                         f'nest them under "resources", e.g. {CONFIG_EXAMPLE}')
+    if tree is not None and (Path(tree) / 'v2/pipeline/orchestrator/resources.py').is_file():
+        env = {k: v for k, v in environ.items() if not k.startswith('PYTHON')}
+        env.update(CF_V2_ROOT=str(root), CF_EVALUATOR_CONFIG=str(path), PYTHONDONTWRITEBYTECODE='1')
+        proc = subprocess.run([python or sys.executable, '-I', '-B', '-c', EVALUATOR_CONFIG_CHECK, str(tree)],
+                              env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        if proc.returncode:
+            last = (proc.stderr.strip().splitlines() or ['exit %d' % proc.returncode])[-1]
+            raise ValueError(f'evaluator config {path} is refused by the installed evaluator '
+                             f'{Path(tree).name[:12]}: {last.split(": ", 1)[-1][:600]}')
+    return path
 
 
 def main():
@@ -168,8 +227,13 @@ def main():
         cores = parse_cores(os.environ.get('CF_V2_CORES'), len(os.sched_getaffinity(0)))
     except ValueError as exc:
         ap.error(str(exc))
-    if not modes or set(modes) - {'DEV', 'T1', 'T2'} or not 1 <= workers <= 2 or not 1 <= cores <= len(os.sched_getaffinity(0)):
+    if not modes or set(modes) - {'DEV', 'T1', 'T2'} or not 1 <= workers <= 2 or (
+            cores is not None and not 1 <= cores <= len(os.sched_getaffinity(0))):
         ap.error('invalid modes, workers or CPU allocation')
+    try:
+        check_evaluator_config(root, os.environ)             # file shape before anything starts
+    except ValueError as exc:
+        ap.error(str(exc))
     min_disk = os.environ.get('CF_V2_PREFLIGHT_MIN_DISK_GIB', '').strip()
     if min_disk and not (min_disk.isdigit() and 1 <= int(min_disk) <= 100000):
         ap.error('CF_V2_PREFLIGHT_MIN_DISK_GIB must be empty or a whole number of GiB')
@@ -178,6 +242,12 @@ def main():
                           os.environ.get('CF_V2_ALLOW_RUNC') == '1', workers, cores,
                           int(min_disk) if min_disk else None)
     except PrivateModeError as exc:
+        ap.error(str(exc))
+    try:                                                      # sections and values: the evaluator's own rules
+        sha = runtime.latest_ready()
+        check_evaluator_config(root, os.environ, root / 'evaluators' / sha if sha else None, interpreter())
+    except ValueError as exc:
+        runtime.close()
         ap.error(str(exc))
     server = Server((args.host, args.port), runtime)
     runtime.start()

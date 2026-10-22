@@ -18,9 +18,16 @@ from pathlib import Path
 ap = argparse.ArgumentParser()
 for x in ('host','port','state','posix','policy','workers','cores','lanes'): ap.add_argument('--'+x)
 ap.add_argument('--allow-runc', action='store_true')
+ap.add_argument('--cancel'); ap.add_argument('--reason')
 a = ap.parse_args()
 state = Path(a.state)
 state.mkdir(parents=True, exist_ok=True)
+if a.cancel:                                   # operator cancellation (service.py --cancel contract)
+    p = state / (a.cancel + '.json')
+    if not p.exists():
+        print(json.dumps(dict(request_id=a.cancel, cancelled=False))); raise SystemExit(3)
+    p.with_suffix('.cancelled').write_text(a.reason or '')
+    print(json.dumps(dict(request_id=a.cancel, cancelled=True))); raise SystemExit(0)
 RAW = {raw!r}
 DELAY = {delay!r}
 class H(BaseHTTPRequestHandler):
@@ -35,6 +42,10 @@ class H(BaseHTTPRequestHandler):
         if self.path == '/health': return self.send(200,b'{{"status":"ok"}}')
         p = state / (self.path.rsplit('/',1)[-1] + '.json')
         if not p.exists(): return self.send(404,b'{{}}')
+        if p.with_suffix('.cancelled').exists():
+            return self.send(200,b'{{"status":"ERROR","problems":[{{"code":"EVALUATION_CANCELLED"}}]}}')
+        if p.with_suffix('.done-without-response').exists():   # an older evaluator's terminal row, no result
+            return self.send(202,b'{{"state":"done"}}')
         t = json.loads(p.read_text())['time']
         if time.time() - t < DELAY:
             phase = 'queued' if time.time() - t < DELAY/2 else 'running'
@@ -47,10 +58,13 @@ class H(BaseHTTPRequestHandler):
         body = self.rfile.read(n)
         msg = BytesParser(policy=email.policy.default).parsebytes(('Content-Type: '+self.headers['Content-Type']+'\\r\\n\\r\\n').encode()+body)
         fields = {{part.get_param('name', header='content-disposition'):part.get_payload(decode=True) for part in msg.iter_parts()}}
-        assert set(fields) == {{'design_zip','request_id','mode','submitter'}}
+        assert set(fields) - {{'chain_commit'}} == {{'design_zip','request_id','mode','submitter'}}
+        if fields['design_zip'] == b'refused-by-evaluator':
+            return self.send(400,b'{{"error":{{"code":"CHAIN_COMMIT_REQUIRED","message":"x"}}}}')
         rid = fields['request_id'].decode()
         p = state / (rid+'.json')
-        if not p.exists(): p.write_text(json.dumps(dict(time=time.time(), design_sha256=hashlib.sha256(fields['design_zip']).hexdigest())))
+        chain = fields['chain_commit'].decode() if 'chain_commit' in fields else None
+        if not p.exists(): p.write_text(json.dumps(dict(time=time.time(), design_sha256=hashlib.sha256(fields['design_zip']).hexdigest(), chain_commit=chain)))
         return self.send(202,b'{{"state":"queued"}}')
 ThreadingHTTPServer((a.host,int(a.port)),H).serve_forever()
 '''

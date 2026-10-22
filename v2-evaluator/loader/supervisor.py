@@ -16,7 +16,9 @@ from .security import InstallError, atomic_json
 class Service:
     def __init__(self, installer, workers=1, cores=None):
         self.installer, self.workers = installer, workers
-        self.cores = cores or len(os.sched_getaffinity(0))
+        # None (CF_V2_CORES empty): pass no --cores, so the evaluator sizes itself (CF_CPUS / CF_MEMORY /
+        # its config file, default auto). A count is the deprecated explicit alias, kept for old setups.
+        self.cores = cores
         self.sha, self.proc, self.port = None, None, None
         self.healthy = False
 
@@ -63,7 +65,9 @@ class Service:
         command = [interpreter(), '-B', str(tree / manifest['service']), '--host', '127.0.0.1',
                    '--port', str(self.port), '--state', env['CF_ORCH_SSD'], '--posix', env['CF_ORCH_POSIX'],
                    '--policy', str(tree / manifest['policy']), '--workers', str(self.workers),
-                   '--cores', str(self.cores), '--lanes', str(root / 'lanes')]
+                   '--lanes', str(root / 'lanes')]
+        if self.cores is not None:
+            command += ['--cores', str(self.cores)]
         if self.installer.allow_runc:
             command.append('--allow-runc')
         self.proc = subprocess.Popen(command, cwd=tree, env=env, stdin=subprocess.DEVNULL,

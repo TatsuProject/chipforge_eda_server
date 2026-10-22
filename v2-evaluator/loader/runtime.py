@@ -32,15 +32,19 @@ CREATE TABLE IF NOT EXISTS jobs (
 '''
 
 
-def system_error(job, code):
+# Evaluator progress states that can never become a response by waiting longer.
+TERMINAL_STATES = frozenset({'done', 'failed', 'cancelled', 'error'})
+
+
+def system_error(job, code, detail='Evaluator infrastructure unavailable; retry this request.',
+                 title='Evaluator infrastructure failure'):
     # No scores for infrastructure/provisioning faults. Never include exception text or subprocess output.
     instance = 'urn:chipforge:eval:' + job['request_id']
-    detail = 'Evaluator infrastructure unavailable; retry this request.'
     return json.dumps(dict(schema='cf-response/1', request_id=job['request_id'], instance=instance,
         created_at=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         submission={'submitter': job['submitter']}, mode=job['mode'], status='ERROR', score=None,
         reward_eligible=False, pending=[], tier_reached='T0', summary=detail, stages=[], logs=[], receipt=None,
-        timing={}, problems=[dict(type='urn:chipforge:problem:npu-v2:' + code, title='Evaluator infrastructure failure',
+        timing={}, problems=[dict(type='urn:chipforge:problem:npu-v2:' + code, title=title,
         detail=detail, instance=instance + '#problem-1', code=code, category='infrastructure', fault='system',
         exploit=False, retryable=True, severity='error', where={'tier': 'T0', 'stage': 'evaluator_install'},
         checked='loader provisioning and service supervision', metadata={})])).encode()
@@ -302,6 +306,16 @@ class Runtime:
                     state = json.loads(body).get('state', 'queued')
                 except (ValueError, AttributeError):
                     raise InstallError('INVALID_EVALUATOR_PROGRESS') from None
+                if state in TERMINAL_STATES:
+                    # The evaluator holds the request as finished but sent no response (an older evaluator
+                    # answers a queue row marked done without a result like this forever). Terminal ERROR
+                    # for the caller; the job leaves the active slot, so the next request (and evaluator)
+                    # is not blocked behind it.
+                    self.finish(job, system_error(
+                        job, 'EVALUATOR_RESULT_MISSING', title='Evaluation ended without a recorded result',
+                        detail='The evaluator finished this evaluation without a result. Nothing was scored; '
+                               'resubmit under a new request ID.'), error='EVALUATOR_RESULT_MISSING')
+                    return
                 phase = 'running' if state in ('running', 'leased') else 'queued'
                 with self.db() as db:
                     db.execute('UPDATE jobs SET phase=?,forwarded=1 WHERE request_id=?', (phase, job['request_id']))

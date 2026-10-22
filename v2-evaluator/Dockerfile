@@ -168,5 +168,6 @@ COPY nangate45.sha256 VERSIONS.sh entrypoint.sh smoke.sh /opt/cf/
 COPY loader/ /opt/cf/loader/
 # Deliberate systemd-run --scope replacement: no systemd daemon runs in this image.
 COPY cfscope /usr/local/bin/systemd-run
+COPY cf-cancel /usr/local/bin/cf-cancel
 RUN /opt/cf/VERSIONS.sh > /opt/cf/VERSIONS.txt && cat /opt/cf/VERSIONS.txt
 ENTRYPOINT ["/opt/cf/entrypoint.sh"]

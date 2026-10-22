@@ -78,6 +78,12 @@ services:
       - /run/log/journal:/run/log/journal:ro
       - /etc/machine-id:/etc/machine-id:ro
       - ./shared/v2-incoming:/incoming
+      # Gate B public-pool bytes, each verified against the signed sha256 before use. The cache is
+      # read-write and defaults to a folder inside the data root (move it to another disk by setting
+      # CF_GATEB_CACHE); the optional mirror is a read-only, pre-seeded copy (<sha[:2]>/<sha>; an empty
+      # folder is fine). Both at the identical path, like the data root.
+      - ${CF_GATEB_CACHE:-${CF_V2_ROOT:-/var/lib/chipforge-v2}/gateb-pool-cache}:${CF_GATEB_CACHE:-${CF_V2_ROOT:-/var/lib/chipforge-v2}/gateb-pool-cache}
+      - ${CF_GATEB_MIRROR:-/var/lib/chipforge-v2-gateb-mirror}:${CF_GATEB_MIRROR:-/var/lib/chipforge-v2-gateb-mirror}:ro
     environment:
       - CF_V2_ROOT=${CF_V2_ROOT:-/var/lib/chipforge-v2}
       - CF_EVALUATOR_SALT_FILE=/run/cf-secrets/evaluator-salt.bin
@@ -86,7 +92,23 @@ services:
       - CF_RTL_IMAGE=cf-rtl:v2.0
       - CF_STA_IMAGE=cf-sta:v2.0
       - CF_DOCKER_REQUIRED_SERVICES=
+      # Sizing (README "Resources"). Empty = auto: every CPU the container may use and its RAM less OS
+      # headroom. Precedence: evaluator config file < CF_CPUS / CF_MEMORY. CF_V2_CORES is the
+      # deprecated count, used only when nothing else sets cpus.
+      - CF_CPUS=${CF_CPUS:-}
+      - CF_MEMORY=${CF_MEMORY:-}
+      # Evaluator config file: {"resources": {"cpus": .., "memory": ..}, "waits": {..}}. Empty =
+      # $CF_V2_ROOT/evaluator.json if it exists (all defaults otherwise). A path must be inside the
+      # container, e.g. under CF_V2_ROOT. The loader checks its shape at start-up.
+      - CF_EVALUATOR_CONFIG=${CF_EVALUATOR_CONFIG:-}
       - CF_V2_CORES=${CF_V2_CORES:-}
+      - CF_GATEB_CACHE=${CF_GATEB_CACHE:-${CF_V2_ROOT:-/var/lib/chipforge-v2}/gateb-pool-cache}
+      - CF_GATEB_MIRROR=${CF_GATEB_MIRROR:-/var/lib/chipforge-v2-gateb-mirror}
+      # T1/T2 randomness: drand relays (README "Network egress"). Empty = the signed beacon policy's
+      # default relays and timeouts.
+      - CF_DRAND_RELAYS=${CF_DRAND_RELAYS:-}
+      - CF_DRAND_TIMEOUT_S=${CF_DRAND_TIMEOUT_S:-}
+      - CF_DRAND_DEADLINE_S=${CF_DRAND_DEADLINE_S:-}
       - CF_V2_WORKERS=${CF_V2_WORKERS:-1}
       - CF_V2_ALLOWED_MODES=${CF_V2_ALLOWED_MODES:-T2}
       # OpenSSH Ed25519 public key text; never a private signing key.

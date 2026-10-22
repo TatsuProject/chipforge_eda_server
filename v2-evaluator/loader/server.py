@@ -138,16 +138,48 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def parse_cores(value, available):
-    """CF_V2_CORES is a count of CPUs to use (empty = all available), not a CPU list or range."""
+    """CF_V2_CORES is a count of CPUs to use, not a CPU list or range. Empty -> None: the evaluator
+    sizes itself (CF_CPUS / CF_MEMORY / its config file; default auto = every CPU it may use)."""
     text = (value or '').strip()
     if not text:
-        return available
+        return None
     if not (text.isascii() and text.isdigit() and int(text) >= 1):
         raise ValueError(f'CF_V2_CORES must be a positive integer (a number of CPUs, e.g. 8), got {value!r}; '
                          'to restrict the loader to specific CPUs use a compose override "cpuset:" instead')
     if int(text) > available:
         raise ValueError(f'CF_V2_CORES={text} exceeds the {available} CPUs available to this container')
     return int(text)
+
+
+CONFIG_EXAMPLE = '{"resources": {"cpus": "auto", "memory": "auto"}, "waits": {"step_bound_factor": 8}}'
+
+
+def check_evaluator_config(root, environ):
+    """Fail at start-up, naming the file, when the evaluator config (CF_EVALUATOR_CONFIG, else
+    <CF_V2_ROOT>/evaluator.json) cannot be what the evaluator reads: otherwise every install fails its
+    preflight as an unscored system fault. Only the shape is checked here; the installed evaluator
+    validates every value (and names the source) at start-up. -> path or None (absent: all defaults)."""
+    explicit = (environ.get('CF_EVALUATOR_CONFIG') or '').strip()
+    path = Path(explicit) if explicit else Path(root) / 'evaluator.json'
+    if not path.is_file():
+        if explicit:
+            raise ValueError(f'CF_EVALUATOR_CONFIG={explicit}: no such file inside the container '
+                             '(put it under CF_V2_ROOT, which is mounted at the same path)')
+        return None
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f'evaluator config {path}: not readable JSON ({exc})') from None
+    if not isinstance(doc, dict) or set(doc) - {'resources', 'waits'}:
+        flat = isinstance(doc, dict) and set(doc) & {'cpus', 'memory'}
+        raise ValueError(f'evaluator config {path}: top-level keys must be "resources" and/or "waits"'
+                         + (' (the old flat {"cpus": ..} form is no longer read)' if flat else '')
+                         + f'; e.g. {CONFIG_EXAMPLE}')
+    if not isinstance(doc.get('resources', {}), dict) or set(doc.get('resources', {})) - {'cpus', 'memory'}:
+        raise ValueError(f'evaluator config {path}: "resources" takes only "cpus" and "memory"; e.g. {CONFIG_EXAMPLE}')
+    if not isinstance(doc.get('waits', {}), dict):
+        raise ValueError(f'evaluator config {path}: "waits" must be an object; e.g. {CONFIG_EXAMPLE}')
+    return path
 
 
 def main():
@@ -168,8 +200,13 @@ def main():
         cores = parse_cores(os.environ.get('CF_V2_CORES'), len(os.sched_getaffinity(0)))
     except ValueError as exc:
         ap.error(str(exc))
-    if not modes or set(modes) - {'DEV', 'T1', 'T2'} or not 1 <= workers <= 2 or not 1 <= cores <= len(os.sched_getaffinity(0)):
+    if not modes or set(modes) - {'DEV', 'T1', 'T2'} or not 1 <= workers <= 2 or (
+            cores is not None and not 1 <= cores <= len(os.sched_getaffinity(0))):
         ap.error('invalid modes, workers or CPU allocation')
+    try:
+        check_evaluator_config(root, os.environ)
+    except ValueError as exc:
+        ap.error(str(exc))
     min_disk = os.environ.get('CF_V2_PREFLIGHT_MIN_DISK_GIB', '').strip()
     if min_disk and not (min_disk.isdigit() and 1 <= int(min_disk) <= 100000):
         ap.error('CF_V2_PREFLIGHT_MIN_DISK_GIB must be empty or a whole number of GiB')

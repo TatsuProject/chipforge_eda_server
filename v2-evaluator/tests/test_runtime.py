@@ -307,6 +307,26 @@ def test_chain_commit_is_stored_forwarded_and_part_of_idempotency(tmp_path):
         assert 'CHAIN_COMMIT_REQUIRED' in doc['problems'][0]['detail']
 
 
+FAKE_EVALUATOR_RESOURCES = """
+import json, os
+from pathlib import Path
+class ResourceConfigError(ValueError):
+    pass
+SECTIONS = {"resources", "waits", "simulation"}
+def read_config_doc(environ=None):
+    path = os.environ["CF_EVALUATOR_CONFIG"]
+    doc = json.loads(Path(path).read_text())
+    if set(doc) - SECTIONS:
+        raise ResourceConfigError(f"evaluator config {path}: unknown keys {sorted(set(doc) - SECTIONS)}")
+    return path, doc
+def load_config_file(environ=None):
+    path, doc = read_config_doc()
+    if set(doc.get("resources", {})) - {"cpus", "memory"}:
+        raise ResourceConfigError(f'evaluator config {path}: "resources" takes only "cpus" and "memory"')
+    return path, doc.get("resources", {})
+"""
+
+
 def test_evaluator_config_shape_is_checked_at_startup(tmp_path):
     from loader.server import check_evaluator_config
     root = tmp_path / 'root'; root.mkdir()
@@ -319,9 +339,19 @@ def test_evaluator_config_shape_is_checked_at_startup(tmp_path):
         check_evaluator_config(root, {})
     with pytest.raises(ValueError, match='no such file'):
         check_evaluator_config(root, {'CF_EVALUATOR_CONFIG': str(tmp_path / 'missing.json')})
-    other = tmp_path / 'other.json'; other.write_text('{"resources": {"cpu": 4}}')
+    # Sections and values are the INSTALLED evaluator's rules (here one that also has "simulation").
+    tree = tmp_path / 'evaluator'
+    (tree / 'v2/pipeline/orchestrator').mkdir(parents=True)
+    (tree / 'v2/pipeline/orchestrator/resources.py').write_text(FAKE_EVALUATOR_RESOURCES)
+    cfg.write_text(json.dumps({'resources': {'cpus': 8}, 'simulation': {'pgo_gate': 1.1}}))
+    assert check_evaluator_config(root, {}, tree) == cfg              # accepted: the evaluator knows it
+    cfg.write_text(json.dumps({'resources': {'cpus': 8}, 'simulaton': {}}))
+    with pytest.raises(ValueError, match="refused by the installed evaluator .*unknown keys \\['simulaton'\\]"):
+        check_evaluator_config(root, {}, tree)
+    cfg.write_text('{"resources": {"cpu": 4}}')
     with pytest.raises(ValueError, match='only "cpus" and "memory"'):
-        check_evaluator_config(root, {'CF_EVALUATOR_CONFIG': str(other)})
+        check_evaluator_config(root, {}, tree)
+    cfg.write_text(json.dumps({'cpus': 36, 'memory': 'auto'}))
     import subprocess, sys
     env = dict(os.environ, CF_V2_ROOT=str(root), CF_V2_CORES='')
     proc = subprocess.run([sys.executable, '-m', 'loader.server'], cwd=Path(__file__).resolve().parents[1],

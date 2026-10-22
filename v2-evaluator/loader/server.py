@@ -5,10 +5,13 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 from urllib.parse import urlsplit
 
+from .install import interpreter
 from .multipart import HTTPError, parse
 from .runtime import ID, Runtime
 from .security import SHA, PrivateModeError
@@ -153,12 +156,31 @@ def parse_cores(value, available):
 
 CONFIG_EXAMPLE = '{"resources": {"cpus": "auto", "memory": "auto"}, "waits": {"step_bound_factor": 8}}'
 
+# Run INSIDE the installed evaluator, with its own interpreter: its resources.read_config_doc() is the
+# one list of accepted top-level sections (resources, waits, simulation, ... as that version defines
+# them), and its own loaders validate the values. The loader keeps no second copy that could drift.
+EVALUATOR_CONFIG_CHECK = """
+import sys
+sys.path[:0] = [sys.argv[1], sys.argv[1] + '/v2/pipeline']
+from orchestrator import resources
+resources.read_config_doc()
+resources.load_config_file()
+try:
+    from orchestrator import waits
+except ImportError:
+    waits = None
+if waits is not None:
+    waits.load()
+"""
 
-def check_evaluator_config(root, environ):
+
+def check_evaluator_config(root, environ, tree=None, python=None):
     """Fail at start-up, naming the file, when the evaluator config (CF_EVALUATOR_CONFIG, else
-    <CF_V2_ROOT>/evaluator.json) cannot be what the evaluator reads: otherwise every install fails its
-    preflight as an unscored system fault. Only the shape is checked here; the installed evaluator
-    validates every value (and names the source) at start-up. -> path or None (absent: all defaults)."""
+    <CF_V2_ROOT>/evaluator.json) is not what the evaluator reads: otherwise every install fails its
+    preflight, or the service exits, as an unscored system fault. The loader itself checks only that
+    the file exists (when named) and is a JSON object without the retired flat {"cpus": ..} form; the
+    sections and values are validated by the installed evaluator `tree` (the newest ready one) when
+    there is one. Without one the first install's preflight validates it. -> path or None (absent)."""
     explicit = (environ.get('CF_EVALUATOR_CONFIG') or '').strip()
     path = Path(explicit) if explicit else Path(root) / 'evaluator.json'
     if not path.is_file():
@@ -170,15 +192,20 @@ def check_evaluator_config(root, environ):
         doc = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
         raise ValueError(f'evaluator config {path}: not readable JSON ({exc})') from None
-    if not isinstance(doc, dict) or set(doc) - {'resources', 'waits'}:
-        flat = isinstance(doc, dict) and set(doc) & {'cpus', 'memory'}
-        raise ValueError(f'evaluator config {path}: top-level keys must be "resources" and/or "waits"'
-                         + (' (the old flat {"cpus": ..} form is no longer read)' if flat else '')
-                         + f'; e.g. {CONFIG_EXAMPLE}')
-    if not isinstance(doc.get('resources', {}), dict) or set(doc.get('resources', {})) - {'cpus', 'memory'}:
-        raise ValueError(f'evaluator config {path}: "resources" takes only "cpus" and "memory"; e.g. {CONFIG_EXAMPLE}')
-    if not isinstance(doc.get('waits', {}), dict):
-        raise ValueError(f'evaluator config {path}: "waits" must be an object; e.g. {CONFIG_EXAMPLE}')
+    if not isinstance(doc, dict):
+        raise ValueError(f'evaluator config {path}: must be a JSON object; e.g. {CONFIG_EXAMPLE}')
+    if set(doc) & {'cpus', 'memory'}:
+        raise ValueError(f'evaluator config {path}: the old flat {{"cpus": ..}} form is no longer read; '
+                         f'nest them under "resources", e.g. {CONFIG_EXAMPLE}')
+    if tree is not None and (Path(tree) / 'v2/pipeline/orchestrator/resources.py').is_file():
+        env = {k: v for k, v in environ.items() if not k.startswith('PYTHON')}
+        env.update(CF_V2_ROOT=str(root), CF_EVALUATOR_CONFIG=str(path), PYTHONDONTWRITEBYTECODE='1')
+        proc = subprocess.run([python or sys.executable, '-I', '-B', '-c', EVALUATOR_CONFIG_CHECK, str(tree)],
+                              env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        if proc.returncode:
+            last = (proc.stderr.strip().splitlines() or ['exit %d' % proc.returncode])[-1]
+            raise ValueError(f'evaluator config {path} is refused by the installed evaluator '
+                             f'{Path(tree).name[:12]}: {last.split(": ", 1)[-1][:600]}')
     return path
 
 
@@ -204,7 +231,7 @@ def main():
             cores is not None and not 1 <= cores <= len(os.sched_getaffinity(0))):
         ap.error('invalid modes, workers or CPU allocation')
     try:
-        check_evaluator_config(root, os.environ)
+        check_evaluator_config(root, os.environ)             # file shape before anything starts
     except ValueError as exc:
         ap.error(str(exc))
     min_disk = os.environ.get('CF_V2_PREFLIGHT_MIN_DISK_GIB', '').strip()
@@ -215,6 +242,12 @@ def main():
                           os.environ.get('CF_V2_ALLOW_RUNC') == '1', workers, cores,
                           int(min_disk) if min_disk else None)
     except PrivateModeError as exc:
+        ap.error(str(exc))
+    try:                                                      # sections and values: the evaluator's own rules
+        sha = runtime.latest_ready()
+        check_evaluator_config(root, os.environ, root / 'evaluators' / sha if sha else None, interpreter())
+    except ValueError as exc:
+        runtime.close()
         ap.error(str(exc))
     server = Server((args.host, args.port), runtime)
     runtime.start()

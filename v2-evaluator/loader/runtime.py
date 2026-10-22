@@ -110,6 +110,12 @@ class Runtime:
         self.service.stop()
         self.lock.close()
 
+    def latest_ready(self):
+        """The newest installed evaluator whose ready marker is valid here, or None."""
+        with self.db() as db:
+            rows = db.execute("SELECT sha FROM installs WHERE phase='ready' ORDER BY rowid DESC").fetchall()
+        return next((r['sha'] for r in rows if self.installer.ready(r['sha'])), None)
+
     def install_status(self, sha, attempt=None):
         with self.db() as db:
             row = (db.execute('SELECT * FROM installs WHERE sha=? ORDER BY attempt DESC LIMIT 1', (sha,))

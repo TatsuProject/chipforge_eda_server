@@ -130,9 +130,12 @@ Apply a change with `docker compose up -d`.
 
   Environment beats the file. `waits` only decides when a run that shows no progress is ended as an
   unscored system fault (the evaluator's TESTNET.md lists every knob); the defaults suit a dedicated
-  validator. The loader refuses to start, naming the file, when the file is not this shape (the old
-  flat `{"cpus": 36}` form included); the evaluator validates the values and logs one `resources:`
-  line with the plan it derived. Sizing changes wall time, never cycles or scores.
+  validator. Other sections (e.g. `simulation`) are whatever the installed evaluator version
+  accepts. At start-up the loader runs the newest installed evaluator's own config check and refuses
+  to start, naming the file and the evaluator's message, when it fails (a misspelt section, a bad
+  value, the retired flat `{"cpus": 36}` form); with no evaluator installed yet, the first install's
+  preflight does the same. The evaluator logs one `resources:` line with the plan it derived.
+  Sizing changes wall time, never cycles or scores.
 - `CF_V2_CORES` (deprecated): a count of CPUs, used only when nothing above sets cpus (a positive
   integer, e.g. `8`). It is not a CPU list: `16-31` is refused at start with a message
   naming the variable. To confine the evaluator to specific CPUs, add a compose override such as

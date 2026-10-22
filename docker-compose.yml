@@ -99,7 +99,7 @@ services:
       - CF_MEMORY=${CF_MEMORY:-}
       # Evaluator config file: {"resources": {"cpus": .., "memory": ..}, "waits": {..}}. Empty =
       # $CF_V2_ROOT/evaluator.json if it exists (all defaults otherwise). A path must be inside the
-      # container, e.g. under CF_V2_ROOT. The loader checks its shape at start-up.
+      # container, e.g. under CF_V2_ROOT. The loader runs the installed evaluator's own check on it at start-up.
       - CF_EVALUATOR_CONFIG=${CF_EVALUATOR_CONFIG:-}
       - CF_V2_CORES=${CF_V2_CORES:-}
       - CF_GATEB_CACHE=${CF_GATEB_CACHE:-${CF_V2_ROOT:-/var/lib/chipforge-v2}/gateb-pool-cache}

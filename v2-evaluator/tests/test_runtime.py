@@ -429,3 +429,32 @@ def test_evaluator_config_values_are_checked_by_the_evaluators_own_loaders(tmp_p
     cfg.write_text(json.dumps({'simulation': {'continuation_threads': 'x'}}))
     with pytest.raises(ValueError, match="refused by the installed evaluator .*continuation_threads must be"):
         check_evaluator_config(root, {}, tree)
+
+
+FAKE_EVALUATOR_GATEB = """
+import json, os
+def load(environ=None):
+    s = json.loads(open(os.environ["CF_EVALUATOR_CONFIG"]).read()).get("gate_b", {})
+    if set(s) - {"mirrors", "require_prefetched", "prefetch_workers"}:
+        raise ValueError(f"evaluator config: unknown gate_b knob(s) {sorted(set(s) - {'mirrors', 'require_prefetched', 'prefetch_workers'})}")
+    return {}
+"""
+
+
+def test_evaluator_config_gate_b_section_is_checked_by_the_evaluators_own_loader(tmp_path):
+    """launch-prefetch added a "gate_b" section (orchestrator/gateb_config.py). Its loader runs at
+    start-up like waits/simspeed, so a misspelt gate_b knob stops the loader, not every preflight."""
+    from loader.server import check_evaluator_config
+    root = tmp_path / 'root'; root.mkdir()
+    cfg = root / 'evaluator.json'
+    tree = tmp_path / 'evaluator'
+    (tree / 'v2/pipeline/orchestrator').mkdir(parents=True)
+    (tree / 'v2/pipeline/orchestrator/__init__.py').write_text('')
+    (tree / 'v2/pipeline/orchestrator/resources.py').write_text(
+        FAKE_EVALUATOR_VALUES.replace('"simulation"}', '"simulation", "gate_b"}'))
+    (tree / 'v2/pipeline/orchestrator/gateb_config.py').write_text(FAKE_EVALUATOR_GATEB)
+    cfg.write_text(json.dumps({'gate_b': {'mirrors': [], 'prefetch_workers': 'auto'}}))
+    assert check_evaluator_config(root, {}, tree) == cfg
+    cfg.write_text(json.dumps({'gate_b': {'mirrorz': []}}))
+    with pytest.raises(ValueError, match="refused by the installed evaluator .*unknown gate_b knob"):
+        check_evaluator_config(root, {}, tree)

@@ -169,7 +169,7 @@ resources.load_config_file()
 for name in ('process_budget', 'compile_workers_setting'):
     if hasattr(resources, name):
         getattr(resources, name)()
-for name in ('waits', 'simspeed'):
+for name in ('waits', 'simspeed', 'gateb_config'):
     try:
         module = __import__('orchestrator.' + name, fromlist=[name])
     except ImportError:

@@ -13,3 +13,4 @@
 !loader/*.py
 !locks/
 !locks/*.lock
+!cf-cancel

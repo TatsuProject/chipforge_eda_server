@@ -58,10 +58,13 @@ class H(BaseHTTPRequestHandler):
         body = self.rfile.read(n)
         msg = BytesParser(policy=email.policy.default).parsebytes(('Content-Type: '+self.headers['Content-Type']+'\\r\\n\\r\\n').encode()+body)
         fields = {{part.get_param('name', header='content-disposition'):part.get_payload(decode=True) for part in msg.iter_parts()}}
-        assert set(fields) == {{'design_zip','request_id','mode','submitter'}}
+        assert set(fields) - {{'chain_commit'}} == {{'design_zip','request_id','mode','submitter'}}
+        if fields['design_zip'] == b'refused-by-evaluator':
+            return self.send(400,b'{{"error":{{"code":"CHAIN_COMMIT_REQUIRED","message":"x"}}}}')
         rid = fields['request_id'].decode()
         p = state / (rid+'.json')
-        if not p.exists(): p.write_text(json.dumps(dict(time=time.time(), design_sha256=hashlib.sha256(fields['design_zip']).hexdigest())))
+        chain = fields['chain_commit'].decode() if 'chain_commit' in fields else None
+        if not p.exists(): p.write_text(json.dumps(dict(time=time.time(), design_sha256=hashlib.sha256(fields['design_zip']).hexdigest(), chain_commit=chain)))
         return self.send(202,b'{{"state":"queued"}}')
 ThreadingHTTPServer((a.host,int(a.port)),H).serve_forever()
 '''

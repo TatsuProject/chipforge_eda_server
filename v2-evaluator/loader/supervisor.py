@@ -112,7 +112,9 @@ class Service:
     def submit(self, job):
         boundary = 'cf-' + uuid.uuid4().hex
         with tempfile.NamedTemporaryFile(dir=self.installer.root / 'tmp') as f:
-            for key in ('request_id', 'mode', 'submitter'):
+            for key in ('request_id', 'mode', 'submitter', 'chain_commit'):
+                if key == 'chain_commit' and not job.get(key):
+                    continue          # only sent when the caller sent one (evaluators before BEACON refuse it)
                 f.write(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{job[key]}\r\n'.encode())
             f.write(f'--{boundary}\r\nContent-Disposition: form-data; name="design_zip"; filename="design.zip"\r\nContent-Type: application/zip\r\n\r\n'.encode())
             with open(job['design'], 'rb') as design:

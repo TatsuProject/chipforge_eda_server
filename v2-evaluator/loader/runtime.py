@@ -72,6 +72,9 @@ class Runtime:
         self.start_failures = {}
         with self.db() as db:
             db.executescript(SCHEMA)
+            # cf-chain-commit/1 (BEACON.md): forwarded verbatim to the evaluator, which validates it.
+            if 'chain_commit' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute('ALTER TABLE jobs ADD COLUMN chain_commit TEXT')
 
     @contextmanager
     def db(self):
@@ -202,11 +205,23 @@ class Runtime:
         if not design:
             raise HTTPError(400, 'MISSING_DESIGN', 'design_zip is required.')
         design_hash = digest(design)
+        chain = fields.get('chain_commit')
+        if chain is not None:
+            # Canonical text, so a re-sent identical object is the same request; the evaluator checks
+            # the schema and that it names this design.
+            try:
+                obj = json.loads(chain)
+            except ValueError:
+                obj = None
+            if not isinstance(obj, dict):
+                raise HTTPError(400, 'INVALID_CHAIN_COMMIT', 'chain_commit must be a JSON object (cf-chain-commit/1).')
+            chain = json.dumps(obj, sort_keys=True, separators=(',', ':'))
         sha = self.archive(fields)
         with self.mutex:
             old = self.job(rid)
             if old:
-                if (old['sha'], old['mode'], old['submitter'], old['design_hash']) != (sha, mode, submitter, design_hash):
+                if (old['sha'], old['mode'], old['submitter'], old['design_hash'], old['chain_commit']) != (
+                        sha, mode, submitter, design_hash, chain):
                     raise HTTPError(409, 'REQUEST_ID_CONFLICT', 'This request ID already names a different request.')
                 if old['error'] is None:
                     return old
@@ -223,8 +238,8 @@ class Runtime:
                     os.fsync(f.fileno())
                 sync_dir(dest.parent)
                 with self.db() as db:
-                    db.execute('INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created) VALUES(?,?,?,?,?,?,?,?,?)',
-                               (rid, sha, attempt, mode, submitter, design_hash, str(dest), 'installing_evaluator', time.time()))
+                    db.execute('INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,chain_commit) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                               (rid, sha, attempt, mode, submitter, design_hash, str(dest), 'installing_evaluator', time.time(), chain))
         accepted = self.job(rid)
         # Installation can fail/complete before this handler returns. A new acceptance is
         # still 202; terminal state belongs to the subsequent status poll.
@@ -320,7 +335,16 @@ class Runtime:
                 with self.db() as db:
                     db.execute('UPDATE jobs SET phase=?,forwarded=1 WHERE request_id=?', (phase, job['request_id']))
             elif status not in (429, 503):
-                self.fail(job, 'EVALUATOR_SERVICE_REJECTED')
+                # Name the evaluator's public refusal code (e.g. CHAIN_COMMIT_REQUIRED), never its text.
+                try:
+                    why = str(json.loads(body)['error']['code'])
+                except (ValueError, KeyError, TypeError):
+                    why = ''
+                why = why if re.fullmatch(r'[A-Z0-9_]{1,64}', why) else f'HTTP {status}'
+                self.finish(job, system_error(job, 'EVALUATOR_SERVICE_REJECTED', title='Evaluator refused the request',
+                                              detail=f'The evaluator refused this request ({why}). Fix the request '
+                                                     'and resubmit under a new request ID.'),
+                            error='EVALUATOR_SERVICE_REJECTED')
         except InstallError as exc:
             if exc.code in ('EVALUATOR_SERVICE_EXITED', 'EVALUATOR_SERVICE_START_FAILED'):
                 failures = self.start_failures.get(job['sha'], 0) + 1

@@ -75,7 +75,7 @@ def parse(stream, length, content_type, directory, evaluate=True):
         raise HTTPError(400, 'INVALID_MULTIPART', 'Invalid initial boundary.')
     allowed = {'evaluator_zip', 'evaluator_sha256', 'evaluator_sig', 'signature'}
     if evaluate:
-        allowed |= {'design_zip', 'request_id', 'mode', 'submitter'}
+        allowed |= {'design_zip', 'request_id', 'mode', 'submitter', 'chain_commit'}
     while True:
         headers = Message()
         for _ in range(16):
@@ -96,7 +96,8 @@ def parse(stream, length, content_type, directory, evaluate=True):
         fd, tmp = tempfile.mkstemp(dir=directory)
         import os
         with os.fdopen(fd, 'wb') as out:
-            reader.part(boundary, out, (256 << 20) if name.endswith('_zip') else (16 << 10) if name in ('evaluator_sig', 'signature') else 128)
+            reader.part(boundary, out, (256 << 20) if name.endswith('_zip') else (16 << 10) if name in ('evaluator_sig', 'signature')
+                        else 2048 if name == 'chain_commit' else 128)
         p = Path(tmp)
         if name.endswith('_zip'):
             fields[name] = p

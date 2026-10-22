@@ -282,6 +282,31 @@ def test_operator_cancel_in_the_evaluator_or_the_loader(tmp_path):
         wait_until(lambda: runtime.job('after')['forwarded'])         # the loader is not blocked
 
 
+def test_chain_commit_is_stored_forwarded_and_part_of_idempotency(tmp_path):
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=0.3)
+    cc = {'schema': 'cf-chain-commit/1', 'netuid': 108, 'block_number': 7, 'hotkey': '5F'}
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        fields = dict(design_zip=b'd', evaluator_zip=archive, request_id='chained', chain_commit=json.dumps(cc, indent=2))
+        assert request('POST', '/evaluate', fields)[0] == 202
+        wait_until(lambda: terminal(request, 'chained'))
+        sent = json.loads((runtime.root / 'state' / sha / 'chained.json').read_text())['chain_commit']
+        assert json.loads(sent) == cc and sent == json.dumps(cc, sort_keys=True, separators=(',', ':'))
+        same = dict(fields, chain_commit=json.dumps(cc), evaluator_zip=None)
+        del same['evaluator_zip']; same['evaluator_sha256'] = sha
+        assert request('POST', '/evaluate', same)[0] == 200                       # same object, any spacing
+        assert request('POST', '/evaluate', dict(same, chain_commit=json.dumps(dict(cc, block_number=8))))[0] == 409
+        assert request('POST', '/evaluate', dict(same, request_id='bad', chain_commit='not json'))[0] == 400
+        assert request('POST', '/evaluate', dict(same, request_id='big', chain_commit='{"x":"' + 'a' * 2100 + '"}'))[0] in (400, 413)
+        request('POST', '/evaluate', dict(design_zip=b'd2', evaluator_sha256=sha, request_id='plain'))
+        wait_until(lambda: terminal(request, 'plain'))
+        assert json.loads((runtime.root / 'state' / sha / 'plain.json').read_text())['chain_commit'] is None
+        # An evaluator refusal names its public code to the caller.
+        request('POST', '/evaluate', dict(design_zip=b'refused-by-evaluator', evaluator_sha256=sha, request_id='refused'))
+        doc = json.loads(wait_until(lambda: terminal(request, 'refused'))[2])
+        assert doc['status'] == 'ERROR' and doc['problems'][0]['code'] == 'EVALUATOR_SERVICE_REJECTED'
+        assert 'CHAIN_COMMIT_REQUIRED' in doc['problems'][0]['detail']
+
+
 def test_evaluator_config_shape_is_checked_at_startup(tmp_path):
     from loader.server import check_evaluator_config
     root = tmp_path / 'root'; root.mkdir()

@@ -239,6 +239,15 @@ unprefixed paths for the existing proxy. Uploads require Content-Length; the
 gateway forwards multipart bytes as a stream. The loader spools ZIP parts with
 bounded memory (at most two concurrent uploads).
 
+`POST /v2/evaluate` fields: `design_zip`, `request_id`, `mode`, optional `submitter`, the evaluator
+(`evaluator_zip` + `evaluator_sig`, or `evaluator_sha256` once cached) and, for T1/T2 with a
+BEACON evaluator, `chain_commit` (JSON `cf-chain-commit/1`, at most 2048 bytes). The loader keeps
+`chain_commit` in canonical form, makes it part of request idempotency (the same `request_id` with a
+different object is 409) and forwards it unchanged; the evaluator validates it. An evaluator
+refusal (e.g. `CHAIN_COMMIT_REQUIRED`) reaches the caller as a terminal ERROR
+`EVALUATOR_SERVICE_REJECTED` whose detail names that code. A terminal evaluator state without a
+response is a terminal ERROR `EVALUATOR_RESULT_MISSING`; neither blocks later requests.
+
 ```sh
 curl -F design_zip=@design.zip -F evaluator_zip=@evaluator.zip \
   -F evaluator_sig=@evaluator.zip.sig -F request_id=job-1 \

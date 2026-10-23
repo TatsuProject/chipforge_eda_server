@@ -5,3 +5,4 @@ python-multipart==0.0.6
 requests
 volare
 aiofiles
+certifi>=2026.10.23  # drops the eMudhra roots Mozilla distrusted (Oct 2026)

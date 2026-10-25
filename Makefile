@@ -11,7 +11,7 @@ images:
 # Pull the 4 pinned images by digest (images.lock), build the gateway (the only locally built image) and start
 # the server. Never builds the 4 pinned images. This is the one command validators run (after git pull).
 start:
-	./pull_images.sh
+	bash ./pull_images.sh
 	docker compose build eda-gateway
 	docker compose up -d --no-build --remove-orphans
 	@echo "Gateway: http://localhost:8080  (v2 routes under /v2/*)"

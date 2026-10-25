@@ -5,7 +5,7 @@
 images:
 	@test -n "$(ZIP)" || { echo "usage: make images ZIP=/path/to/chipforge_npu_v2_0_evaluator.zip"; exit 2; }
 	rm -rf .images-zip && mkdir .images-zip
-	unzip -q "$(ZIP)" 'v2/deploy/*' 'v2/pipeline/orchestrator/checker/validator_pins.json' -d .images-zip
+	unzip -q "$(ZIP)" 'v2/deploy/*' 'v2/pipeline/image_content.py' 'v2/pipeline/orchestrator/checker/validator_pins.json' -d .images-zip
 	cd .images-zip && bash v2/deploy/load_images.sh pull docker
 
 # Build the gateway (the only locally built image) and start the server. Never builds the 4 pinned images.

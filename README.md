@@ -50,17 +50,15 @@ images (`pull_policy: never`, step 3); their sources are `v2-evaluator/` and `v2
    In `.env` set at least `CF_V2_EVALUATOR_PUBLIC_KEY` (the publisher's `ssh-ed25519 AAAA...`
    public key line), `CF_V2_ROOT` (data root) and `CF_V2_SECRETS` (see Configuration).
 
-3. **Get the images and start:**
+3. **Start (pulls the 4 published images by digest, builds only the small gateway):**
    ```bash
-   make images ZIP=/path/to/chipforge_npu_v2_0_evaluator.zip   # once per evaluator release
    make start
    ```
-   `make images` pulls the four published images (Docker Hub, `logicx101/chipforge-v2-*`) by their
-   immutable digests listed in the signed evaluator zip, checks each against the zip's pins and tags
-   the local names. Check the zip's signature first (setup guide). `make start` builds only the small
-   gateway. Never build the four pinned images for validating: every evaluation verifies them, and a
-   local rebuild gets a new identity and is refused (`VALIDATOR_ENVIRONMENT_MISMATCH`, INCOMPLETE).
-   Their Dockerfiles stay here for source audit (`make build-from-source`).
+   The 4 tool/runtime images come from Docker Hub (`logicx101/chipforge-v2-*`), pulled by the immutable digests in
+   `images.lock`; every evaluation checks each image's content against the pins in the signed evaluator zip. Never
+   build them for validating: a local rebuild is a different image and is refused (`VALIDATOR_ENVIRONMENT_MISMATCH`,
+   INCOMPLETE). Their Dockerfiles stay here for source audit (`make build-from-source`). Optional stronger check
+   against the signed zip before starting: `make images ZIP=/path/to/chipforge_npu_v2_0_evaluator.zip`.
 
 4. **Check it:**
    ```bash
@@ -71,8 +69,7 @@ images (`pull_policy: never`, step 3); their sources are `v2-evaluator/` and `v2
 5. **Validators:** point the validator's EDA server URL at `http://localhost:8080` and start it
    after this server is up.
 
-**Updating:** `git pull`, compare `.env` with `.env.example`, `make images ZIP=<new evaluator zip>` when
-the evaluator release changes, then `make start`.
+**Updating:** `git pull`, compare `.env` with `.env.example`, then `make start`.
 
 **Upgrading a server that ran npu-v1:** the same commands. This stack keeps the v1 project name on
 purpose, so it replaces v1 in place (same port 8080): `--remove-orphans` removes the old

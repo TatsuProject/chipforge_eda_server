@@ -69,3 +69,14 @@ def test_evaluator_gets_the_box_images_compose_builds():
         assert services[name]['pull_policy'] == 'never'
     for name in ('cf-compiler', 'cf-rtl', 'cf-sta'):
         assert services['v2-evaluator']['depends_on'][name] == {'condition': 'service_completed_successfully'}
+
+
+def test_images_lock_pins_every_compose_image_by_digest():
+    """`make start` pulls images.lock by immutable digest: one line per pinned compose image, digest refs only."""
+    import re
+    services = compose()['services']
+    want = {services[n]['image'] for n in ('cf-compiler', 'cf-rtl', 'cf-sta', 'v2-evaluator')}
+    rows = [line.split() for line in (REPO / 'images.lock').read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith('#')]
+    assert {r[0] for r in rows} == want and len(rows) == len(want)
+    assert all(len(r) == 2 and re.fullmatch(r'docker\.io/logicx101/chipforge-v2-[a-z]+@sha256:[0-9a-f]{64}', r[1]) for r in rows)

@@ -1,15 +1,17 @@
 .PHONY: images start build-from-source up down logs ps health test
 
-# Pull and verify the 4 published pinned images, from the SIGNED evaluator zip (check its signature
-# first: see the setup guide). Once per evaluator release:  make images ZIP=/path/to/evaluator.zip
+# Optional stronger check: pull and verify the 4 images against the SIGNED evaluator zip itself (check its
+# signature first: see the setup guide):  make images ZIP=/path/to/evaluator.zip
 images:
 	@test -n "$(ZIP)" || { echo "usage: make images ZIP=/path/to/chipforge_npu_v2_0_evaluator.zip"; exit 2; }
 	rm -rf .images-zip && mkdir .images-zip
 	unzip -q "$(ZIP)" 'v2/deploy/*' 'v2/pipeline/image_content.py' 'v2/pipeline/orchestrator/checker/validator_pins.json' -d .images-zip
 	cd .images-zip && bash v2/deploy/load_images.sh pull docker
 
-# Build the gateway (the only locally built image) and start the server. Never builds the 4 pinned images.
+# Pull the 4 pinned images by digest (images.lock), build the gateway (the only locally built image) and start
+# the server. Never builds the 4 pinned images. This is the one command validators run (after git pull).
 start:
+	./pull_images.sh
 	docker compose build eda-gateway
 	docker compose up -d --no-build --remove-orphans
 	@echo "Gateway: http://localhost:8080  (v2 routes under /v2/*)"

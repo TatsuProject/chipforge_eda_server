@@ -64,6 +64,8 @@ def test_evaluator_gets_the_box_images_compose_builds():
     assert env['CF_COMPILER_IMAGE'] == services['cf-compiler']['image']
     assert 'CF_OPENLANE_IMAGE' not in env
     assert services['cf-rtl']['build']['target'] == 'rtl' and services['cf-sta']['build']['target'] == 'sta'
+    for name in ('cf-compiler', 'cf-rtl', 'cf-sta', 'v2-evaluator'):
+        # the published pinned images, pulled + verified by `make images`; never built or pulled by compose
+        assert services[name]['pull_policy'] == 'never'
     for name in ('cf-compiler', 'cf-rtl', 'cf-sta'):
-        assert services[name]['pull_policy'] == 'build'
         assert services['v2-evaluator']['depends_on'][name] == {'condition': 'service_completed_successfully'}

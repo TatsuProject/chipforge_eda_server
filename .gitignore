@@ -221,3 +221,4 @@ trash/
 
 # Reviewed public tool pins (no credentials).
 !v2-evaluator/pins.env
+.images-zip/

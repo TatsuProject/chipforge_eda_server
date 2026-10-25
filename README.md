@@ -12,15 +12,15 @@ sky130 or OpenLane flow and no PDK download in this server.
 | compose service | image | role |
 |---|---|---|
 | `eda-gateway` | built from `gateway/` | the only published port (8080): `GET /health` and the `/v2/*` routes |
-| `v2-evaluator` | `chipforge_eda_server-v2-evaluator:2.0` | installs signed evaluators and runs evaluations (Verilator 5.038, Yosys 0.56, Nangate45, DRAMsim3) |
+| `v2-evaluator` | `chipforge_eda_server-v2-evaluator:2.0-r63` | installs signed evaluators and runs evaluations (Verilator 5.038, Yosys 0.56, Nangate45, DRAMsim3) |
 | `cf-compiler` | `cf-compiler:v2.1-public` | box image: every miner compiler is built and run in it |
 | `cf-rtl` | `cf-rtl:v2.0` | box image: RTL tool, simulator and firmware boxes (g++/make/python3, xPack RISC-V GCC 14.2.0) |
 | `cf-sta` | `cf-sta:v2.0` | box image: OpenSTA 2.4.0 for post-synthesis timing |
 
 `cf-compiler`, `cf-rtl` and `cf-sta` only build their images: each runs `true` once and shows
 `Exited (0)` in `docker compose ps -a`, by design. The evaluator starts them itself as no-network,
-read-only sibling containers, so it needs the Docker socket. Every image is built locally from
-pinned sources (`pull_policy: build`); see `v2-evaluator/README.md` and `v2-compiler/README.md`.
+read-only sibling containers, so it needs the Docker socket. These four are the published pinned
+images (`pull_policy: never`, step 3); their sources are `v2-evaluator/` and `v2-compiler/`.
 
 ```
 .
@@ -50,15 +50,17 @@ pinned sources (`pull_policy: build`); see `v2-evaluator/README.md` and `v2-comp
    In `.env` set at least `CF_V2_EVALUATOR_PUBLIC_KEY` (the publisher's `ssh-ed25519 AAAA...`
    public key line), `CF_V2_ROOT` (data root) and `CF_V2_SECRETS` (see Configuration).
 
-3. **Build and start** (one command, no profile):
+3. **Get the images and start:**
    ```bash
-   docker compose up -d --build --remove-orphans      # or: make start
+   make images ZIP=/path/to/chipforge_npu_v2_0_evaluator.zip   # once per evaluator release
+   make start
    ```
-   The first build compiles Python, Verilator, Yosys and OpenSTA from source and takes a while.
-   On a small machine build one image at a time with the legacy builder:
-   `COMPOSE_PARALLEL_LIMIT=1 DOCKER_BUILDKIT=0 docker compose up -d --build --remove-orphans`
-   (keep the same prefix on later builds so the layer cache is reused). A failed build is usually
-   a download timeout: run it again.
+   `make images` pulls the four published images (Docker Hub, `logicx101/chipforge-v2-*`) by their
+   immutable digests listed in the signed evaluator zip, checks each against the zip's pins and tags
+   the local names. Check the zip's signature first (setup guide). `make start` builds only the small
+   gateway. Never build the four pinned images for validating: every evaluation verifies them, and a
+   local rebuild gets a new identity and is refused (`VALIDATOR_ENVIRONMENT_MISMATCH`, INCOMPLETE).
+   Their Dockerfiles stay here for source audit (`make build-from-source`).
 
 4. **Check it:**
    ```bash
@@ -69,10 +71,11 @@ pinned sources (`pull_policy: build`); see `v2-evaluator/README.md` and `v2-comp
 5. **Validators:** point the validator's EDA server URL at `http://localhost:8080` and start it
    after this server is up.
 
-**Updating:** `git pull`, compare `.env` with `.env.example`, then
-`docker compose up -d --build --remove-orphans`.
+**Updating:** `git pull`, compare `.env` with `.env.example`, `make images ZIP=<new evaluator zip>` when
+the evaluator release changes, then `make start`.
 
-**Upgrading a server that ran npu-v1:** the same command. `--remove-orphans` removes the old
+**Upgrading a server that ran npu-v1:** the same commands. This stack keeps the v1 project name on
+purpose, so it replaces v1 in place (same port 8080): `--remove-orphans` removes the old
 `verilator-api` and `openlane-api` containers; their images
 (`chipforge_eda_server-verilator-api`, `chipforge_eda_server-openlane-api`, about 6.6 GB with the
 sky130 PDK) are no longer used and can be deleted with `docker rmi` when nothing else needs them.

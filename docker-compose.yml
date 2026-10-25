@@ -2,12 +2,15 @@ name: chipforge_eda_server
 
 # ChipForge EDA server, npu-v2 only (Nangate45; no sky130, no OpenLane, no PDK download).
 #
-#   docker compose up -d --build
+#   make images ZIP=<evaluator.zip>   # once per release: pull + verify the 4 pinned images
+#   make start                        # build the gateway only, start everything
 #
-# Five services. Two are long-running (eda-gateway, v2-evaluator). Three only build the images the
+# Five services. Two are long-running (eda-gateway, v2-evaluator). Three only provide the images the
 # evaluator starts as no-network sibling boxes (cf-compiler, cf-rtl, cf-sta); each runs `true`
-# once and shows "Exited (0)" in `docker compose ps -a`, by design. The evaluator starts after all
-# three have built. Every image is built locally from pinned sources (pull_policy: build).
+# once and shows "Exited (0)" in `docker compose ps -a`, by design. The four tool/runtime images are
+# the PUBLISHED pinned images (pull_policy: never): every evaluation verifies them against the pins
+# in the signed evaluator zip, and a local rebuild is refused (VALIDATOR_ENVIRONMENT_MISMATCH).
+# Their build: sections stay for source audit only (make build-from-source).
 
 services:
   eda-gateway:
@@ -25,12 +28,12 @@ services:
       - V2_SERVICE_URL=${V2_SERVICE_URL:-http://v2-evaluator:18080}
       - V2_ADMIN_TOKEN=${V2_ADMIN_TOKEN:-}
 
-  # The box every miner compiler is built and run in. Locally rebuilt and content-pinned.
+  # The box every miner compiler is built and run in. Published, pinned image.
   cf-compiler:
     platform: linux/amd64
     build: { context: ./v2-compiler }
     image: cf-compiler:v2.1-public
-    pull_policy: build
+    pull_policy: never
     entrypoint: ["true"]
     restart: "no"
 
@@ -40,7 +43,7 @@ services:
     platform: linux/amd64
     build: { context: ./v2-evaluator, target: rtl }
     image: cf-rtl:v2.0
-    pull_policy: build
+    pull_policy: never
     entrypoint: ["true"]
     restart: "no"
 
@@ -49,7 +52,7 @@ services:
     platform: linux/amd64
     build: { context: ./v2-evaluator, target: sta }
     image: cf-sta:v2.0
-    pull_policy: build
+    pull_policy: never
     entrypoint: ["true"]
     restart: "no"
 
@@ -57,8 +60,8 @@ services:
   v2-evaluator:
     platform: linux/amd64
     build: { context: ./v2-evaluator }
-    image: chipforge_eda_server-v2-evaluator:2.0
-    pull_policy: build
+    image: chipforge_eda_server-v2-evaluator:2.0-r63
+    pull_policy: never
     depends_on:
       cf-compiler: { condition: service_completed_successfully }
       cf-rtl: { condition: service_completed_successfully }

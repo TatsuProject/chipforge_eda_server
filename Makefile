@@ -1,16 +1,26 @@
-.PHONY: start build up down logs ps health test
+.PHONY: images start build-from-source up down logs ps health test
 
-# Build every image and start the server (the gateway and the v2 evaluator)
+# Pull and verify the 4 published pinned images, from the SIGNED evaluator zip (check its signature
+# first: see the setup guide). Once per evaluator release:  make images ZIP=/path/to/evaluator.zip
+images:
+	@test -n "$(ZIP)" || { echo "usage: make images ZIP=/path/to/chipforge_npu_v2_0_evaluator.zip"; exit 2; }
+	rm -rf .images-zip && mkdir .images-zip
+	unzip -q "$(ZIP)" 'v2/deploy/*' 'v2/pipeline/orchestrator/checker/validator_pins.json' -d .images-zip
+	cd .images-zip && bash v2/deploy/load_images.sh pull docker
+
+# Build the gateway (the only locally built image) and start the server. Never builds the 4 pinned images.
 start:
-	docker compose up -d --build --remove-orphans
+	docker compose build eda-gateway
+	docker compose up -d --no-build --remove-orphans
 	@echo "Gateway: http://localhost:8080  (v2 routes under /v2/*)"
 
-# Build all images. On a small machine: COMPOSE_PARALLEL_LIMIT=1 DOCKER_BUILDKIT=0 make build
-build:
+# Source audit only: rebuilds the 4 images from this repo. The evaluator REFUSES locally built images
+# (new image identity), so never use these for validating.
+build-from-source:
 	docker compose build
 
 up:
-	docker compose up -d --remove-orphans
+	docker compose up -d --no-build --remove-orphans
 
 down:
 	docker compose down

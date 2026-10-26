@@ -47,13 +47,15 @@ images (`pull_policy: never`, step 3); their sources are `v2-evaluator/` and `v2
    cd chipforge_eda_server
    cp .env.example .env
    ```
-   In `.env` set at least `CF_V2_EVALUATOR_PUBLIC_KEY` (the publisher's `ssh-ed25519 AAAA...`
-   public key line), `CF_V2_ROOT` (data root) and `CF_V2_SECRETS` (see Configuration).
+   In `.env` set `CF_V2_ROOT` (data root), `CF_V2_SECRETS` and `CF_V2_EVALUATOR_ZIP` (the evaluator zip, with its
+   `.sshsig` next to it). `CF_V2_EVALUATOR_PUBLIC_KEY` already holds ChipForge's publisher key (see Configuration).
 
-3. **Start (pulls the 4 published images by digest, builds only the small gateway):**
+3. **Start (pulls the 4 published images by digest, builds only the small gateway, installs the evaluator):**
    ```bash
    make start
    ```
+   It ends with `Evaluator ready: <sha256>` (first install: about 3 min plus a ~315 MB download; later starts
+   reuse the installed evaluator). Evaluations then send that sha256 as `evaluator_sha256`.
    The 4 tool/runtime images come from Docker Hub (`logicx101/chipforge-v2-*`), pulled by the immutable digests in
    `images.lock`; every evaluation checks each image's content against the pins in the signed evaluator zip. Never
    build them for validating: a local rebuild is a different image and is refused (`VALIDATOR_ENVIRONMENT_MISMATCH`,
@@ -156,7 +158,7 @@ Apply a change with `docker compose up -d`.
   (`<sha[:2]>/<sha>`). Both are mounted at the identical path. Nothing in them is secret.
 - **drand relays** (`CF_DRAND_RELAYS`, `CF_DRAND_TIMEOUT_S`, `CF_DRAND_DEADLINE_S`): see Network
   egress. Empty = the signed beacon policy's defaults.
-- `V2_ADMIN_TOKEN`: if set, `POST /v2/evaluator` (optional pre-warm) requires
+- `V2_ADMIN_TOKEN`: if set, `POST /v2/evaluator` (and so `make start`'s install) requires
   `Authorization: Bearer <token>`. Automatic installs verify publisher signatures regardless.
 
 The box images are passed to the evaluator by compose as `CF_COMPILER_IMAGE`, `CF_RTL_IMAGE` and

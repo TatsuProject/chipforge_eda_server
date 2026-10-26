@@ -1,4 +1,4 @@
-.PHONY: images start build-from-source up down logs ps health test
+.PHONY: images start evaluator build-from-source up down logs ps health test
 
 # Optional stronger check: pull and verify the 4 images against the SIGNED evaluator zip itself (check its
 # signature first: see the setup guide):  make images ZIP=/path/to/evaluator.zip
@@ -9,12 +9,18 @@ images:
 	cd .images-zip && bash v2/deploy/load_images.sh pull docker
 
 # Pull the 4 pinned images by digest (images.lock), build the gateway (the only locally built image) and start
-# the server. Never builds the 4 pinned images. This is the one command validators run (after git pull).
+# the server, then install the evaluator named in .env (CF_V2_EVALUATOR_ZIP) and wait until it is ready. Never
+# builds the 4 pinned images. This is the one command validators run (after git pull).
 start:
 	bash ./pull_images.sh
 	docker compose build eda-gateway
 	docker compose up -d --no-build --remove-orphans
 	@echo "Gateway: http://localhost:8080  (v2 routes under /v2/*)"
+	bash ./install_evaluator.sh
+
+# Install the evaluator named by CF_V2_EVALUATOR_ZIP in .env and wait until it is ready (also part of make start).
+evaluator:
+	bash ./install_evaluator.sh
 
 # Source audit only: rebuilds the 4 images from this repo. The evaluator REFUSES locally built images
 # (new image identity), so never use these for validating.

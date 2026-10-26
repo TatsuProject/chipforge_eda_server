@@ -1,4 +1,4 @@
-# v2 evaluator container (C1 + C2 + C6)
+# v2 evaluator container
 
 Ubuntu 24.04 LTS, Linux amd64 only. This public context contains tools, Python
 package locks and public Nangate45 collateral. The small evaluator zip carries

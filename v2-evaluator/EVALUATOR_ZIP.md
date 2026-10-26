@@ -1,6 +1,6 @@
-# Evaluator archive contract (C2 + C6 / C7 envelope)
+# Evaluator archive contract
 
-This public tools image contains the loader, never the evaluator. C7 must produce
+This public tools image contains the loader, never the evaluator. The evaluator release build produces
 an archive matching this versioned contract (`cf-evaluator-zip/1`). The tests build an entirely synthetic
 HTTP service; they do not contain evaluation logic or challenge/reference data.
 
@@ -16,7 +16,7 @@ harness/...                  # if required by that evaluator
 policy/policy.json
 ```
 
-`MANIFEST.json` uses the C7 `cf-evaluator-zip/1` envelope:
+`MANIFEST.json` uses the `cf-evaluator-zip/1` envelope:
 
 ```json
 {
@@ -71,7 +71,7 @@ sha256sum evaluator.zip
 ```
 
 Send the resulting `evaluator.zip.sig` as `evaluator_sig` (`signature` is accepted
-as an alias). For C7 releases, use its OpenSSH `.sshsig` output. Verification uses `ssh-keygen -Y verify`, signer identity
+as an alias). Releases ship an OpenSSH `.sshsig`; send that. Verification uses `ssh-keygen -Y verify`, signer identity
 `evaluator`, namespace `chipforge-evaluator`. No extra Python crypto dependency
 is needed. ZIP SHA-256 is computed while accepting the archive and checked again
 before any extraction or execution. If `evaluator_sha256` accompanies the ZIP,
@@ -283,7 +283,7 @@ The provisional `cf-evaluator/1` manifest remains supported: flat `service` and
 `post_install` steps with `argv`, `outputs` (nonempty list of `path`/`sha256`) and
 optional `timeout_s`. Its `cf-assets/1` document uses `url`, `sha256`, optional
 `size`, and `target`, always materialized as a regular file. This compatibility
-format is exercised with synthetic fixtures; C7 uses the envelope above.
+format is exercised with synthetic fixtures; releases use the envelope above.
 
 ## cfscope and tests
 
@@ -316,8 +316,8 @@ python v2-evaluator/tests/fixtures.py /tmp/fake-evaluator.zip
 ```
 
 The synthetic fixture is transport-only and cannot validate actual EDA/tool
-parity, real policy compatibility or a full T2 evaluation. C7 and fresh-install
-acceptance remain separate work.
+parity, real policy compatibility or a full T2 evaluation. Release acceptance (a full T2 on
+a fresh install) is run separately.
 
 An isolated signed container smoke uses prebuilt images, a unique compose project
 and an ephemeral loopback gateway port. It starts only the evaluator and gateway,
@@ -325,5 +325,5 @@ mounts this checkout's gateway code read-only, and removes its own containers,
 temporary signing key and data afterward:
 
 ```sh
-python v2-evaluator/tests/container_smoke.py --work /var/tmp/c6-smoke
+python v2-evaluator/tests/container_smoke.py --work /var/tmp/cf-smoke
 ```

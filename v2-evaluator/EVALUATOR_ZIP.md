@@ -180,7 +180,7 @@ preflight and service, and is recorded in health. The evaluator must implement
 that flag/recording contract. Preflight has a 300 second ceiling.
 
 The preflight also checks free space under the data root against the evaluator's own
-minimum (100 GiB for the v2.0 evaluator); a smaller disk fails the install with
+minimum (40 GiB from the v2.0.1 evaluator; 100 GiB for v2.0); a smaller disk fails the install with
 `EVALUATOR_PREFLIGHT_FAILED`. A non-empty `CF_V2_PREFLIGHT_MIN_DISK_GIB=N` appends
 `--min-disk-gib N` to preflight, is bound into the ready marker (changing it re-runs
 preflight) and is reported as `preflight_min_disk_gib` in health. Lower it only on a

@@ -31,7 +31,7 @@ Edit `.env`:
 
 | Setting | Value |
 |---|---|
-| `CF_V2_ROOT` | `/var/lib/chipforge-v2` (data directory, 100 GiB free) |
+| `CF_V2_ROOT` | `/var/lib/chipforge-v2` (data directory, 40 GiB free from v2.0.1) |
 | `CF_V2_SECRETS` | `/var/lib/chipforge-v2-secrets` |
 | `CF_V2_EVALUATOR_ZIP` | absolute path of the evaluator zip, with its `.sshsig` next to it. Optional: leave empty if your validator neuron installs the evaluator |
 

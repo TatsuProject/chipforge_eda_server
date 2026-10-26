@@ -38,7 +38,7 @@ if [ "$(phase)" = ready ]; then
   echo "Evaluator ready: $SHA"
   exit 0
 fi
-echo "Installing evaluator $SHA (first time: about 3 min plus a ~315 MB download)"
+echo "Installing evaluator $SHA (first time: a few minutes plus a ~1 GB download)"
 curl -fsS "${AUTH[@]}" -F "evaluator_zip=@$ZIP" -F "evaluator_sig=@$SIG" "$URL/v2/evaluator" >/dev/null
 
 last=""

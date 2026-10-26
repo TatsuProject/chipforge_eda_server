@@ -49,7 +49,7 @@ and, if `CF_V2_EVALUATOR_ZIP` is set, installs the evaluator and waits. It ends 
 Evaluator ready: <evaluator sha256>
 ```
 
-The first install takes about 3 minutes plus a ~315 MB download. The installed evaluator is kept and reused after
+The first install takes a few minutes plus a ~1 GB download. The installed evaluator is kept and reused after
 restarts and reboots. Check the server at any time:
 
 ```sh
@@ -144,7 +144,8 @@ Optional settings in `.env.example`: `CF_CPUS` and `CF_MEMORY` (limit a shared m
 
 Outbound HTTPS is used for: Docker Hub (images), the drand relays `api.drand.sh`, `api2.drand.sh`,
 `api3.drand.sh`, `drand.cloudflare.com` (one small request per evaluation), the Gate B image origin
-`open-images-dataset.s3.amazonaws.com`, and, once per evaluator, the evaluator's public assets (`s3.amazonaws.com`,
+`open-images-dataset.s3.amazonaws.com`, and, once per evaluator, the evaluator's files (`github.com` and
+`objects.githubusercontent.com` for the model files, `s3.amazonaws.com`,
 `hailo-model-zoo.s3.eu-west-2.amazonaws.com`, `huggingface.co`, `download.pytorch.org`, `download.openmmlab.com`,
 `codeload.github.com`).
 

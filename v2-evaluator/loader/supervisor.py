@@ -5,12 +5,33 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 
+from . import boxes
 from .install import environment, interpreter
 from .security import InstallError, atomic_json
+
+LOG_ROTATE_BYTES = 64 << 20
+
+
+def exit_text(returncode):
+    """'returncode 1' / 'signal 9 (SIGKILL)' for a finished process."""
+    if returncode is not None and returncode < 0:
+        try:
+            return f'signal {-returncode} ({signal.Signals(-returncode).name})'
+        except ValueError:
+            return f'signal {-returncode}'
+    return f'returncode {returncode}'
+
+
+def report_exit(sha, proc, log_path, when):
+    """v2.0.1: the loader's own log (docker logs) names an evaluator service that ended by itself, how it
+    ended, and where its own log and its workers' log are. Paths only, never their content."""
+    print(f'evaluator service {sha[:12]} pid {proc.pid} exited {when}: {exit_text(proc.returncode)}; '
+          f'service log {log_path}; worker log {Path(log_path).with_name("workers.log")}', file=sys.stderr, flush=True)
 
 
 class Service:
@@ -19,7 +40,7 @@ class Service:
         # None (CF_V2_CORES empty): pass no --cores, so the evaluator sizes itself (CF_CPUS / CF_MEMORY /
         # its config file, default auto). A count is the deprecated explicit alias, kept for old setups.
         self.cores = cores
-        self.sha, self.proc, self.port = None, None, None
+        self.sha, self.proc, self.port, self.log_path = None, None, None, None
         self.healthy = False
 
     def stop(self):
@@ -29,8 +50,10 @@ class Service:
                 self.proc.terminate()  # The evaluator drains its own children/checkpoints.
                 self.proc.wait()
             else:
+                report_exit(self.sha or '', self.proc, self.log_path, 'unexpectedly')
                 self.reap_orphans(self.proc.pid)
             self.proc = None
+            boxes.reap(self.installer.root, 'evaluator service stopped')
 
     @staticmethod
     def reap_orphans(group):
@@ -58,7 +81,9 @@ class Service:
         root = self.installer.root
         tree = root / 'evaluators' / sha
         manifest = ready['manifest']
-        env = environment(root, sha, self.installer.salt)
+        # Every box the service starts carries this root's label; none of ours may run before it starts.
+        env = boxes.with_label(environment(root, sha, self.installer.salt), root)
+        boxes.reap(root, 'before evaluator service start')
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             self.port = sock.getsockname()[1]
@@ -70,12 +95,22 @@ class Service:
             command += ['--cores', str(self.cores)]
         if self.installer.allow_runc:
             command.append('--allow-runc')
-        self.proc = subprocess.Popen(command, cwd=tree, env=env, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     start_new_session=True)
+        # v2.0.1: the service's own output (start-up plan, worker restarts with their exit evidence,
+        # tracebacks) goes to service.log beside workers.log in its state directory (owner-only root),
+        # not to /dev/null. One previous generation is kept.
+        self.log_path = Path(env['CF_ORCH_SSD']) / 'service.log'
+        try:
+            if self.log_path.stat().st_size > LOG_ROTATE_BYTES:
+                os.replace(self.log_path, self.log_path.with_name('service.log.1'))
+        except FileNotFoundError:
+            pass
+        with open(self.log_path, 'ab') as log:
+            self.proc = subprocess.Popen(command, cwd=tree, env=env, stdin=subprocess.DEVNULL,
+                                         stdout=log, stderr=log, start_new_session=True)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
+                report_exit(sha, self.proc, self.log_path, 'during start-up')
                 # Signal only this service's process group, never another evaluator/host job.
                 self.reap_orphans(self.proc.pid)
                 raise InstallError('EVALUATOR_SERVICE_EXITED')

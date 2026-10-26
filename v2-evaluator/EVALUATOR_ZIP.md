@@ -208,6 +208,15 @@ abrupt service-parent death, orphan broker/worker processes in its own process
 group receive SIGTERM, then SIGKILL after five seconds; the service's durable
 leases/checkpoints govern recovery. Queued loader jobs persist across restart.
 
+Logs and leftover boxes (v2.0.1). The service's own stdout/stderr go to
+`state/<sha>/service.log` beside the evaluator's `workers.log` (one older generation,
+`service.log.1`, is kept past 64 MiB). When a service ends by itself, the loader's log
+(`docker logs`) names the evaluator, its exit status or signal, and these two paths (never
+their content). The loader adds `cf.v2.loader=<root id>` to `CF_DOCKER_LABELS`; evaluators
+from v2.0.1 keep every inherited label on every box they start. Before starting a service and
+after one stops, the loader force-removes the containers carrying this root's label (found by
+that label only, never by name) and logs how many it found.
+
 `CF_V2_ROOT` must be an absolute same-path host/container bind. The loader copies
 bind-mounted image collateral (Verilator/Yosys share, native Verilator runtime
 and libraries, Nangate45, and the DRAMsim3 platform tree that simulators built in RTL

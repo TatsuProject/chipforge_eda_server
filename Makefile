@@ -1,4 +1,4 @@
-.PHONY: images start evaluator build-from-source up down logs ps health test
+.PHONY: images start evaluator build-from-source up down logs ps health test mock-start mock-stop mock-logs
 
 # Optional stronger check: pull and verify the 4 images against the SIGNED evaluator zip itself (check its
 # signature first: see the setup guide):  make images ZIP=/path/to/evaluator.zip
@@ -46,3 +46,16 @@ health:
 # Unit tests (no Docker needed): pip install fastapi==0.104.1 aiohttp==3.14.5 httpx pytest pyyaml
 test:
 	python3 -m pytest -q gateway/tests v2-evaluator/tests
+
+# TESTING ONLY: v2 mock mode, the gateway alone answering /v2/* from shared/eda_mock.json (no evaluator, no
+# tool images, results in seconds). Stop the real server first (make down); never use this to validate.
+mock-start:
+	@test -f shared/eda_mock.json || { mkdir -p shared && cp gateway/mock_result.example.json shared/eda_mock.json && echo "created shared/eda_mock.json from the example"; }
+	docker compose -f docker-compose.mock.yml up -d --build
+	@echo "Mock EDA server: http://localhost:8080 (edit shared/eda_mock.json any time; it is re-read per evaluation)"
+
+mock-stop:
+	docker compose -f docker-compose.mock.yml down
+
+mock-logs:
+	docker compose -f docker-compose.mock.yml logs -f

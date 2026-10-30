@@ -1,0 +1,8 @@
+{
+  "delay_seconds": 60,
+  "status": "PASSED",
+  "S": [1.0, 6.0],
+  "S_offset": 0,
+  "failure_code": "NPU_PORT_MISMATCH",
+  "projection": "deterministic"
+}

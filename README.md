@@ -163,6 +163,36 @@ Outbound HTTPS is used for: Docker Hub (images), the drand relays `api.drand.sh`
 Technical details of the evaluator format: [`v2-evaluator/EVALUATOR_ZIP.md`](v2-evaluator/EVALUATOR_ZIP.md).
 Unit tests: `make test` (no Docker needed).
 
+## Mock mode (testing only)
+
+To test validators, the challenge server and the website end to end without waiting hours per design, the
+gateway can answer `/v2/health`, `/v2/evaluate` and `/v2/status` itself, in the real v2 formats, without the
+evaluator or any tool image. **Never use it on a validator that evaluates real submissions.**
+
+```sh
+make down                      # stop the real server if it runs (same port 8080)
+make mock-start                # creates shared/eda_mock.json from gateway/mock_result.example.json
+make mock-logs                 # [MOCK] lines for every evaluation
+make mock-stop
+```
+
+`shared/eda_mock.json` is re-read for every evaluation (no restart):
+
+| field | effect |
+|---|---|
+| `delay_seconds` | how long until the result is ready (`/v2/status` answers 202 until then) |
+| `status` | `PASSED`, `REJECTED` (fault `miner`), `INCOMPLETE` or `ERROR` (fault `system`) |
+| `S` | the score: a number, or `[low, high]` for a value derived from the design's sha256 (every validator gets the same S for the same design) |
+| `S_offset` | added to S on this server only: simulates a dishonest or misconfigured validator (its projection hash differs too) |
+| `failure_code` | for `REJECTED` |
+| `projection` | `deterministic` (default: from the design, its chain_commit and the result) or `random` |
+
+A design zip may carry `MOCK.json` at its top level with the same fields; they win for that design (one
+miner's design rejected, another slow, another with a fixed S). The mock checks what the real evaluator
+checks: T1/T2 need a `chain_commit` whose `package_sha256` is the zip's sha256, the evaluator sha256 must be
+`/v2/health`'s `active_evaluator`, and a reused request ID must name the same bytes. Results carry
+`"mock": true`, `projection_sha256` and a `public_report` built from a sample report with the mocked S.
+
 ## License and support
 
 MIT License; see `LICENSE`. Support: [Discord](https://discord.com/channels/799672011265015819/1408463235082092564),

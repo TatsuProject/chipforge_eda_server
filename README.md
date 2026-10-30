@@ -186,12 +186,35 @@ make mock-stop
 | `S_offset` | added to S on this server only: simulates a dishonest or misconfigured validator (its projection hash differs too) |
 | `failure_code` | for `REJECTED` |
 | `projection` | `deterministic` (default: from the design, its chain_commit and the result) or `random` |
+| `install_seconds` | how long a simulated evaluator install takes (default 20) |
+| `install_fail` | e.g. `"EVALUATOR_PREFLIGHT_FAILED"`: simulated installs fail at preflight with this code |
 
 A design zip may carry `MOCK.json` at its top level with the same fields; they win for that design (one
 miner's design rejected, another slow, another with a fixed S). The mock checks what the real evaluator
-checks: T1/T2 need a `chain_commit` whose `package_sha256` is the zip's sha256, the evaluator sha256 must be
-`/v2/health`'s `active_evaluator`, and a reused request ID must name the same bytes. Results carry
-`"mock": true`, `projection_sha256` and a `public_report` built from a sample report with the mocked S.
+checks: T1/T2 need a `chain_commit` whose `package_sha256` is the zip's sha256, the evaluator named by
+`evaluator_sha256` must be installed and ready here, and a reused request ID must name the same bytes. Results
+carry `"mock": true`, `projection_sha256` and a `public_report` built from a sample report with the mocked S.
+
+Validator neurons install the evaluator the challenge server names by themselves (`POST /v2/evaluator`). In
+mock mode that install is **simulated**: the zip needs a `MANIFEST.json` and the signature must look like an
+OpenSSH signature, then `GET /v2/evaluator/<sha>` goes through `verify`, `extract`, `fetch_assets`,
+`post_install`, `preflight` and `ready` over `install_seconds`.
+
+### Hybrid mode: real installs, simulated evaluations
+
+To test evaluator updates for real (signature check against `CF_V2_EVALUATOR_PUBLIC_KEY`, ~1 GB of assets,
+post-install, preflight) while evaluations still take minutes:
+
+```sh
+make mock-stop                 # if the mock runs (same port 8080)
+make hybrid-start              # the real server (pinned images, .env as for make start) + the mock for evaluations
+make hybrid-logs
+make hybrid-stop
+```
+
+No evaluator is installed until a validator sends one; leave `CF_V2_EVALUATOR_ZIP` empty. On a laptop set
+`CF_V2_PREFLIGHT_MIN_DISK_GIB=20` in `.env` (the preflight wants 100 GiB free otherwise). `/v2/health` is the
+real one (plus `"mock": true`); `/v2/evaluate` is refused until the requested evaluator is really installed.
 
 ## License and support
 

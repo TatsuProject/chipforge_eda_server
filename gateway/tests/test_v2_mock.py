@@ -122,3 +122,61 @@ def test_design_mock_json_overrides(client):
 
 def test_unknown_status_404(client):
     assert client.get("/v2/status/nope").status_code == 404
+
+
+# --- evaluator installs (simulated) ---------------------------------------------------------------
+
+def _evaluator(tag="v2"):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("MANIFEST.json", json.dumps({"schema": "cf-evaluator-zip/1", "version": tag}))
+    return buf.getvalue()
+
+
+SIG = b"-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----\n"
+
+
+def install(c, data, sig=SIG):
+    return c.post("/v2/evaluator", files={"evaluator_zip": ("e.zip", data, "application/zip"),
+                                          "evaluator_sig": ("e.zip.sshsig", sig, "text/plain")})
+
+
+def test_install_goes_through_the_phases_then_evaluations_use_it(client):
+    client.cfg.write_text(json.dumps({"delay_seconds": 0, "install_seconds": 0.5}))
+    data = _evaluator()
+    sha = hashlib.sha256(data).hexdigest()
+    r = install(client, data)
+    assert r.status_code == 202 and r.json()["phase"] == "verify"
+    design = _zip(tag="x")
+    assert evaluate(client, design, rid="early", evaluator_sha256=sha).json()["error"]["code"] == "EVALUATOR_NOT_READY"
+    time.sleep(0.6)
+    assert client.get(f"/v2/evaluator/{sha}").json()["phase"] == "ready"
+    assert client.get("/v2/health").json()["active_evaluator"] == sha
+    r = evaluate(client, design, rid="after", evaluator_sha256=sha)
+    assert r.status_code == 202 and r.json()["evaluator_sha256"] == sha
+    assert client.get("/v2/status/after").json()["evaluator_sha256"] == sha
+
+
+def test_unknown_evaluator_is_refused_like_the_real_server(client):
+    r = evaluate(client, _zip(), evaluator_sha256="ab" * 32)
+    assert r.status_code == 404 and r.json()["error"]["code"] == "EVALUATOR_NOT_CACHED"
+
+
+def test_install_checks_shape_and_can_be_made_to_fail(client):
+    assert install(client, _evaluator(), sig=b"not a signature").json()["error"]["code"] == "EVALUATOR_SIGNATURE_INVALID"
+    assert install(client, _zip()).json()["error"]["code"] == "EVALUATOR_MANIFEST_INVALID"
+    client.cfg.write_text(json.dumps({"install_seconds": 0, "install_fail": "EVALUATOR_PREFLIGHT_FAILED"}))
+    data = _evaluator("bad")
+    install(client, data)
+    state = client.get(f"/v2/evaluator/{hashlib.sha256(data).hexdigest()}").json()
+    assert state["phase"] == "failed" and state["error"] == "EVALUATOR_PREFLIGHT_FAILED"
+    assert any(f["error"] == "EVALUATOR_PREFLIGHT_FAILED" for f in client.get("/v2/health").json()["install_failures"])
+
+
+def test_install_requires_the_admin_token_when_set(client, monkeypatch):
+    monkeypatch.setenv("V2_ADMIN_TOKEN", "t0k")
+    assert install(client, _evaluator()).status_code == 401
+    r = client.post("/v2/evaluator", headers={"Authorization": "Bearer t0k"},
+                    files={"evaluator_zip": ("e.zip", _evaluator(), "application/zip"),
+                           "evaluator_sig": ("s", SIG, "text/plain")})
+    assert r.status_code == 202

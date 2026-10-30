@@ -1,4 +1,5 @@
-.PHONY: images start evaluator build-from-source up down logs ps health test mock-start mock-stop mock-logs
+.PHONY: images start evaluator build-from-source up down logs ps health test mock-start mock-stop mock-logs \
+	hybrid-start hybrid-stop hybrid-logs
 
 # Optional stronger check: pull and verify the 4 images against the SIGNED evaluator zip itself (check its
 # signature first: see the setup guide):  make images ZIP=/path/to/evaluator.zip
@@ -59,3 +60,20 @@ mock-stop:
 
 mock-logs:
 	docker compose -f docker-compose.mock.yml logs -f
+
+# TESTING ONLY: hybrid mode, the real server with simulated evaluations. Evaluator installs are real (the
+# validator installs the evaluator from the challenge server by itself); only /v2/evaluate is simulated.
+HYBRID = docker compose -f docker-compose.yml -f docker-compose.hybrid.yml
+
+hybrid-start:
+	@test -f shared/eda_mock.json || { mkdir -p shared && cp gateway/mock_result.example.json shared/eda_mock.json && echo "created shared/eda_mock.json from the example"; }
+	bash ./pull_images.sh
+	$(HYBRID) build eda-gateway
+	$(HYBRID) up -d --no-build --remove-orphans
+	@echo "Hybrid EDA server: http://localhost:8080 (real installs, simulated evaluations; no evaluator installed until a validator sends one)"
+
+hybrid-stop:
+	$(HYBRID) down
+
+hybrid-logs:
+	$(HYBRID) logs -f eda-gateway v2-evaluator

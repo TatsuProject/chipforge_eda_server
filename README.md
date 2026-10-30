@@ -15,6 +15,8 @@ reuses it until a new one is released.
 - Miners: the same for a full evaluation; a smaller machine runs the quick checks.
 - Data directories on a local ext4 or xfs filesystem (NTFS, FUSE, SMB and NFS are refused).
 - Outbound HTTPS. No inbound access is needed.
+- The evaluator refuses to install with less than about 22 GiB of RAM available. For testing on a smaller
+  machine (a laptop), use [mock mode](#mock-mode-testing-only).
 
 ## Set up
 
@@ -165,56 +167,189 @@ Unit tests: `make test` (no Docker needed).
 
 ## Mock mode (testing only)
 
-To test validators, the challenge server and the website end to end without waiting hours per design, the
-gateway can answer `/v2/health`, `/v2/evaluate` and `/v2/status` itself, in the real v2 formats, without the
-evaluator or any tool image. **Never use it on a validator that evaluates real submissions.**
+Mock mode lets validators, the challenge server and the website be tested end to end in minutes instead of
+hours per design, on any machine. The gateway answers the v2 API itself, in the real formats, without the
+evaluator service or any tool image. **Never use it on a validator that evaluates real submissions.**
+
+### Which mode
+
+| mode | command | evaluations | evaluator installs | machine |
+|---|---|---|---|---|
+| real | `make start` | real (1.5-2 h per design) | real | 16 cores, 32 GiB RAM, 300 GiB disk |
+| **mock** | `make mock-start` | simulated (`delay_seconds`) | simulated (`install_seconds`) | anything (one small container) |
+| hybrid | `make hybrid-start` | simulated | real (signature, ~1 GB assets, post-install, preflight) | **at least ~22 GiB free RAM** |
+
+The real evaluator's preflight refuses to install when less than about 22 GiB of RAM is *available* ("RAM
+minimum" in the install log, `EVALUATOR_PREFLIGHT_FAILED`): a 16 GB laptop, or a 32 GB laptop with a browser
+and an IDE open, cannot run `make start` or hybrid mode. Use mock mode there.
+
+### Quick start (mock)
 
 ```sh
-make down                      # stop the real server if it runs (same port 8080)
-make mock-start                # creates shared/eda_mock.json from gateway/mock_result.example.json
-make mock-logs                 # [MOCK] lines for every evaluation
+cd chipforge_eda_server        # branch launch-v2-eda
+make down                      # stop the real server if it runs (same port 8080); never needed otherwise
+make mock-start                # builds the gateway, creates shared/eda_mock.json from gateway/mock_result.example.json
+curl -s localhost:8080/v2/health      # {"ready": true, ..., "mock": true}
+make mock-logs                 # one [MOCK] line per install and per evaluation
 make mock-stop
 ```
 
-`shared/eda_mock.json` is re-read for every evaluation (no restart):
+Nothing else is needed: no `.env` settings, no `CF_V2_EVALUATOR_ZIP`, no images, no data root.
+
+### The validator next to it
+
+In the SN108 validator's `.env` (only these matter for mock testing):
+
+```sh
+EDA_SERVER_URL=http://localhost:8080
+EDA_API=v2
+EDA_MODE=T2
+EDA_POLL_SECONDS=10             # results are ready in seconds, poll often
+EVALUATOR_RETRY_MINUTES=1       # retry a failed (simulated) install quickly
+STATUS_REPORT_SECONDS=30
+```
+
+The validator installs the evaluator the challenge server names by itself: it downloads the bundle's
+evaluator zip and `.sshsig`, sends them to `POST /v2/evaluator`, follows the phases and reports *Downloading
+evaluator*, *Installing evaluator*, then *Idle* with the version ready (logs: `Status: ...`; website:
+Validators tab). The website marks a validator whose EDA server is a mock with a MOCK badge.
+
+### The challenge server side
+
+The quest's test-cases file is an evaluator bundle (see EVALUATOR_UPDATES.md in chipforge_challenge_server):
+the evaluator zip, its `.sshsig` and an optional `VERSION.txt`. The challenge server checks the signature
+for real, so use either:
+
+- the **released bundle** (signed by the subnet owner): nothing to configure; or
+- **test-signed bundles**, to test updates (v1 -> v2 -> v3) with the real evaluator but without asking the
+  publisher for new builds:
+  ```sh
+  cd chipforge_challenge_server
+  python3 scripts/dev/make_test_evaluator.py <path>/chipforge_npu_v2_0_evaluator.zip --versions 3 --out dev/challenges
+  # prints the test public key: put it in dev/env.lan as EVALUATOR_PUBLIC_KEY=ssh-ed25519 ..., then make lan
+  make lan-seed ID=<id> ZIP=dev/challenges/<id>.zip TESTCASES=dev/challenges/quest2_testcases_v1.zip
+  make lan-testcases FILE=dev/challenges/quest2_testcases_v2.zip     # an update mid-quest
+  ```
+  v1 is the release's bytes; vN only changes MANIFEST.json, so it gets a new sha256. The mock does not
+  check signatures, so no key is needed on the EDA side.
+
+### shared/eda_mock.json
+
+Re-read for every evaluation and every install (no restart). Defaults in brackets.
+
+```json
+{
+  "delay_seconds": 60,
+  "status": "PASSED",
+  "S": [1.0, 6.0],
+  "S_offset": 0,
+  "failure_code": "NPU_PORT_MISMATCH",
+  "projection": "deterministic",
+  "install_seconds": 20,
+  "install_fail": null
+}
+```
 
 | field | effect |
 |---|---|
-| `delay_seconds` | how long until the result is ready (`/v2/status` answers 202 until then) |
-| `status` | `PASSED`, `REJECTED` (fault `miner`), `INCOMPLETE` or `ERROR` (fault `system`) |
-| `S` | the score: a number, or `[low, high]` for a value derived from the design's sha256 (every validator gets the same S for the same design) |
-| `S_offset` | added to S on this server only: simulates a dishonest or misconfigured validator (its projection hash differs too) |
-| `failure_code` | for `REJECTED` |
-| `projection` | `deterministic` (default: from the design, its chain_commit and the result) or `random` |
-| `install_seconds` | how long a simulated evaluator install takes (default 20) |
-| `install_fail` | e.g. `"EVALUATOR_PREFLIGHT_FAILED"`: simulated installs fail at preflight with this code |
+| `delay_seconds` | seconds until an evaluation's result is ready; `/v2/status` answers 202 until then [10] |
+| `status` | `PASSED`; `REJECTED` (the miner's fault, score 0); `INCOMPLETE` or `ERROR` (system fault: the challenge server hands the design to another validator) [PASSED] |
+| `S` | the score: a number, or `[low, high]` for a value derived from the design's sha256, so every validator gets the same S for the same design [[1.0, 6.0]] |
+| `S_offset` | added to S on this server only: a dishonest or misconfigured validator (its projection hash differs too) [0] |
+| `failure_code` | the code of a `REJECTED` result [NPU_PORT_MISMATCH] |
+| `projection` | `deterministic` (from the design, its chain_commit and the result: equal on honest servers) or `random` (a non-deterministic evaluator) [deterministic] |
+| `install_seconds` | how long a simulated evaluator install takes, spread over its phases [20] |
+| `install_fail` | a code, e.g. `"EVALUATOR_PREFLIGHT_FAILED"`: installs fail at preflight with it, as on a machine with too little RAM. Back to `null` and the validator's next retry succeeds [null] |
 
-A design zip may carry `MOCK.json` at its top level with the same fields; they win for that design (one
-miner's design rejected, another slow, another with a fixed S). The mock checks what the real evaluator
-checks: T1/T2 need a `chain_commit` whose `package_sha256` is the zip's sha256, the evaluator named by
-`evaluator_sha256` must be installed and ready here, and a reused request ID must name the same bytes. Results
-carry `"mock": true`, `projection_sha256` and a `public_report` built from a sample report with the mocked S.
+Environment of the mock container (docker-compose.mock.yml): `EDA_MOCK_FILE` (the file above, enables mock
+mode), `EDA_MOCK_INSTALL` (`simulated`, or `real` for hybrid), `EDA_MOCK_EVALUATOR_SHA256` (the evaluator
+that counts as installed from the start, default `000...0001`), `V2_ADMIN_TOKEN` (if set, installs need
+`Authorization: Bearer <token>`; the validator sends `EDA_ADMIN_TOKEN`).
 
-Validator neurons install the evaluator the challenge server names by themselves (`POST /v2/evaluator`). In
-mock mode that install is **simulated**: the zip needs a `MANIFEST.json` and the signature must look like an
-OpenSSH signature, then `GET /v2/evaluator/<sha>` goes through `verify`, `extract`, `fetch_assets`,
-`post_install`, `preflight` and `ready` over `install_seconds`.
+### Per design: MOCK.json
+
+A design zip may hold `MOCK.json` at its top level with the same result fields; they win for that design.
+Useful designs for a test round:
+
+| design | MOCK.json | expected |
+|---|---|---|
+| good | `{"S": 6.0}` | a record at 6.0 (two validators agree) |
+| better | `{"S": 7.5}` | a record at 7.5 |
+| low | `{"S": 3.0}` | evaluated, not a record |
+| rejected | `{"status": "REJECTED", "failure_code": "NPU_PORT_MISMATCH"}` | not a record, reason shown |
+| broken | `{"status": "INCOMPLETE"}` | system fault on every validator, then *Not scored* |
+| slow | `{"delay_seconds": 2400}` | runs past the evaluation window: timeout |
+| plain | none | S from the range, the same on every validator |
+
+### What the mock checks (like the real server)
+
+- `POST /v2/evaluate`: multipart `design_zip`, `mode`, `request_id`; T1/T2 need a `chain_commit`
+  (`cf-chain-commit/1`, 8 fields) whose `package_sha256` is the zip's sha256; the evaluator named by
+  `evaluator_sha256` must be installed and ready here (`EVALUATOR_NOT_CACHED` / `EVALUATOR_NOT_READY`
+  otherwise); a reused request ID must name the same bytes, chain_commit and evaluator (409).
+- `POST /v2/evaluator`: `evaluator_zip` + `evaluator_sig`; the zip must hold a readable `MANIFEST.json`, the
+  signature must be an OpenSSH signature (its key is not checked), `evaluator_sha256` if sent must match.
+  `GET /v2/evaluator/<sha>` then reports `verify`, `extract`, `fetch_assets`, `post_install`, `preflight`,
+  `ready` (or `failed` with `error`), and `/v2/health` names the newest ready evaluator.
+- Results are cf-response/1 with `"mock": true`, `evaluator_sha256`, `projection_sha256` and a
+  `public_report` built from a sample report with the mocked S.
+
+### Checking it by hand
+
+```sh
+curl -s localhost:8080/v2/health | jq                 # ready, active_evaluator, install_failures, mock
+curl -s localhost:8080/v2/evaluator | jq              # every evaluator and its phase
+curl -s localhost:8080/v2/evaluator/<sha256> | jq     # one install's phase / error
+make mock-logs                                        # [MOCK] installing evaluator ... / accepted ... / PASSED S=...
+```
+
+Recipes:
+
+- **A failed install**: set `"install_fail": "EVALUATOR_PREFLIGHT_FAILED"`, upload a new evaluator version
+  (`make lan-testcases ...`): the validator shows *Install failed · EVALUATOR_PREFLIGHT_FAILED* and gets no
+  work; set it back to `null`: it retries after `EVALUATOR_RETRY_MINUTES` and recovers.
+- **A cheating validator**: `"S_offset": 2.5` on one laptop only: its results are outvoted.
+- **An update while a design is in flight**: give a design `{"delay_seconds": 600}`, upload a new version
+  while it evaluates: it finishes on the old version, newer designs wait (*Waiting for evaluator update*).
+- **Restart**: `make mock-stop && make mock-start` forgets the simulated installs: the validator installs the
+  current evaluator again by itself (a good test of recovery).
 
 ### Hybrid mode: real installs, simulated evaluations
 
-To test evaluator updates for real (signature check against `CF_V2_EVALUATOR_PUBLIC_KEY`, ~1 GB of assets,
-post-install, preflight) while evaluations still take minutes:
+Only on a machine with at least ~22 GiB of RAM free. To test the real install (signature against
+`CF_V2_EVALUATOR_PUBLIC_KEY`, ~1 GB of assets, post-install, preflight) while evaluations take seconds:
 
 ```sh
-make mock-stop                 # if the mock runs (same port 8080)
-make hybrid-start              # the real server (pinned images, .env as for make start) + the mock for evaluations
+make mock-stop                 # same port 8080
+make hybrid-start              # pinned images + the real server (.env as for make start) + the mock for evaluations
 make hybrid-logs
 make hybrid-stop
 ```
 
-No evaluator is installed until a validator sends one; leave `CF_V2_EVALUATOR_ZIP` empty. On a laptop set
-`CF_V2_PREFLIGHT_MIN_DISK_GIB=20` in `.env` (the preflight wants 100 GiB free otherwise). `/v2/health` is the
-real one (plus `"mock": true`); `/v2/evaluate` is refused until the requested evaluator is really installed.
+- Leave `CF_V2_EVALUATOR_ZIP` empty: nothing is installed until a validator sends an evaluator.
+- `CF_V2_PREFLIGHT_MIN_DISK_GIB=20` in `.env` on a laptop (the preflight wants 100 GiB free otherwise).
+- With test-signed bundles, `CF_V2_EVALUATOR_PUBLIC_KEY` must be the test key. To keep a real setup untouched,
+  give the test its own data root on the command line (overrides `.env`):
+  ```sh
+  CF_V2_ROOT=/var/lib/chipforge-v2-test CF_V2_SECRETS=/var/lib/chipforge-v2-test-secrets \
+  CF_V2_EVALUATOR_PUBLIC_KEY="ssh-ed25519 AAAA... chipforge-evaluator-TEST" CF_V2_PREFLIGHT_MIN_DISK_GIB=20 \
+  make hybrid-start
+  # afterwards: make hybrid-stop; sudo rm -rf /var/lib/chipforge-v2-test /var/lib/chipforge-v2-test-secrets
+  ```
+- `/v2/health` is the real one (plus `"mock": true`); `/v2/evaluate` is refused until the requested evaluator
+  is really installed. A failed preflight is explained in `$CF_V2_ROOT/logs/install/<sha>.preflight-T2.log`
+  (root only: `sudo cat`).
+
+### Troubleshooting (mock)
+
+| symptom | cause / fix |
+|---|---|
+| `make mock-start`: port 8080 already allocated | the real server or hybrid runs: `make down` / `make hybrid-stop` |
+| validator: *EDA server offline* | `curl localhost:8080/v2/health`; `EDA_SERVER_URL` in the validator's `.env` |
+| validator stays *Waiting for evaluator* | the challenge server has no valid bundle (website: *Last upload refused: ...*) or the validator cannot download it (its log) |
+| `EVALUATOR_NOT_CACHED` in a result | the validator asked for an evaluator this mock never installed (e.g. the mock restarted mid-evaluation): it re-installs on its next cycle |
+| results never arrive | `delay_seconds` too large for the batch window, or the design's `MOCK.json` sets a long delay |
+| scores differ between laptops | `S_offset` set on one of them, or a number vs a range in `S` |
 
 ## License and support
 

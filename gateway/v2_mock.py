@@ -58,6 +58,27 @@ EDA_MOCK_FILE = os.environ.get("EDA_MOCK_FILE", "").strip()
 MOCK_EVALUATOR_SHA = os.environ.get("EDA_MOCK_EVALUATOR_SHA256", "").strip() or ("0" * 63 + "1")
 INSTALL_MODE = os.environ.get("EDA_MOCK_INSTALL", "simulated").strip().lower()       # simulated | real
 PHASES = ("verify", "extract", "fetch_assets", "post_install", "preflight")
+MAX_UPLOAD_BYTES = int(float(os.environ.get("EDA_MOCK_MAX_UPLOAD_MB", "300")) * 1024 * 1024)
+MAX_JOBS, MAX_INSTALLS = 5000, 20      # remembered jobs / simulated installs (oldest forgotten first)
+
+
+def _too_large(request: Request):
+    """Uploads are read into memory: refuse a body above EDA_MOCK_MAX_UPLOAD_MB before reading it."""
+    try:
+        size = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        size = 0
+    if size > MAX_UPLOAD_BYTES:
+        return _err(413, "TOO_LARGE", f"Upload larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+    if not request.headers.get("content-length"):
+        return _err(411, "CONTENT_LENGTH_REQUIRED", "Provide one Content-Length (no chunked upload).")
+    return None
+
+
+def _forget_oldest(store: dict, keep: int, protect=()) -> None:
+    for key in list(store)[:max(0, len(store) - keep)]:
+        if key not in protect:
+            store.pop(key, None)
 REPORTS = Path(__file__).resolve().parent / "mock_reports"
 ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -257,6 +278,9 @@ async def install(request: Request):
         return refused
     if INSTALL_MODE == "real":
         return await _forward(request, "POST", "/evaluator", upload=True)
+    too_large = _too_large(request)
+    if too_large is not None:
+        return too_large
     try:
         form = await request.form()
     except Exception:
@@ -280,7 +304,9 @@ async def install(request: Request):
     cfg = _config()
     if sha not in _installs or _install_phase(sha)["phase"] == "failed":
         _installs[sha] = {"started": time.monotonic(), "seconds": max(0.0, float(cfg.get("install_seconds", 20))),
-                          "fail": cfg.get("install_fail") or None, "order": len(_installs)}
+                          "fail": cfg.get("install_fail") or None,
+                          "order": max((r["order"] for r in _installs.values()), default=0) + 1}
+        _forget_oldest(_installs, MAX_INSTALLS, protect=(MOCK_EVALUATOR_SHA, sha))
         print(f"[MOCK] installing evaluator {sha[:16]} ({len(data)} bytes, simulated "
               f"{_installs[sha]['seconds']:.0f}s{', will fail: ' + _installs[sha]['fail'] if _installs[sha]['fail'] else ''})",
               flush=True)
@@ -301,6 +327,9 @@ async def install_state(sha: str, request: Request):
 
 @router.post("/evaluate")
 async def evaluate(request: Request):
+    too_large = _too_large(request)
+    if too_large is not None:
+        return too_large
     try:
         form = await request.form()
     except Exception:
@@ -355,6 +384,7 @@ async def evaluate(request: Request):
            "received_utc": datetime.now(timezone.utc).isoformat(), "ready_at": time.monotonic() + delay,
            "result": None}
     _jobs[rid] = job
+    _forget_oldest(_jobs, MAX_JOBS)
     print(f"[MOCK] accepted {rid} ({len(data)} bytes, {mode}, chain_commit {'yes' if chain else 'no'}, "
           f"evaluator {sha[:12]}): {status} in {delay:.0f}s", flush=True)
     return _job_response(job, accepted=True)

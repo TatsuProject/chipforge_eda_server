@@ -233,6 +233,10 @@ for real, so use either:
   v1 is the release's bytes; vN only changes MANIFEST.json, so it gets a new sha256. The mock does not
   check signatures, so no key is needed on the EDA side.
 
+The challenge server refuses results from a mock EDA server unless `ALLOW_MOCK_RESULTS=true` (set in its
+`dev/env.lan` and `dev/env.dev`; never in production, where a validator misconfigured with a mock must not
+count). Without it, every mock result is answered 409 "produced by a mock EDA server".
+
 ### shared/eda_mock.json
 
 Re-read for every evaluation and every install (no restart). Defaults in brackets.
@@ -264,7 +268,9 @@ Re-read for every evaluation and every install (no restart). Defaults in bracket
 Environment of the mock container (docker-compose.mock.yml): `EDA_MOCK_FILE` (the file above, enables mock
 mode), `EDA_MOCK_INSTALL` (`simulated`, or `real` for hybrid), `EDA_MOCK_EVALUATOR_SHA256` (the evaluator
 that counts as installed from the start, default `000...0001`), `V2_ADMIN_TOKEN` (if set, installs need
-`Authorization: Bearer <token>`; the validator sends `EDA_ADMIN_TOKEN`).
+`Authorization: Bearer <token>`; the validator sends `EDA_ADMIN_TOKEN`), `EDA_MOCK_MAX_UPLOAD_MB` (largest
+design or evaluator upload, default 300; uploads need a Content-Length). The mock remembers the last 20
+simulated installs and 5000 jobs.
 
 ### Per design: MOCK.json
 
@@ -349,6 +355,8 @@ make hybrid-stop
 | validator stays *Waiting for evaluator* | the challenge server has no valid bundle (website: *Last upload refused: ...*) or the validator cannot download it (its log) |
 | `EVALUATOR_NOT_CACHED` in a result | the validator asked for an evaluator this mock never installed (e.g. the mock restarted mid-evaluation): it re-installs on its next cycle |
 | results never arrive | `delay_seconds` too large for the batch window, or the design's `MOCK.json` sets a long delay |
+| results refused: "produced by a mock EDA server" | the challenge server needs `ALLOW_MOCK_RESULTS=true` (LAN / dev stacks only) |
+| `413` on an upload | larger than `EDA_MOCK_MAX_UPLOAD_MB` (300) |
 | scores differ between laptops | `S_offset` set on one of them, or a number vs a range in `S` |
 
 ## License and support

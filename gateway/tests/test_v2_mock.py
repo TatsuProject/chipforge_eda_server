@@ -180,3 +180,24 @@ def test_install_requires_the_admin_token_when_set(client, monkeypatch):
                     files={"evaluator_zip": ("e.zip", _evaluator(), "application/zip"),
                            "evaluator_sig": ("s", SIG, "text/plain")})
     assert r.status_code == 202
+
+
+def test_uploads_above_the_cap_are_refused_before_reading(client, monkeypatch):
+    import v2_mock
+    monkeypatch.setattr(v2_mock, "MAX_UPLOAD_BYTES", 1000)
+    r = client.post("/v2/evaluator", files={"evaluator_zip": ("e.zip", b"x" * 5000, "application/zip"),
+                                            "evaluator_sig": ("s", SIG, "text/plain")})
+    assert r.status_code == 413
+    assert evaluate(client, b"y" * 5000).status_code == 413
+
+
+def test_simulated_installs_are_bounded(client):
+    import v2_mock
+    client.cfg.write_text(json.dumps({"install_seconds": 0}))
+    shas = []
+    for i in range(v2_mock.MAX_INSTALLS + 5):
+        data = _evaluator(f"t{i}")
+        install(client, data)
+        shas.append(hashlib.sha256(data).hexdigest())
+    assert len(v2_mock._installs) <= v2_mock.MAX_INSTALLS + 1
+    assert v2_mock.MOCK_EVALUATOR_SHA in v2_mock._installs and shas[-1] in v2_mock._installs

@@ -1,0 +1,13 @@
+# TESTING ONLY: the gateway alone in v2 mock mode (no evaluator, no tool images). See README "Mock mode".
+#   make mock-start   /   make mock-stop
+services:
+  eda-gateway-mock:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    ports:
+      - "${EDA_BIND_ADDRESS:-127.0.0.1}:8080:8080"
+    environment:
+      - EDA_MOCK_FILE=/shared/eda_mock.json
+    volumes:
+      - ./shared:/shared:ro

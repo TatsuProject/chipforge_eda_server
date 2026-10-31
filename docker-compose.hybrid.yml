@@ -1,0 +1,12 @@
+# TESTING ONLY (hybrid): the REAL server, but evaluations are simulated by the mock. Installs are real
+# (validators install the evaluator through POST /v2/evaluator: signature check, ~1 GB of assets,
+# post-install, preflight); /v2/evaluate and /v2/status answer from shared/eda_mock.json in minutes.
+#   make hybrid-start   /   make hybrid-stop
+# Used with docker-compose.yml:  docker compose -f docker-compose.yml -f docker-compose.hybrid.yml ...
+services:
+  eda-gateway:
+    environment:
+      - EDA_MOCK_FILE=/shared/eda_mock.json
+      - EDA_MOCK_INSTALL=real
+    volumes:
+      - ./shared:/shared:ro

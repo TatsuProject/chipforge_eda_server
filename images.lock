@@ -1,0 +1,7 @@
+# The 4 published tool/runtime images of the current evaluator release: local name, then the immutable Docker
+# Hub digest (copied from the signed evaluator zip's v2/deploy/images.json). `make start` pulls these by digest.
+# Every evaluation additionally checks each image's content against the pins in the signed zip.
+cf-compiler:v2.1-public docker.io/logicx101/chipforge-v2-compiler@sha256:65b8cf27d1865f4bd73fb11cf75b31b4f9a39b6818a1cce92846456ee44d1a04
+cf-rtl:v2.0 docker.io/logicx101/chipforge-v2-rtl@sha256:f0ae2a3453bc59c94a7814a4048208fc0216914585ecb97add0dbc7472d46d5c
+cf-sta:v2.0 docker.io/logicx101/chipforge-v2-sta@sha256:f9d6a2625c2bb0cab56388d8e05723a58c5120220a26325148bd75bbe5cea6e8
+chipforge_eda_server-v2-evaluator:2.0-r63 docker.io/logicx101/chipforge-v2-evaluator@sha256:a52d8b9d39a452b421d07124ad8fbeb87a17a2f0b7e2646ef72f06fcf33acc78

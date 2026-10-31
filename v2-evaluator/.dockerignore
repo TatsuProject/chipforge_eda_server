@@ -1,0 +1,16 @@
+*
+!Dockerfile
+!pins.env
+!fetch.py
+!build_dram.py
+!nangate45.sha256
+!riscv-gcc.sha256
+!VERSIONS.sh
+!entrypoint.sh
+!smoke.sh
+!cfscope
+!loader/
+!loader/*.py
+!locks/
+!locks/*.lock
+!cf-cancel

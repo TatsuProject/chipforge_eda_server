@@ -1,8 +1,0 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-pydantic==2.5.0
-python-multipart==0.0.6
-requests
-volare
-aiofiles
-certifi>=2026.10.23  # drops the eMudhra roots Mozilla distrusted (Oct 2026)

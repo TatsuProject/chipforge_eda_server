@@ -1,0 +1,33 @@
+#!/bin/sh
+# Print every tool's version; exit non-zero if one is missing. Runs at image build (-> VERSIONS.txt)
+# and is what `docker run --rm IMAGE /opt/cf/versions.sh` shows a miner.
+set -eu
+v() { printf '%-22s %s\n' "$1" "$(sh -c "$2" 2>&1 | head -n1)"; sh -c "$2" >/dev/null 2>&1; }
+v debian        'cat /etc/debian_version'
+v python        'python3 --version'
+v gcc           'gcc --version'
+v g++           'g++ --version'
+v cmake         'cmake --version'
+v ninja         'ninja --version'
+v make          'make --version'
+v clang         'clang --version'
+v ld.lld        'ld.lld --version'
+v llvm-config   'llvm-config --version'
+v mlir-opt      'mlir-opt --version | grep -i version'
+v mlir-translate 'mlir-translate --version | grep -i version'
+v MLIRConfig    'test -f /usr/lib/llvm-22/lib/cmake/mlir/MLIRConfig.cmake && echo /usr/lib/llvm-22/lib/cmake/mlir'
+v rustc         'rustc --version'
+v cargo         'cargo --version'
+v riscv-gcc     'riscv-none-elf-gcc --version'
+v riscv-multilib 'riscv-none-elf-gcc -march=rv32imc_zicsr -mabi=ilp32 -print-multi-directory'
+v iree-compile  'iree-compile --version | head -n1'
+v tosa-opt      'tosa-opt --version | grep -i version || tosa-opt --help | head -n1'
+v tosa_reference_model 'test -x /opt/tosa/bin/tosa_reference_model && /opt/tosa/bin/pip show tosa-tools | grep ^Version'
+v python-pkgs   'python3 -c "import numpy, flatbuffers, tflite, tvm, iree.compiler, iree.runtime, ai_edge_litert, tflite_micro; from tvm.relax.frontend import tflite as _; from iree.compiler import ir; print(\"numpy\", numpy.__version__, \"tvm\", tvm.__version__, \"iree.compiler.ir ok\")"'
+v pip-freeze    'pip freeze | tr "\n" " "'
+v tosa-venv     '/opt/tosa/bin/pip freeze | tr "\n" " "'
+v iree-c-api 'test -f /opt/iree/include/iree/compiler/embedding_api.h && test -e /opt/iree/lib/libIREECompiler.so && echo 3.11.0'
+v vela-build-deps 'python3 -c "import setuptools_scm, lxml.etree; print(lxml.etree.LXML_VERSION)"'
+v onnx        'python3 -c "import onnx, onnxruntime; from tvm.relax.frontend.onnx import from_onnx; print(\"onnx\", onnx.__version__, \"onnxruntime\", onnxruntime.__version__, \"tvm-relax-onnx ok\")"'
+v iree-import-onnx 'iree-import-onnx --help >/dev/null && echo ok'
+v iree-tflite 'python3 -c "from iree.compiler import tflite; print(tflite.is_available())"'

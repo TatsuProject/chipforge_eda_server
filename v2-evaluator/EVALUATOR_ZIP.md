@@ -213,7 +213,8 @@ Logs and leftover boxes (v2.0.1). The service's own stdout/stderr go to
 `service.log.1`, is kept past 64 MiB). When a service ends by itself, the loader's log
 (`docker logs`) names the evaluator, its exit status or signal, and these two paths (never
 their content). The loader adds `cf.v2.loader=<root id>` to `CF_DOCKER_LABELS`; evaluators
-from v2.0.1 keep every inherited label on every box they start. Before starting a service and
+from v2.0.1 keep every inherited label on every box the service starts (the short CPU probe run
+during installation is not labelled, so a reap never removes a live install). Before starting a service and
 after one stops, the loader force-removes the containers carrying this root's label (found by
 that label only, never by name) and logs how many it found.
 

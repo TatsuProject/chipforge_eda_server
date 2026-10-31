@@ -261,6 +261,7 @@ class Runtime:
         return dict(row) if row else None
 
     def finish(self, job, body, content_type='application/json', error=None):
+        self.retry_after.pop(job['request_id'], None)
         with self.db() as db:
             db.execute("UPDATE jobs SET phase='done',response=?,response_type=?,error=? WHERE request_id=?",
                        (body, content_type, error, job['request_id']))
@@ -281,6 +282,7 @@ class Runtime:
                 with self.db() as db:
                     jobs = [dict(r) for r in db.execute("SELECT * FROM jobs WHERE phase!='done' ORDER BY created")]
                 active = next((j for j in jobs if j['forwarded']), None)
+                hold = None     # a refused job keeps its evaluator: other evaluators' jobs wait (no service switching)
                 for job in jobs:
                     install = self.install_status(job['sha'], job['attempt'])
                     if not install or install['phase'] == 'failed':
@@ -293,10 +295,14 @@ class Runtime:
                         job['phase'] = 'queued'
                     if active and active['request_id'] != job['request_id']:
                         continue
+                    if hold and hold != job['sha']:
+                        continue
                     self.tick(job)
                     # Only an accepted job owns the service; a refused mode must not block ready modes.
                     current = self.job(job['request_id'])
                     active = current if current['forwarded'] and current['phase'] != 'done' else None
+                    if current['phase'] != 'done' and not current['forwarded']:
+                        hold = hold or job['sha']
                 if not jobs:
                     with self.db() as db:
                         latest = db.execute("SELECT sha FROM installs WHERE phase='ready' ORDER BY rowid DESC LIMIT 1").fetchone()
@@ -374,12 +380,8 @@ class Runtime:
                                                      'and resubmit under a new request ID.'),
                             error='EVALUATOR_SERVICE_REJECTED')
         except InstallError as exc:
-            if exc.code == 'EVALUATOR_NOT_READY':
-                if job.get('forwarded'):
-                    with self.db() as db:
-                        db.execute("UPDATE jobs SET phase='queued',forwarded=0 WHERE request_id=?", (job['request_id'],))
-                self.retry_after[job['request_id']] = time.monotonic() + 30
-                return
+            # EVALUATOR_NOT_READY here is the install no longer matching this loader (supervisor.ensure), not a RAM
+            # refusal (that is the evaluator's HTTP 503 above): terminal, as before.
             if exc.code in ('EVALUATOR_SERVICE_EXITED', 'EVALUATOR_SERVICE_START_FAILED'):
                 failures = self.start_failures.get(job['sha'], 0) + 1
                 self.start_failures[job['sha']] = failures

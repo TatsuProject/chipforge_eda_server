@@ -510,7 +510,8 @@ def test_not_ready_job_backs_off_without_blocking_ready_mode(tmp_path, monkeypat
         assert runtime.install_status(sha)['attempt'] == 1 and not runtime.start_failures
 
 
-def test_not_ready_before_submission_never_fails_the_job():
+def test_install_mismatch_before_submission_stays_terminal():
+    """supervisor.ensure raises EVALUATOR_NOT_READY when the install no longer matches the loader: never retried."""
     from types import SimpleNamespace
     from loader.security import InstallError
 
@@ -521,15 +522,50 @@ def test_not_ready_before_submission_never_fails_the_job():
 
     runtime = SimpleNamespace(service=SimpleNamespace(ensure=ensure), retry_after={}, start_failures={},
                               fail=lambda *args: failed.append(args))
-    job = {'sha': 'a' * 64, 'request_id': 'waiting'}
-    before = time.monotonic()
-    for _ in range(5):
-        Runtime.tick(runtime, job)
-    assert not failed and not runtime.start_failures
-    assert before + 30 <= runtime.retry_after['waiting'] <= time.monotonic() + 30
+    job = {'sha': 'a' * 64, 'request_id': 'mismatch'}
+    Runtime.tick(runtime, job)
+    assert failed == [(job, 'EVALUATOR_NOT_READY')] and 'mismatch' not in runtime.retry_after
 
 
-@pytest.mark.parametrize('refusal', ['submit', 'ensure'])
+def test_refused_job_keeps_its_evaluator_and_other_evaluators_wait(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import loader.runtime as module
+    from loader.supervisor import Service
+
+    clock = [100.0]
+    monkeypatch.setattr(module, 'time', SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    attempts = []
+    ready = threading.Event()
+    refused = threading.Event()
+    submit = Service.submit
+
+    def forward(service, job):
+        attempts.append(job['request_id'])
+        if job['request_id'] == 'a' and not ready.is_set():
+            refused.set()
+            return 503, {}, b'{"status":"not_ready"}'
+        return submit(service, job)
+
+    monkeypatch.setattr(Service, 'submit', forward)
+    za, zb = tmp_path / 'a.zip', tmp_path / 'b.zip'
+    build_zip(za, delay=0.1)
+    build_zip(zb, delay=0.1, extra={'other.txt': 'b'})
+    with running(tmp_path, allow_unsigned=True, modes=('T1', 'T2')) as (runtime, request):
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_zip=za, request_id='a', mode='T2'))[0] == 202
+        assert refused.wait(10)
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_zip=zb, request_id='b', mode='T1'))[0] == 202
+        assert wait_until(lambda: runtime.install_status(runtime.job('b')['sha'])['phase'] == 'ready')
+        time.sleep(0.6)   # dispatch ticks: b's evaluator must not displace a's
+        assert attempts == ['a'] and runtime.job('b')['phase'] != 'done'
+        ready.set()
+        clock[0] += 31
+        runtime.wakeup.set()
+        assert wait_until(lambda: terminal(request, 'a'))[2] == RAW
+        assert wait_until(lambda: terminal(request, 'b'))[2] == RAW
+        assert attempts == ['a', 'a', 'b'] and 'a' not in runtime.retry_after
+
+
+@pytest.mark.parametrize('refusal', ['submit'])
 def test_recovered_job_refused_on_resubmission_releases_its_old_slot(tmp_path, monkeypatch, refusal):
     from loader.security import InstallError
 

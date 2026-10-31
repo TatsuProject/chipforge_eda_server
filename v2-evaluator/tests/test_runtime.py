@@ -565,6 +565,49 @@ def test_refused_job_keeps_its_evaluator_and_other_evaluators_wait(tmp_path, mon
         assert attempts == ['a', 'a', 'b'] and 'a' not in runtime.retry_after
 
 
+def test_slot_freed_beside_a_refused_job_does_not_switch_evaluators(tmp_path, monkeypatch):
+    """Refused A (evaluator X), accepted B (X), queued C (Y): when B ends, C waits until A has run (no switch to Y)."""
+    from types import SimpleNamespace
+    import loader.runtime as module
+    from loader.supervisor import Service
+
+    clock = [100.0]
+    monkeypatch.setattr(module, 'time', SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    attempts = []
+    ready = threading.Event()
+    refused = threading.Event()
+    submit = Service.submit
+
+    def forward(service, job):
+        attempts.append(job['request_id'])
+        if job['request_id'] == 'a' and not ready.is_set():
+            refused.set()
+            return 503, {}, b'{"status":"not_ready"}'
+        return submit(service, job)
+
+    monkeypatch.setattr(Service, 'submit', forward)
+    za, zb = tmp_path / 'a.zip', tmp_path / 'b.zip'
+    sha = build_zip(za, delay=3)
+    build_zip(zb, delay=0.1, extra={'other.txt': 'b'})
+    with running(tmp_path, allow_unsigned=True, modes=('T1', 'T2')) as (runtime, request):
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_zip=za, request_id='a', mode='T2'))[0] == 202
+        assert refused.wait(10)
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_sha256=sha, request_id='b', mode='T1'))[0] == 202
+        assert wait_until(lambda: runtime.job('b')['forwarded'])
+        # C is queued after B and its evaluator is installed while B still runs
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_zip=zb, request_id='c', mode='T1'))[0] == 202
+        assert wait_until(lambda: runtime.install_status(runtime.job('c')['sha'])['phase'] == 'ready')
+        assert runtime.job('b')['phase'] != 'done'
+        assert wait_until(lambda: terminal(request, 'b'))[2] == RAW
+        time.sleep(0.6)   # dispatch ticks after B ended: C's evaluator must not displace A's
+        assert attempts == ['a', 'b'] and runtime.job('c')['phase'] != 'done'
+        ready.set()
+        clock[0] += 31
+        runtime.wakeup.set()
+        assert wait_until(lambda: terminal(request, 'c'))[2] == RAW
+        assert terminal(request, 'a')[2] == RAW and attempts == ['a', 'b', 'a', 'c']
+
+
 @pytest.mark.parametrize('refusal', ['submit'])
 def test_recovered_job_refused_on_resubmission_releases_its_old_slot(tmp_path, monkeypatch, refusal):
     from loader.security import InstallError

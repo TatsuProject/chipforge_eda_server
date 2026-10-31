@@ -294,6 +294,8 @@ class Runtime:
                         self.set_phase(job['request_id'], 'queued')
                         job['phase'] = 'queued'
                     if active and active['request_id'] != job['request_id']:
+                        if not job['forwarded']:
+                            hold = hold or job['sha']     # an older waiting job keeps its evaluator
                         continue
                     if hold and hold != job['sha']:
                         continue
@@ -303,6 +305,8 @@ class Runtime:
                     active = current if current['forwarded'] and current['phase'] != 'done' else None
                     if current['phase'] != 'done' and not current['forwarded']:
                         hold = hold or job['sha']
+                    elif current['phase'] == 'done' and hold:
+                        break      # the slot freed with an older job waiting: the next pass offers it first, in order
                 if not jobs:
                     with self.db() as db:
                         latest = db.execute("SELECT sha FROM installs WHERE phase='ready' ORDER BY rowid DESC LIMIT 1").fetchone()

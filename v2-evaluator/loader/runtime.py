@@ -374,6 +374,7 @@ class Runtime:
         alive = self.thread is not None and self.thread.is_alive() and not self.stop_event.is_set()
         service_alive = self.service.proc is not None and self.service.proc.poll() is None and self.service.healthy
         return dict(ready=bool(ready and alive and service_alive and self.tools_ready and not self.tools_error),
+                    evaluator_not_ready=self.service.not_ready,
                     status='ok' if alive else 'degraded', active_evaluator=self.service.sha,
                     modes=list(self.installer.modes), allow_unsigned=self.allow_unsigned,
                     sandbox_override=self.installer.allow_runc, preflight_min_disk_gib=self.installer.min_disk_gib,

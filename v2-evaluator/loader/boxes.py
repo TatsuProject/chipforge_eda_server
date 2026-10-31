@@ -55,17 +55,23 @@ def owner_locks(root, state=None, environ=None):
 
 
 def reap_unowned(root, why, *, state=None, environ=None, log=None):
-    """reap() only while this process holds every owner lock (owner_locks; a lock file that does not exist was
-    never taken). Another holder means a live evaluator (e.g. one started before this loader restarted): then
-    nothing is removed. -> reap()'s dict, or with 'skipped': the lock that is held. Never raises."""
+    """reap() only while this process holds every owner lock (owner_locks): the evaluation lock always (created when
+    missing, so held during the listing and removal), the state lock when it exists. Another holder means a live
+    evaluator (e.g. one started before this loader restarted): then nothing is removed.
+    -> reap()'s dict, or with 'skipped': the lock that is held. Never raises."""
     log = log or (lambda line: print(line, file=sys.stderr, flush=True))
     fds = []
     try:
-        for path in owner_locks(root, state, environ):
+        for n, path in enumerate(owner_locks(root, state, environ)):
             try:
-                fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+                # the evaluation lock is created when missing (as the evaluator does, O_RDONLY 0666), so it is
+                # always held while boxes are listed: no evaluation, however it started, can start a box then
+                fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | (os.O_CREAT if n == 0 else 0), 0o666)
             except FileNotFoundError:
-                continue
+                if n == 0:                   # the evaluation lock cannot even be created: do not guess
+                    log(f'leftover evaluator boxes ({why}) not removed: cannot create {path}')
+                    return dict(found=[], removed=[], left=[], verified=False, skipped=path)
+                continue                     # no state lock yet: no service ever ran there
             except OSError as e:
                 log(f'leftover evaluator boxes ({why}) not removed: cannot open {path} ({e.strerror})')
                 return dict(found=[], removed=[], left=[], verified=False, skipped=path)

@@ -199,3 +199,95 @@ def test_a_restarted_loader_never_reaps_a_running_evaluators_boxes(tmp_path, doc
     finally:
         holder.kill()
         holder.wait()
+
+
+def test_missing_lock_files_never_let_a_reap_run_unlocked(tmp_path, docker, monkeypatch):
+    """Codex review of v201 round 2 (P0, race): with no lock file yet, an evaluator still starting could create
+    the locks and start boxes while the loader lists them. The evaluation lock is created and held for the whole
+    listing and removal, so no evaluation can be running then."""
+    import fcntl
+    monkeypatch.delenv('CF_V2_HOST_LOCK', raising=False)
+    root, state = tmp_path / 'root', tmp_path / 'state'
+    root.mkdir()
+    docker('leftover', boxes.label(root))
+    held = []
+    real = boxes.reap
+
+    def reap(*a, **kw):
+        fd = os.open(root / boxes.EVALUATION_LOCK, os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)      # an evaluation trying to start now must wait
+            held.append(True)
+        finally:
+            os.close(fd)
+        return real(*a, **kw)
+    monkeypatch.setattr(boxes, 'reap', reap)
+    assert not (root / boxes.EVALUATION_LOCK).exists() and not state.exists()
+    assert boxes.reap_unowned(root, 'test', state=state, log=lambda line: None)['removed'] == ['leftover']
+    assert held == [True]
+    lines = []
+    got = boxes.reap_unowned(tmp_path / 'no-such-root', 'test', log=lines.append)
+    assert got['skipped'] and 'cannot create' in lines[0]
+
+
+class _Clock:
+    """A virtual clock for supervisor.time: sleep() advances monotonic() instantly."""
+    def __init__(self):
+        self.now = 1000.0
+    def monotonic(self):
+        return self.now
+    def sleep(self, s):
+        self.now += s
+
+
+def test_a_service_waiting_for_ram_is_kept_not_a_start_failure(tmp_path, docker, monkeypatch):
+    """Codex review of v201 round 2 (P1): an evaluator that is alive but not ready (its RAM plan cannot execute
+    yet; it re-checks itself every 30 s) answers /health 503 not_ready. With a virtual clock past the 30 s start
+    deadline the loader keeps it (no EVALUATOR_SERVICE_START_FAILED, no stop), reports the reason, and a job tick
+    neither fails the job nor counts a start failure: the job stays queued until the evaluator accepts it."""
+    import json as _json
+    import subprocess
+    from types import SimpleNamespace
+    from loader import supervisor
+    from loader.runtime import Runtime
+    root = tmp_path / 'root'
+    (root / 'evaluators' / ('a' * 64)).mkdir(parents=True)
+    (root / 'loader').mkdir()
+    state = tmp_path / 'state'
+    state.mkdir()
+    proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
+    monkeypatch.setattr(supervisor, 'environment', lambda *a: {'CF_ORCH_SSD': str(state), 'CF_ORCH_POSIX': 'p'})
+    monkeypatch.setattr(supervisor, 'interpreter', lambda: sys.executable)
+    real = supervisor.subprocess.Popen
+    monkeypatch.setattr(supervisor.subprocess, 'Popen', lambda command, *a, **kw:
+                        real(command, *a, **kw) if command[0] == 'docker' else proc)   # the module is shared
+    monkeypatch.setattr(supervisor, 'time', _Clock())
+    reason = 'T2: 13.9 GiB RAM free at start; this T2 plan needs 21.9 GiB free; set CF_MEMORY=12GiB'
+    health = {'answer': (503, {}, _json.dumps({'status': 'not_ready', 'reason': reason}).encode())}
+    calls = []
+
+    def request(method, path, body=None, content_type=None):
+        calls.append(path)
+        if path == '/health':
+            return health['answer']
+        return 404, {}, b'{}'
+    service = Service(_Installer(root))
+    monkeypatch.setattr(service, 'request', request)
+    monkeypatch.setattr(service, 'submit', lambda job: (503, {}, _json.dumps(
+        {'error': {'code': 'EVALUATOR_NOT_READY', 'message': reason}}).encode()))
+    try:
+        service.ensure('a' * 64)                                   # no InstallError although never 200
+        assert service.proc is proc and proc.poll() is None and not service.healthy
+        assert service.not_ready == reason
+        failed, rt = [], SimpleNamespace(service=service, start_failures={}, fail=lambda job, code: failed.append(code),
+                                         finish=lambda *a, **kw: failed.append('finished'))
+        for _ in range(5):                                         # more ticks than the 3 start failures allowed
+            Runtime.tick(rt, {'sha': 'a' * 64, 'request_id': 'r1'})
+        assert failed == [] and rt.start_failures == {} and service.proc is proc
+        health['answer'] = (200, {}, b'{"status": "ok"}')          # free RAM came back: the evaluator is ready
+        service.ensure('a' * 64)
+        assert service.healthy and service.not_ready is None and service.proc is proc
+    finally:
+        proc.kill()
+        proc.wait()

@@ -1,5 +1,6 @@
 """Loopback-only evaluator process, restarted after a crash; one active evaluator."""
 import http.client
+import json
 import os
 from pathlib import Path
 import signal
@@ -43,6 +44,22 @@ class Service:
         self.sha, self.proc, self.port, self.log_path = None, None, None, None
         self.env = None             # the running service's environment (its state dir and lock paths)
         self.healthy = False
+        self.not_ready = None       # v2.0.1: the running service's "not ready" reason (RAM plan), or None
+
+    def _read_health(self, status, body):
+        """v2.0.1: 200 healthy; 503 with status "not_ready" is an evaluator ALIVE that waits for RAM (its RAM plan
+        cannot execute yet; it re-checks itself): kept, never a start failure. -> True when it answered either."""
+        try:
+            doc = json.loads(body or b'{}')
+        except ValueError:
+            doc = {}
+        doc = doc if isinstance(doc, dict) else {}
+        waiting = doc.get('reason') if status == 503 and doc.get('status') == 'not_ready' else doc.get('modes_not_ready')
+        if waiting and waiting != self.not_ready:
+            print(f'evaluator service {(self.sha or "")[:12]} not ready: {waiting}', file=sys.stderr, flush=True)
+        self.not_ready = waiting or None
+        self.healthy = status == 200
+        return status == 200 or (status == 503 and doc.get('status') == 'not_ready')
 
     def stop(self):
         self.healthy = False
@@ -72,8 +89,8 @@ class Service:
 
     def ensure(self, sha):
         if self.sha == sha and self.proc and self.proc.poll() is None:
-            status, _, _ = self.request('GET', '/health')
-            self.healthy = status == 200
+            status, _, body = self.request('GET', '/health')
+            self._read_health(status, body)
             return
         self.stop()
         ready = self.installer.ready(sha)
@@ -118,9 +135,8 @@ class Service:
                 self.reap_orphans(self.proc.pid)
                 raise InstallError('EVALUATOR_SERVICE_EXITED')
             try:
-                status, _, _ = self.request('GET', '/health')
-                if status == 200:
-                    self.healthy = True
+                status, _, body = self.request('GET', '/health')
+                if self._read_health(status, body):        # healthy, or alive and waiting for RAM: kept
                     atomic_json(root / 'loader/active.json', {'sha256': sha})
                     return
             except (OSError, http.client.HTTPException):

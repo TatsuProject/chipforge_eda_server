@@ -608,6 +608,24 @@ def test_slot_freed_beside_a_refused_job_does_not_switch_evaluators(tmp_path, mo
         assert terminal(request, 'a')[2] == RAW and attempts == ['a', 'b', 'a', 'c']
 
 
+def test_active_job_is_polled_while_an_older_job_installs_another_evaluator(tmp_path):
+    """Older A installs evaluator Y while newer B on X is accepted; Y becomes ready while B runs: B still completes."""
+    za, zb = tmp_path / 'a.zip', tmp_path / 'b.zip'
+    build_zip(za, delay=0.1, preflight_delay=2, extra={'other.txt': 'a'})
+    sha = build_zip(zb, delay=5)
+    with running(tmp_path, allow_unsigned=True, modes=('T1', 'T2')) as (runtime, request):
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_zip=zb, request_id='warm', mode='T1'))[0] == 202
+        assert wait_until(lambda: terminal(request, 'warm'), timeout=30)[2] == RAW
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_zip=za, request_id='a', mode='T1'))[0] == 202
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_sha256=sha, request_id='b', mode='T1'))[0] == 202
+        assert wait_until(lambda: runtime.job('b')['forwarded'])
+        assert runtime.install_status(runtime.job('a')['sha'])['phase'] != 'ready'
+        assert wait_until(lambda: runtime.install_status(runtime.job('a')['sha'])['phase'] == 'ready')
+        assert runtime.job('b')['phase'] != 'done'
+        assert wait_until(lambda: terminal(request, 'b'), timeout=30)[2] == RAW
+        assert wait_until(lambda: terminal(request, 'a'), timeout=30)[2] == RAW
+
+
 @pytest.mark.parametrize('refusal', ['submit'])
 def test_recovered_job_refused_on_resubmission_releases_its_old_slot(tmp_path, monkeypatch, refusal):
     from loader.security import InstallError

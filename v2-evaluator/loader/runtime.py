@@ -297,8 +297,8 @@ class Runtime:
                         if not job['forwarded']:
                             hold = hold or job['sha']     # an older waiting job keeps its evaluator
                         continue
-                    if hold and hold != job['sha']:
-                        continue
+                    if hold and hold != job['sha'] and not active:
+                        continue      # the active job is always polled, whatever evaluator a waiting job holds
                     self.tick(job)
                     # Only an accepted job owns the service; a refused mode must not block ready modes.
                     current = self.job(job['request_id'])

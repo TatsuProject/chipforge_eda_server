@@ -458,3 +458,96 @@ def test_evaluator_config_gate_b_section_is_checked_by_the_evaluators_own_loader
     cfg.write_text(json.dumps({'gate_b': {'mirrorz': []}}))
     with pytest.raises(ValueError, match="refused by the installed evaluator .*unknown gate_b knob"):
         check_evaluator_config(root, {}, tree)
+
+
+@pytest.mark.parametrize('retry_header,delay', [(None, 30), ('45', 45), ('date', 60)])
+def test_not_ready_job_backs_off_without_blocking_ready_mode(tmp_path, monkeypatch, retry_header, delay):
+    from email.utils import formatdate
+    from types import SimpleNamespace
+    import loader.runtime as module
+    from loader.supervisor import Service
+
+    clock = [100.0]
+    monkeypatch.setattr(module, 'time', SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    if retry_header == 'date':
+        now = int(time.time())
+        monkeypatch.setattr(module.time, 'time', lambda: now)
+        retry_header = formatdate(now + delay, usegmt=True)
+    attempts = []
+    ready = threading.Event()
+    refused = threading.Event()
+    submit = Service.submit
+
+    def forward(service, job):
+        attempts.append(job['request_id'])
+        if job['mode'] == 'T2' and not ready.is_set():
+            refused.set()
+            return 503, ({'Retry-After': retry_header} if retry_header else {}), b'{"status":"not_ready"}'
+        return submit(service, job)
+
+    monkeypatch.setattr(Service, 'submit', forward)
+    archive = tmp_path / 'e.zip'
+    sha = build_zip(archive, preflight_delay=0.3, delay=0.1)
+    with running(tmp_path, allow_unsigned=True, modes=('T1', 'T2')) as (runtime, request):
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_zip=archive,
+                       request_id='t2', mode='T2'))[0] == 202
+        assert request('POST', '/evaluate', dict(design_zip=b'd', evaluator_sha256=sha,
+                       request_id='t1', mode='T1'))[0] == 202
+        assert refused.wait(10)
+        assert wait_until(lambda: terminal(request, 't1'))[2] == RAW
+        job = runtime.job('t2')
+        assert job['phase'] == 'queued' and not job['forwarded'] and job['response'] is None
+        time.sleep(0.6)   # multiple dispatch ticks must not re-copy or re-submit T2
+        assert attempts == ['t2', 't1'] and not runtime.start_failures
+        clock[0] = 100 + delay - 1
+        runtime.tick(job)
+        assert attempts == ['t2', 't1']
+        ready.set()
+        clock[0] += 1
+        runtime.wakeup.set()
+        assert wait_until(lambda: terminal(request, 't2'))[2] == RAW
+        assert attempts == ['t2', 't1', 't2']
+        assert runtime.install_status(sha)['attempt'] == 1 and not runtime.start_failures
+
+
+def test_not_ready_before_submission_never_fails_the_job():
+    from types import SimpleNamespace
+    from loader.security import InstallError
+
+    failed = []
+
+    def ensure(sha):
+        raise InstallError('EVALUATOR_NOT_READY')
+
+    runtime = SimpleNamespace(service=SimpleNamespace(ensure=ensure), retry_after={}, start_failures={},
+                              fail=lambda *args: failed.append(args))
+    job = {'sha': 'a' * 64, 'request_id': 'waiting'}
+    before = time.monotonic()
+    for _ in range(5):
+        Runtime.tick(runtime, job)
+    assert not failed and not runtime.start_failures
+    assert before + 30 <= runtime.retry_after['waiting'] <= time.monotonic() + 30
+
+
+@pytest.mark.parametrize('refusal', ['submit', 'ensure'])
+def test_recovered_job_refused_on_resubmission_releases_its_old_slot(tmp_path, monkeypatch, refusal):
+    from loader.security import InstallError
+
+    runtime = Runtime(tmp_path / 'root', tmp_path / 'secrets/salt', allow_unsigned=True)
+    try:
+        with runtime.db() as db:
+            db.execute('INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,forwarded) '
+                       'VALUES(?,?,?,?,?,?,?,?,?,?)', ('old', 'a' * 64, 1, 'T2', 'miner', 'd' * 64, 'unused', 'running', 0, 1))
+        def ensure(sha):
+            if refusal == 'ensure':
+                raise InstallError('EVALUATOR_NOT_READY')
+
+        monkeypatch.setattr(runtime.service, 'ensure', ensure)
+        monkeypatch.setattr(runtime.service, 'request', lambda *args: (404, {}, b'{}'))
+        monkeypatch.setattr(runtime.service, 'submit', lambda job: (503, {}, b'{"status":"not_ready"}'))
+        runtime.tick(runtime.job('old'))
+        job = runtime.job('old')
+        assert job['phase'] == 'queued' and not job['forwarded'] and job['response'] is None
+        assert runtime.retry_after['old'] > time.monotonic() and not runtime.start_failures
+    finally:
+        runtime.close()

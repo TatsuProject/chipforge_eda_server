@@ -1,6 +1,7 @@
 """Durable asynchronous acceptance/install/queue and evaluator supervision."""
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import fcntl
 import http.client
 import json
@@ -70,6 +71,7 @@ class Runtime:
         self.tools_ready = False
         self.tools_error = None
         self.start_failures = {}
+        self.retry_after = {}
         with self.db() as db:
             db.executescript(SCHEMA)
             # cf-chain-commit/1 (BEACON.md): forwarded verbatim to the evaluator, which validates it.
@@ -292,9 +294,9 @@ class Runtime:
                     if active and active['request_id'] != job['request_id']:
                         continue
                     self.tick(job)
-                    # Keep a challenge active until its job is terminal; switching can drain for hours.
-                    if self.job(job['request_id'])['phase'] != 'done':
-                        active = job
+                    # Only an accepted job owns the service; a refused mode must not block ready modes.
+                    current = self.job(job['request_id'])
+                    active = current if current['forwarded'] and current['phase'] != 'done' else None
                 if not jobs:
                     with self.db() as db:
                         latest = db.execute("SELECT sha FROM installs WHERE phase='ready' ORDER BY rowid DESC LIMIT 1").fetchone()
@@ -314,11 +316,15 @@ class Runtime:
             self.wakeup.clear()
 
     def tick(self, job):
+        if time.monotonic() < self.retry_after.get(job['request_id'], 0):
+            return
+        self.retry_after.pop(job['request_id'], None)
         try:
             self.service.ensure(job['sha'])
             self.start_failures.pop(job['sha'], None)
             status, headers, body = self.service.request('GET', '/status/' + job['request_id'])
-            if status == 404:
+            submitting = status == 404
+            if submitting:
                 status, headers, body = self.service.submit(job)
             if status == 200:
                 self.finish(job, body, next((v for k, v in headers.items() if k.lower() == 'content-type'), 'application/json'))
@@ -340,7 +346,23 @@ class Runtime:
                 phase = 'running' if state in ('running', 'leased') else 'queued'
                 with self.db() as db:
                     db.execute('UPDATE jobs SET phase=?,forwarded=1 WHERE request_id=?', (phase, job['request_id']))
-            elif status not in (429, 503):
+            elif status in (429, 503):
+                if submitting and job.get('forwarded'):
+                    # A restarted evaluator has no accepted copy of this previously forwarded job.
+                    with self.db() as db:
+                        db.execute("UPDATE jobs SET phase='queued',forwarded=0 WHERE request_id=?", (job['request_id'],))
+                delay = 30
+                value = next((v for k, v in headers.items() if k.lower() == 'retry-after'), None)
+                if value is not None:
+                    try:
+                        delay = max(0, int(value))
+                    except ValueError:
+                        try:
+                            delay = max(0, parsedate_to_datetime(value).timestamp() - time.time())
+                        except (ValueError, TypeError, OverflowError):
+                            pass
+                self.retry_after[job['request_id']] = time.monotonic() + delay
+            else:
                 # Name the evaluator's public refusal code (e.g. CHAIN_COMMIT_REQUIRED), never its text.
                 try:
                     why = str(json.loads(body)['error']['code'])
@@ -352,6 +374,12 @@ class Runtime:
                                                      'and resubmit under a new request ID.'),
                             error='EVALUATOR_SERVICE_REJECTED')
         except InstallError as exc:
+            if exc.code == 'EVALUATOR_NOT_READY':
+                if job.get('forwarded'):
+                    with self.db() as db:
+                        db.execute("UPDATE jobs SET phase='queued',forwarded=0 WHERE request_id=?", (job['request_id'],))
+                self.retry_after[job['request_id']] = time.monotonic() + 30
+                return
             if exc.code in ('EVALUATOR_SERVICE_EXITED', 'EVALUATOR_SERVICE_START_FAILED'):
                 failures = self.start_failures.get(job['sha'], 0) + 1
                 self.start_failures[job['sha']] = failures

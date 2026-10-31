@@ -284,6 +284,12 @@ A new request retries a failed install; an identical request ID may retry that
 system error too. Successful terminal requests retain idempotent bytes. Changing
 archive, design, mode or submitter under an existing ID returns 409.
 
+A live evaluator's 503 `not_ready` / `EVALUATOR_NOT_READY` refusal leaves the job queued,
+without consuming startup-failure attempts. Refused jobs back off individually (`Retry-After`,
+including HTTP dates, or 30 seconds when absent); they do not own the active slot or re-copy the
+design during backoff. Other ready modes can proceed, and the refused job is forwarded on a
+later retry once its mode is ready.
+
 ## Minimal fixture compatibility
 
 The provisional `cf-evaluator/1` manifest remains supported: flat `service` and

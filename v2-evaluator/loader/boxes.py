@@ -4,10 +4,16 @@ Every sibling container an evaluator service starts carries the label cf.v2.load
 loader exports it in CF_DOCKER_LABELS and evaluators from v2.0.1 keep inherited labels on every box.
 The loader holds this root's lock and runs at most one evaluator service, so while no service runs
 a container with this label is a leftover (a crashed or replaced service, a recreated container).
+"No service runs" is established, not assumed (Codex review of v201): reap_unowned removes boxes only
+while the loader itself holds the root's evaluation lock (every evaluation of the root holds it while
+its boxes live) and the service's state lock; a restarted loader that meets a still-running evaluator
+removes nothing.
 A leftover keeps its CPUs and spoils the timing of later jobs (25 Oct: 13 boxes of a stopped run
 survived ~95 h). Containers are found by this label only, never by name; nothing else is touched.
 """
+import fcntl
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -32,6 +38,47 @@ def _docker(args, timeout=DOCKER_TIMEOUT_S):
         return subprocess.run(['docker', *args], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+EVALUATION_LOCK = 'active-evaluation.lock'      # the evaluator's resources.HOST_LOCK_NAME under its data root
+
+
+def owner_locks(root, state=None, environ=None):
+    """The locks a live evaluator of this root holds: the evaluation lock (CF_V2_HOST_LOCK, else
+    <root>/active-evaluation.lock: held by every evaluation for its whole life) and the service's state lock
+    (<state>/http.lock: held by the service process)."""
+    environ = os.environ if environ is None else environ
+    out = [environ.get('CF_V2_HOST_LOCK') or str(Path(root) / EVALUATION_LOCK)]
+    if state:
+        out.append(str(Path(state) / 'http.lock'))
+    return out
+
+
+def reap_unowned(root, why, *, state=None, environ=None, log=None):
+    """reap() only while this process holds every owner lock (owner_locks; a lock file that does not exist was
+    never taken). Another holder means a live evaluator (e.g. one started before this loader restarted): then
+    nothing is removed. -> reap()'s dict, or with 'skipped': the lock that is held. Never raises."""
+    log = log or (lambda line: print(line, file=sys.stderr, flush=True))
+    fds = []
+    try:
+        for path in owner_locks(root, state, environ):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                log(f'leftover evaluator boxes ({why}) not removed: cannot open {path} ({e.strerror})')
+                return dict(found=[], removed=[], left=[], verified=False, skipped=path)
+            fds.append(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                log(f'leftover evaluator boxes ({why}) not removed: a live evaluator holds {path}')
+                return dict(found=[], removed=[], left=[], verified=False, skipped=path)
+        return reap(root, why, log=log)
+    finally:
+        for fd in fds:
+            os.close(fd)
 
 
 def reap(root, why, log=None):

@@ -41,6 +41,7 @@ class Service:
         # its config file, default auto). A count is the deprecated explicit alias, kept for old setups.
         self.cores = cores
         self.sha, self.proc, self.port, self.log_path = None, None, None, None
+        self.env = None             # the running service's environment (its state dir and lock paths)
         self.healthy = False
 
     def stop(self):
@@ -53,7 +54,8 @@ class Service:
                 report_exit(self.sha or '', self.proc, self.log_path, 'unexpectedly')
                 self.reap_orphans(self.proc.pid)
             self.proc = None
-            boxes.reap(self.installer.root, 'evaluator service stopped')
+            env = self.env or {}
+            boxes.reap_unowned(self.installer.root, 'evaluator service stopped', state=env.get('CF_ORCH_SSD'), environ=env)
 
     @staticmethod
     def reap_orphans(group):
@@ -83,7 +85,8 @@ class Service:
         manifest = ready['manifest']
         # Every box the service starts carries this root's label; none of ours may run before it starts.
         env = boxes.with_label(environment(root, sha, self.installer.salt), root)
-        boxes.reap(root, 'before evaluator service start')
+        self.env = env
+        boxes.reap_unowned(root, 'before evaluator service start', state=env.get('CF_ORCH_SSD'), environ=env)
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             self.port = sock.getsockname()[1]

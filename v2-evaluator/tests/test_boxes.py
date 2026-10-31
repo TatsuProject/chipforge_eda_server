@@ -139,3 +139,63 @@ def test_service_output_goes_to_its_log_and_an_exit_is_reported(tmp_path, docker
     assert f"evaluator service {'a' * 12} pid " in err and 'exited during start-up: signal 9 (SIGKILL)' in err
     assert f"service log {state / 'service.log'}; worker log {state / 'workers.log'}" in err
     assert supervisor.exit_text(3) == 'returncode 3' and supervisor.exit_text(-15) == 'signal 15 (SIGTERM)'
+
+
+def _hold(path):
+    """A separate process (an evaluator that outlived its loader) holding flock on `path`."""
+    import subprocess
+    p = subprocess.Popen([sys.executable, '-c', 'import fcntl, os, time\n'
+                          f'fd = os.open({str(path)!r}, os.O_RDONLY | os.O_CREAT, 0o666)\n'
+                          "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); time.sleep(120)"],
+                         stdout=subprocess.PIPE, text=True)
+    assert p.stdout.readline().strip() == 'held'
+    return p
+
+
+@pytest.mark.parametrize('which', ['evaluation', 'state'])
+def test_reap_unowned_removes_nothing_while_a_live_evaluator_holds_a_lock(tmp_path, docker, monkeypatch, which):
+    """Codex review of v201 (P0): a box with this root's label may belong to a live evaluator (one that outlived a
+    loader restart). Nothing is removed while any process holds the root's evaluation lock or the service's state
+    lock; once released, leftovers go."""
+    monkeypatch.delenv('CF_V2_HOST_LOCK', raising=False)
+    root, state = tmp_path / 'root', tmp_path / 'state'
+    root.mkdir()
+    state.mkdir()
+    docker('live-box', boxes.label(root))
+    holder = _hold(root / boxes.EVALUATION_LOCK if which == 'evaluation' else state / 'http.lock')
+    lines = []
+    try:
+        got = boxes.reap_unowned(root, 'test', state=state, log=lines.append)
+        assert got['skipped'] and got['found'] == [] and docker.names() == ['live-box']
+        assert 'not removed: a live evaluator holds' in lines[0]
+    finally:
+        holder.kill()
+        holder.wait()
+    assert boxes.reap_unowned(root, 'test', state=state, log=lines.append)['removed'] == ['live-box']
+    assert docker.names() == []
+
+
+def test_a_restarted_loader_never_reaps_a_running_evaluators_boxes(tmp_path, docker, monkeypatch):
+    """A new loader (fresh Service, no process of its own) meets an evaluator that still owns its evaluation lock:
+    ensure() removes nothing before it starts its own service."""
+    from loader import supervisor
+    monkeypatch.delenv('CF_V2_HOST_LOCK', raising=False)
+    root = tmp_path / 'root'
+    root.mkdir()
+    docker('running-evaluation-box', boxes.label(root))
+    real = supervisor.subprocess.Popen
+
+    def popen(command, *a, **kw):
+        if command[0] == 'docker':
+            return real(command, *a, **kw)
+        raise OSError('test: no service')
+    holder = _hold(root / boxes.EVALUATION_LOCK)          # before Popen is patched (the module is shared)
+    monkeypatch.setattr(supervisor, 'environment', lambda *a: {'CF_ORCH_SSD': str(tmp_path / 'state'), 'CF_ORCH_POSIX': 'p'})
+    monkeypatch.setattr(supervisor.subprocess, 'Popen', popen)
+    try:
+        with pytest.raises(OSError):
+            Service(_Installer(root)).ensure('a' * 64)
+        assert docker.names() == ['running-evaluation-box']
+    finally:
+        holder.kill()
+        holder.wait()

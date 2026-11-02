@@ -8,12 +8,14 @@ verilator=$(verilator --version)
 yosys=$(yosys -V)
 python=$(python3.13 --version)
 case "$verilator" in 'Verilator 5.038 '*g318b1c1a3*) ;; *) echo "Verilator parity mismatch: $verilator" >&2; exit 1;; esac
-case "$yosys" in 'Yosys 0.56+197 (git sha1 d4c4b2106,'*) ;; *) echo "Yosys parity mismatch: $yosys" >&2; exit 1;; esac
+case "$yosys" in 'Yosys 0.56+197-cf1 (git sha1 d4c4b2106,'*) ;; *) echo "Yosys parity mismatch: $yosys" >&2; exit 1;; esac
 test "$python" = "Python $PYTHON_VERSION"
 test "$(cat /opt/cf/git/verilator)" = "$VERILATOR_COMMIT"
 test "$(cat /opt/cf/git/yosys)" = "$YOSYS_COMMIT"
+test "$(cat /opt/cf/git/yosys-patch)" = "$YOSYS_PATCH_SHA256"
 test "$(cat /opt/cf/git/yosys-abc)" = "$YOSYS_ABC_COMMIT"
 printf 'verilator %s\nyosys %s\npython %s\n' "$verilator" "$yosys" "$python"
+printf 'yosys.patch.sha256 %s\n' "$YOSYS_PATCH_SHA256"
 for tool in verilator yosys yosys-abc orfs cacti; do
     printf '%s.git %s\n' "$tool" "$(cat /opt/cf/git/$tool)"
 done

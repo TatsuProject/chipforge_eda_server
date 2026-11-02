@@ -46,6 +46,21 @@ def test_box_stages_pinned_and_in_build_context():
         assert word not in docker.lower()
 
 
+def test_yosys_patch_is_verified_before_build_and_has_a_distinct_identity():
+    import hashlib
+    patch = 'yosys-d4c4b2106-shiftadd-bsigned.patch'
+    assert hashlib.sha256((HERE / patch).read_bytes()).hexdigest() == pins()['YOSYS_PATCH_SHA256']
+    assert '!' + patch in (HERE / '.dockerignore').read_text().splitlines()
+    stage = (HERE / 'Dockerfile').read_text().split('FROM base AS yosys\n')[1].split('\nFROM ')[0]
+    assert f'COPY {patch} /opt/cf/' in stage
+    steps = ('git checkout', 'sha256sum -c', 'git apply', 'make -j2', 'make install')
+    assert [stage.index(s) for s in steps] == sorted(stage.index(s) for s in steps)
+    assert stage.count('YOSYS_VER=0.56+197-cf1') == 2
+    versions = (HERE / 'VERSIONS.sh').read_text()
+    assert "'Yosys 0.56+197-cf1 (git sha1 d4c4b2106,'" in versions
+    assert 'test "$(cat /opt/cf/git/yosys-patch)" = "$YOSYS_PATCH_SHA256"' in versions
+
+
 def test_compose_is_v2_only():
     services = compose()['services']
     assert set(services) == {'eda-gateway', 'cf-compiler', 'cf-rtl', 'cf-sta', 'v2-evaluator'}
@@ -79,4 +94,19 @@ def test_images_lock_pins_every_compose_image_by_digest():
     rows = [line.split() for line in (REPO / 'images.lock').read_text().splitlines()
             if line.strip() and not line.lstrip().startswith('#')]
     assert {r[0] for r in rows} == want and len(rows) == len(want)
-    assert all(len(r) == 2 and re.fullmatch(r'docker\.io/logicx101/chipforge-v2-[a-z]+@sha256:[0-9a-f]{64}', r[1]) for r in rows)
+    pending = 'PENDING_DOCKER_HUB_YOSYS_CF1_DIGEST'
+    for name, ref in rows:
+        if ref == pending:
+            assert name == 'chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1'
+        else:
+            assert re.fullmatch(r'docker\.io/logicx101/chipforge-v2-[a-z]+@sha256:[0-9a-f]{64}', ref)
+
+
+def test_pending_registry_digest_cannot_be_pulled(tmp_path):
+    import subprocess
+    import shutil
+    shutil.copy2(REPO / 'pull_images.sh', tmp_path)
+    (tmp_path / 'images.lock').write_text(
+        'chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1 PENDING_DOCKER_HUB_YOSYS_CF1_DIGEST\n')
+    result = subprocess.run(['bash', str(tmp_path / 'pull_images.sh')], capture_output=True, text=True)
+    assert result.returncode == 2 and 'is not a digest reference' in result.stderr

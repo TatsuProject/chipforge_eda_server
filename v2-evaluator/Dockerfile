@@ -108,15 +108,19 @@ RUN . /opt/cf/pins.env \
  && git rev-parse HEAD > /out/opt/cf/git/verilator
 
 FROM base AS yosys
+COPY yosys-d4c4b2106-shiftadd-bsigned.patch /opt/cf/
 RUN . /opt/cf/pins.env \
  && retry() { n=0; until "$@"; do n=$((n+1)); [ "$n" -lt 5 ] || return 1; echo "retry $n: $*" >&2; sleep $((n*10)); done; } \
  && retry sh -c 'rm -rf /src && git clone https://github.com/YosysHQ/yosys /src' \
  && cd /src && git checkout "$YOSYS_COMMIT" \
  && test "$(git rev-parse HEAD)" = "$YOSYS_COMMIT" \
+ && echo "$YOSYS_PATCH_SHA256  /opt/cf/yosys-d4c4b2106-shiftadd-bsigned.patch" | sha256sum -c - \
+ && git apply /opt/cf/yosys-d4c4b2106-shiftadd-bsigned.patch \
  && retry git submodule update --init --recursive \
- && make -j2 CONFIG=gcc PREFIX=/usr/local \
- && make install CONFIG=gcc PREFIX=/usr/local DESTDIR=/out \
+ && make -j2 CONFIG=gcc PREFIX=/usr/local YOSYS_VER=0.56+197-cf1 \
+ && make install CONFIG=gcc PREFIX=/usr/local YOSYS_VER=0.56+197-cf1 DESTDIR=/out \
  && mkdir -p /out/opt/cf/git \
+ && printf '%s\n' "$YOSYS_PATCH_SHA256" > /out/opt/cf/git/yosys-patch \
  && git rev-parse HEAD > /out/opt/cf/git/yosys \
  && git -C abc rev-parse HEAD > /out/opt/cf/git/yosys-abc \
  && git submodule status --recursive > /out/opt/cf/git/yosys-submodules

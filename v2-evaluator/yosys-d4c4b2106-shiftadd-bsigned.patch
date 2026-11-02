@@ -1,0 +1,13 @@
+diff --git a/passes/opt/peepopt_shiftadd.pmg b/passes/opt/peepopt_shiftadd.pmg
+index 58dbefc12..fe1f94029 100644
+--- a/passes/opt/peepopt_shiftadd.pmg
++++ b/passes/opt/peepopt_shiftadd.pmg
+@@ -83,6 +83,8 @@ match add
+ 	filter !(!offset_negative && varport_signed)
+ 	// -> data >> (var-c) (with var unsigned) is illegal
+ 	filter !(offset_negative && !varport_signed)
++	// shift must read B with the add/sub signedness (upstream a74edc9be, YosysHQ/yosys#6256)
++	filter varport_signed == (param(shift, \B_SIGNED).as_bool() && !msb_zeros)
+ 
+ 	// state-variables are assigned at the end only:
+ 	// shift the log2scale offset in-front of add to get true value: (var+c)<<N -> (var<<N)+(c<<N)

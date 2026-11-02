@@ -60,7 +60,7 @@ services:
   v2-evaluator:
     platform: linux/amd64
     build: { context: ./v2-evaluator }
-    image: chipforge_eda_server-v2-evaluator:2.0-r63
+    image: chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1
     pull_policy: never
     depends_on:
       cf-compiler: { condition: service_completed_successfully }

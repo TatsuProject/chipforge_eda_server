@@ -11,7 +11,7 @@ reuses it until a new one is released.
 ## Requirements
 
 - Linux x86-64 with cgroup v2 (Ubuntu 22.04 or 24.04), Docker Engine with the Compose plugin.
-- Validators: EC2 c7a.4xlarge (16 cores, 32 GiB RAM) or better, 300 GiB disk, on a machine used only for this.
+- Validators: 16 cores and 64 GB RAM minimum (e.g. EC2 m7a.4xlarge), 300 GiB disk, on a machine used only for this.
 - Miners: the same for a full evaluation; a smaller machine runs the quick checks.
 - Data directories on a local ext4 or xfs filesystem (NTFS, FUSE, SMB and NFS are refused).
 - Outbound HTTPS. No inbound access is needed.

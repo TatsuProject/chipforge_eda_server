@@ -48,7 +48,11 @@ as well. `regenerate-locks.py` regenerates locks from explicitly provided compon
 venvs; review version changes and wheel URLs before committing.
 
 Tool parity checks version and git SHA, as required by the lead decision. Yosys's
-reported build compiler may differ from the laptop. DRAMsim3 checks both upstream
+reported build compiler may differ from the laptop. Yosys remains pinned to
+`d4c4b2106697f62852cce03cd98eb78395a7779c` with upstream `a74edc9be`
+(PR #6256, shiftadd B signedness) backported as `0.56+197-cf1`. The build
+verifies `YOSYS_PATCH_SHA256` before applying the patch; startup checks and records
+that hash as well as the source commit. DRAMsim3 checks both upstream
 archive and patched controller hashes; the observer overlay is the same small
 public-library integration patch used by the native backend. The shared library
 can differ in bytes across build toolchains.
@@ -107,3 +111,33 @@ and failed checks) in
 `$CF_V2_ROOT/logs/install/<sha>.<step>.log` (mode 0600). The container log prints the log's path
 (`install failed: ... log=...`) and `GET /health` lists it under `install_failures`; neither
 contains the output itself.
+
+## Yosys-only v2.0.5 candidate
+
+When the original `chipforge_eda_server-v2-evaluator:2.0-r63` runtime is local,
+`nice -n 10 ./v2-evaluator/build-yosys-patch.sh` builds
+`chipforge/v2-evaluator:2.0.5-rc-yosys` using Docker BuildKit. The script checks the
+original image ID, and the build checks all original tool pins before changing
+Yosys. Compilation uses two jobs in a temporary RAM filesystem; other tools,
+including the shipped ABC binary, remain byte-identical. This avoids rebuilding
+all dependencies or storing Yosys source and object layers on the Docker disk.
+The full-source Dockerfile also carries the same SHA-checked patch.
+
+Run the miscompile regression against the candidate:
+
+```sh
+nice -n 10 docker run --rm --network none --read-only --tmpfs /tmp:rw,size=128m \
+  -e CF_YOSYS_FIXED=1 -v "$PWD/v2-evaluator/tests:/tests:ro" \
+  --entrypoint /usr/bin/nice chipforge/v2-evaluator:2.0.5-rc-yosys -n 10 \
+  /opt/cf/venv/orchestrator/bin/python -m pytest -p no:cacheprovider \
+  /tests/test_peepopt_shiftadd.py -q
+```
+
+`tests/replay_yosys_blocks.py` replays cached block inputs sequentially inside an
+image. Compare old/new `mapped.v` after removing only the first generated-version
+line; every synthesis must succeed. Release measurements and the precise pin
+handoff live in `releases/2.0.5-yosys.json`. The candidate is local: its config
+ID and content identity are distinct from a registry manifest digest. The release
+publisher must push, obtain the registry digest, update the signed evaluator's
+pins/image manifest and this repository's `images.lock`, then sign the archive.
+The existing published image reference stays valid until that release step.

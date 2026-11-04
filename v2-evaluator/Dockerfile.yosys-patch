@@ -1,0 +1,27 @@
+# BuildKit keeps source/object files off the Docker data filesystem.
+# build-yosys-patch.sh verifies this local runtime's config ID before building.
+ARG RUNTIME=chipforge_eda_server-v2-evaluator:2.0-r63
+FROM ${RUNTIME} AS yosys_patch
+COPY pins.env yosys-d4c4b2106-shiftadd-bsigned.patch /opt/cf/patch/
+RUN --mount=type=tmpfs,target=/src nice -n 10 sh -eu -c '\
+    . /opt/cf/patch/pins.env; \
+    grep -v "^YOSYS_PATCH_SHA256=" /opt/cf/patch/pins.env > /tmp/expected-pins; \
+    cmp /tmp/expected-pins /opt/cf/pins.env; \
+    cd /src; git init; git remote add origin https://github.com/YosysHQ/yosys; \
+    git fetch --depth 1 origin "$YOSYS_COMMIT"; git checkout FETCH_HEAD; \
+    test "$(git rev-parse HEAD)" = "$YOSYS_COMMIT"; \
+    echo "$YOSYS_PATCH_SHA256  /opt/cf/patch/yosys-d4c4b2106-shiftadd-bsigned.patch" | sha256sum -c -; \
+    git apply /opt/cf/patch/yosys-d4c4b2106-shiftadd-bsigned.patch; \
+    git submodule update --init --recursive --depth 1; \
+    test "$(git -C abc rev-parse HEAD)" = "$YOSYS_ABC_COMMIT"; \
+    make -j2 CONFIG=gcc PREFIX=/usr/local YOSYS_VER=0.56+197-cf1 ABCEXTERNAL=/usr/local/bin/yosys-abc; \
+    make install CONFIG=gcc PREFIX=/usr/local YOSYS_VER=0.56+197-cf1 ABCEXTERNAL=/usr/local/bin/yosys-abc DESTDIR=/out; \
+    mkdir -p /out/opt/cf/git; \
+    git rev-parse HEAD > /out/opt/cf/git/yosys; \
+    printf "%s\n" "$YOSYS_PATCH_SHA256" > /out/opt/cf/git/yosys-patch'
+
+FROM ${RUNTIME}
+COPY --from=yosys_patch /out/ /
+COPY pins.env VERSIONS.sh /opt/cf/
+RUN nice -n 10 /opt/cf/VERSIONS.sh > /opt/cf/VERSIONS.txt \
+ && cat /opt/cf/VERSIONS.txt

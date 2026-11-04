@@ -1,0 +1,171 @@
+{
+  "schema": "cf-yosys-release-handoff/1",
+  "release": "2.0.5",
+  "candidate_local_tag": "chipforge/v2-evaluator:2.0.5-rc-yosys",
+  "release_local_tag": "chipforge_eda_server-v2-evaluator:2.0.5-yosys-cf1",
+  "image_id": "sha256:c2fb0b3f4892640810efb50a6117c940085913dfa5615d45fafbf848a9332bdc",
+  "image_content": "sha256:08e4be880102774738c9370b7b94af99dc1102439c90ee37b706a505a28551a4",
+  "unpatched_base_image_id": "sha256:e3b79874d55d0c476890ecdcbc5dd1df046230b44e0738e1315634d9b41f8425",
+  "unpatched_base_image_content": "sha256:f05e03620c75fff07b2b09fc8bf413e24ed519745f680a3e4f17de0ef414ea25",
+  "registry_manifest_digest": null,
+  "registry_manifest_digest_status": "Unknown until owner publication; no image was pushed.",
+  "source_commit": "d4c4b2106697f62852cce03cd98eb78395a7779c",
+  "upstream_patch": "a74edc9be (YosysHQ/yosys PR #6256)",
+  "patch_sha256": "e17f21a1ce312c5887d3817876f2647464f6114a386d8a2232129b95e4132e53",
+  "yosys": "Yosys 0.56+197-cf1 (git sha1 d4c4b2106, g++ 13.3.0-6ubuntu2~24.04.1 -fPIC -O3)",
+  "archive": {
+    "filename": "chipforge-v2-evaluator_2.0.5-yosys-cf1.tar",
+    "sha256": "790a75ea5527c5441f6a88b3df47a65d1ad21caa4dd309e3b575fff193bf0dd5",
+    "bytes": 2828609536
+  },
+  "previous_release": {
+    "runtime_image": "chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1",
+    "image_id": "sha256:311dee56e7c6d970308381d509da0ea48e8b00334eaf1b3f8226352da002c5ce",
+    "image_content": "sha256:a2bc23bced1727aa7b8e9e128195e1d05541a7d7daeab65f520baaf1e4b7a893",
+    "registry_ref": "docker.io/logicx101/chipforge-v2-evaluator@sha256:6153f27317a8aa0593f6704ef5a666b39e8735eee3c5cdc328aecedb327939f7"
+  },
+  "validator_pins_changes": [
+    {
+      "op": "test",
+      "path": "/runtime_image",
+      "value": "chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1"
+    },
+    {
+      "op": "test",
+      "path": "/images/chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1",
+      "value": "sha256:311dee56e7c6d970308381d509da0ea48e8b00334eaf1b3f8226352da002c5ce"
+    },
+    {
+      "op": "test",
+      "path": "/image_content/chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1",
+      "value": "sha256:a2bc23bced1727aa7b8e9e128195e1d05541a7d7daeab65f520baaf1e4b7a893"
+    },
+    {
+      "op": "remove",
+      "path": "/images/chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1"
+    },
+    {
+      "op": "remove",
+      "path": "/image_content/chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1"
+    },
+    {
+      "op": "add",
+      "path": "/images/chipforge_eda_server-v2-evaluator:2.0.5-yosys-cf1",
+      "value": "sha256:c2fb0b3f4892640810efb50a6117c940085913dfa5615d45fafbf848a9332bdc"
+    },
+    {
+      "op": "add",
+      "path": "/image_content/chipforge_eda_server-v2-evaluator:2.0.5-yosys-cf1",
+      "value": "sha256:08e4be880102774738c9370b7b94af99dc1102439c90ee37b706a505a28551a4"
+    },
+    {
+      "op": "replace",
+      "path": "/runtime_image",
+      "value": "chipforge_eda_server-v2-evaluator:2.0.5-yosys-cf1"
+    }
+  ],
+  "validator_pins_unchanged": [
+    "yosys (already cf1 in v2.0.2)",
+    "verilator",
+    "python",
+    "components",
+    "schema_sha256",
+    "all compiler/RTL/STA image pins"
+  ],
+  "deploy_images_runtime_entry": {
+    "name": "chipforge_eda_server-v2-evaluator:2.0.5-yosys-cf1",
+    "tarball": "chipforge-v2-evaluator_2.0.5-yosys-cf1.tar",
+    "tarball_sha256": "790a75ea5527c5441f6a88b3df47a65d1ad21caa4dd309e3b575fff193bf0dd5",
+    "bytes": 2828609536,
+    "role": "runtime",
+    "source": "Local Docker BuildKit rebuild over original e3b79874 runtime, SHA-checked upstream a74edc9be backport only, shipped ABC preserved; v205-yosys evidence.",
+    "registry_ref": null
+  },
+  "eda_deployment_after_publication": {
+    "docker-compose.yml": "Set services.v2-evaluator.image to chipforge_eda_server-v2-evaluator:2.0.5-yosys-cf1",
+    "images.lock": "Replace evaluator line with chipforge_eda_server-v2-evaluator:2.0.5-yosys-cf1 docker.io/logicx101/chipforge-v2-evaluator@sha256:<owner-measured-registry-manifest-digest>"
+  },
+  "source_pins_changed_from_branch_head": [],
+  "compared_to_unpatched_r63": {
+    "yosys_version": "0.56+197 -> 0.56+197-cf1",
+    "YOSYS_PATCH_SHA256": "absent -> e17f21a1ce312c5887d3817876f2647464f6114a386d8a2232129b95e4132e53"
+  },
+  "runtime_configuration_unchanged": true,
+  "original_layers_retained": 16,
+  "added_layers": 3,
+  "yosys_binary_sha256": "04ebb7052ce07b84fe83528ea32583d66906608d871848bc19653646892a9366",
+  "unchanged_abc_binary_sha256": "4c6494e338f0912f23a143b747536dd0cc444075dc092b1325d993f2909ca959",
+  "fixed_mode_regressions_passed": 4,
+  "smoke": "C1_SMOKE_PASS",
+  "ref2k": {
+    "blocks": 10,
+    "old_synthesis_successes": 10,
+    "new_synthesis_successes": 10,
+    "byte_identical_excluding_first_generated_version_line": 10,
+    "comparison": "Direct streaming byte comparison; SHA256 and prior w6 MD5 independently checked.",
+    "all_match_prior_investigation": true,
+    "results": [
+      {
+        "key": "13979a1a142df8c29c7e9e05aa09a72b4b20ca55fc2abda27cc350dc710d21df",
+        "sha256_excluding_generated_header": "cce5cc541ef80a904a6967fa6a150342fbb15ba39329696a064260f8bf4b63cf",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      },
+      {
+        "key": "1b004b7b9e44dd0660130f0e63c3e5938286b24aebfe0583305c41d71f19cfde",
+        "sha256_excluding_generated_header": "b011d2c27154db9872ee3db760138a492dad597f07377bc8a7a8e90b12700aa8",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      },
+      {
+        "key": "3913d2b667bcfbf5c808d7952e0ec444a959e212b35b65fbcfd50f924841366d",
+        "sha256_excluding_generated_header": "c617bbbc8829888b13f61dba7e34d222409cddc51a525e3018e725647722c14d",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      },
+      {
+        "key": "48ae7dab3031f0fe8198c27936a59cc4dc313dd18d4ef8796ecf71f64e614320",
+        "sha256_excluding_generated_header": "5f0a43cc7e42b0113b83758dadbc0287e3d2a3cd78580b82cb35f26a736fae97",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      },
+      {
+        "key": "4b5a031bbd70dfd3a7fc34f83d3a6274929e0f71579f438d9f06a7d6d452b7a0",
+        "sha256_excluding_generated_header": "0262e8de427c9330b8da9ac66abcceff5fb6e33d02824666b2cc3263423cd304",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      },
+      {
+        "key": "89e14fe287ad3461c6ab467eae97deeddf0ccd8e8764721664e1a0ac4e5cdab5",
+        "sha256_excluding_generated_header": "17a915bdbb14f34fcf9498766a5fdf76d73f7bd54067818294ce56074c962f8f",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      },
+      {
+        "key": "9c27297f8cd8b8ddad23fed9488cef3f8bdb4215a8bfedec20317ce66ca3faa7",
+        "sha256_excluding_generated_header": "b24168fcf652ca67c59fee4d1261cce982f2b3297283004642885aa2091fad17",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      },
+      {
+        "key": "a1ad04d212040c8ab5109af2c838e36780facb13bb8e80d5f1f9c2c9645e210f",
+        "sha256_excluding_generated_header": "8373b9ee2afa253fbc49de830b5932a82a7a4f12f51504e3563468ffe53bc063",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      },
+      {
+        "key": "b54ca3a071f68ee19c196967e375fc12b62eb86903357546c38224df201131a3",
+        "sha256_excluding_generated_header": "f9b12d0efc4502e849162ccbac5ad89bc079a797188fa22d35700f2f16a2c695",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      },
+      {
+        "key": "e3581e976e8fe29da053fcb6c6a7d0029f287aec2cae68ea2de5f57e0a917eec",
+        "sha256_excluding_generated_header": "830b92bb0dc2f8d7d27c35cd3b1339f9670cc201a9075ef30b62b540bfa6085f",
+        "byte_compare_equal": true,
+        "matches_w6_old_and_patched": true
+      }
+    ]
+  },
+  "evidence_directory": "/mnt/ssd/chipforge/runs/2026-11-04-v205-yosys"
+}

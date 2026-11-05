@@ -648,3 +648,24 @@ def test_recovered_job_refused_on_resubmission_releases_its_old_slot(tmp_path, m
         assert runtime.retry_after['old'] > time.monotonic() and not runtime.start_failures
     finally:
         runtime.close()
+
+
+def test_kernel_witnessed_service_oom_is_terminal_then_next_job_restarts(tmp_path, monkeypatch):
+    from loader import cgroups
+    kills = [0]
+    monkeypatch.setattr(cgroups, 'oom_kills', lambda: kills[0])
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=1.5)
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        request('POST', '/evaluate', dict(design_zip=b'd', evaluator_zip=archive, request_id='oom'))
+        wait_until(lambda: runtime.job('oom')['forwarded'])
+        old_pid = runtime.service.proc.pid
+        kills[0] += 1
+        os.kill(old_pid, signal.SIGKILL)
+        status, _, body = wait_until(lambda: terminal(request, 'oom'))
+        doc = json.loads(body)
+        assert doc['status'] == 'ERROR' and doc['score'] is None
+        assert doc['problems'][0]['code'] == 'EVALUATOR_SERVICE_EXITED'
+        assert doc['problems'][0]['fault'] == 'system'
+        assert request('POST', '/evaluate', dict(design_zip=b'd2', evaluator_sha256=sha, request_id='after-oom'))[0] == 202
+        assert wait_until(lambda: terminal(request, 'after-oom'))[2] == RAW
+        assert runtime.service.proc.pid != old_pid

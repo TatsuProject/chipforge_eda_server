@@ -18,6 +18,7 @@ services:
       context: ./gateway
       dockerfile: Dockerfile
     restart: unless-stopped
+    oom_score_adj: -900
     ports:
       # 127.0.0.1 by default: /v2/evaluate runs evaluator code. Set EDA_BIND_ADDRESS=0.0.0.0 in
       # .env only behind a firewall (see .env.example).
@@ -60,7 +61,7 @@ services:
   v2-evaluator:
     platform: linux/amd64
     build: { context: ./v2-evaluator }
-    image: chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1
+    image: chipforge_eda_server-v2-evaluator:2.0.5-ship
     pull_policy: never
     depends_on:
       cf-compiler: { condition: service_completed_successfully }
@@ -68,6 +69,9 @@ services:
       cf-sta: { condition: service_completed_successfully }
     restart: unless-stopped
     privileged: true
+    # configure-memory.py writes host RAM minus 4 GiB; direct compose has a conservative fallback.
+    mem_limit: ${CF_V2_EVALUATOR_MEMORY_LIMIT:-4g}
+    memswap_limit: ${CF_V2_EVALUATOR_MEMORY_LIMIT:-4g}
     pid: host
     cgroup: host
     stop_grace_period: 30m

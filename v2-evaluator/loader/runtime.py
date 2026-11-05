@@ -330,6 +330,11 @@ class Runtime:
             return
         self.retry_after.pop(job['request_id'], None)
         try:
+            if job.get("forwarded") and self.service.sha == job["sha"] and self.service.was_oom_killed():
+                # Preserve a terminal, unscored result before restarting for the next request.
+                self.fail(job, "EVALUATOR_SERVICE_EXITED")
+                self.service.stop()
+                return
             self.service.ensure(job['sha'])
             self.start_failures.pop(job['sha'], None)
             status, headers, body = self.service.request('GET', '/status/' + job['request_id'])

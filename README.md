@@ -363,3 +363,18 @@ make hybrid-stop
 
 MIT License; see `LICENSE`. Support: [Discord](https://discord.com/channels/799672011265015819/1408463235082092564),
 contact@tatsuecosystem.io.
+
+The SHIP evaluator container has a hard RAM ceiling and no swap. Before starting
+it, run `python3 -B configure-memory.py`: an unset
+`CF_V2_EVALUATOR_MEMORY_LIMIT` in `.env` becomes host MemTotal minus 4 GiB reserved
+for the OS, Docker and HTTP services. An explicit value is preserved; size it
+below host RAM with that headroom. `make start` runs this automatically; direct
+Compose use defaults conservatively to 4 GiB until configured. The gateway runs
+outside this ceiling. The loader and gateway use OOM score -900; the evaluator
+service resets to +500. Native stage scopes remain inside the container ceiling;
+sibling tool boxes retain the evaluator's existing individual limits.
+
+If the evaluator service receives SIGKILL and this container's kernel OOM counter
+increased since its launch, the loader finishes its forwarded request with the
+existing `EVALUATOR_SERVICE_EXITED` system ERROR, with no score, before restarting
+for another request. A normal service crash retains existing recovery behavior.

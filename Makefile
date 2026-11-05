@@ -13,6 +13,7 @@ images:
 # the server, then install the evaluator named in .env (CF_V2_EVALUATOR_ZIP) and wait until it is ready. Never
 # builds the 4 pinned images. This is the one command validators run (after git pull).
 start:
+	python3 -B configure-memory.py
 	bash ./pull_images.sh
 	docker compose build eda-gateway
 	docker compose up -d --no-build --remove-orphans

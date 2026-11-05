@@ -185,3 +185,14 @@ def main(argv=None):
     except (OSError, RuntimeError) as exc:
         print('cfscope: ' + str(exc), file=sys.stderr)
         return 1
+
+
+def oom_kills():
+    """Kernel OOM kills in this container's delegated subtree (including stage scopes)."""
+    try:
+        root = current()
+        if root.name == 'service.scope':
+            root = root.parent
+        return int(dict(line.split() for line in (root / 'memory.events').read_text().splitlines())['oom_kill'])
+    except (OSError, KeyError, ValueError):
+        return None

@@ -7,6 +7,8 @@ from .cgroups import setup
 
 
 def main():
+    # Protect the loader HTTP endpoint; evaluator children reset this before exec.
+    Path("/proc/self/oom_score_adj").write_text("-900")
     setup()
     ptrace_scope = Path('/proc/sys/kernel/yama/ptrace_scope')
     if ptrace_scope.exists() and int(ptrace_scope.read_text()) > 2:

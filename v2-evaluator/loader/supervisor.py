@@ -11,7 +11,7 @@ import tempfile
 import time
 import uuid
 
-from . import boxes
+from . import boxes, cgroups
 from .install import environment, interpreter
 from .security import InstallError, atomic_json
 
@@ -44,7 +44,13 @@ class Service:
         self.sha, self.proc, self.port, self.log_path = None, None, None, None
         self.env = None             # the running service's environment (its state dir and lock paths)
         self.healthy = False
+        self.oom_start = None
         self.not_ready = None       # v2.0.1: the running service's "not ready" reason (RAM plan), or None
+
+    def was_oom_killed(self):
+        count = cgroups.oom_kills()
+        return (self.proc is not None and self.proc.poll() == -signal.SIGKILL
+                and self.oom_start is not None and count is not None and count > self.oom_start)
 
     def _read_health(self, status, body):
         """v2.0.1: 200 healthy; 503 with status "not_ready" is an evaluator ALIVE that waits for RAM (its RAM plan
@@ -124,6 +130,11 @@ class Service:
                 os.replace(self.log_path, self.log_path.with_name('service.log.1'))
         except FileNotFoundError:
             pass
+        self.oom_start = cgroups.oom_kills()
+        # No preexec_fn in this threaded loader: reset the inherited protection before exec.
+        command = [sys.executable, "-B", "-c",
+                   "import os,sys; open('/proc/self/oom_score_adj','w').write('500'); "
+                   "os.execv(sys.argv[1],sys.argv[1:])", *command]
         with open(self.log_path, 'ab') as log:
             self.proc = subprocess.Popen(command, cwd=tree, env=env, stdin=subprocess.DEVNULL,
                                          stdout=log, stderr=log, start_new_session=True)

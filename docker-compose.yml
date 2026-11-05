@@ -60,7 +60,7 @@ services:
   # Automatic authenticated evaluator install and cgroup-v2 stage scopes.
   v2-evaluator:
     platform: linux/amd64
-    build: { context: ./v2-evaluator }
+    build: { context: ./v2-evaluator, dockerfile: Dockerfile.ship }
     image: chipforge_eda_server-v2-evaluator:2.0.5-ship
     pull_policy: never
     depends_on:

@@ -97,7 +97,7 @@ def test_images_lock_pins_every_compose_image_by_digest():
     pending = 'PENDING_DOCKER_HUB_YOSYS_CF1_DIGEST'
     for name, ref in rows:
         if ref == pending:
-            assert name == 'chipforge_eda_server-v2-evaluator:2.0.2-yosys-cf1'
+            assert name == 'chipforge_eda_server-v2-evaluator:2.0.5-ship'
         else:
             assert re.fullmatch(r'docker\.io/logicx101/chipforge-v2-[a-z]+@sha256:[0-9a-f]{64}', ref)
 

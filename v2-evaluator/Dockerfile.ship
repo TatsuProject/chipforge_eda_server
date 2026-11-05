@@ -1,0 +1,4 @@
+# Preserve the qualified Yosys-only overlay and every other proven runtime tool.
+ARG RUNTIME=chipforge/v2-evaluator:2.0.5-ship-yosys
+FROM ${RUNTIME}
+COPY loader /opt/cf/loader

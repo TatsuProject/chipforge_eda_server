@@ -131,3 +131,69 @@ def test_cancel_that_loses_to_backend_completion_keeps_the_real_result(tmp_path,
         assert runtime.job('orphan')['error'] is None
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize('forwarded', [False, True])
+def test_legacy_service_refusal_finishes_without_fence_flag(tmp_path, monkeypatch, forwarded):
+    runtime = seeded(tmp_path)
+    service = runtime.root / 'evaluators' / ('a' * 64) / 'v2/deploy/service.py'
+    service.parent.mkdir(parents=True)
+    service.write_text('import argparse\nargparse.ArgumentParser().parse_args()\n')
+    with runtime.db() as db:
+        db.execute('UPDATE jobs SET forwarded=?', (int(forwarded),))
+    monkeypatch.setattr(runtime.service, 'ensure', lambda sha: None)
+    monkeypatch.setattr(runtime.service, 'request', lambda *a: (404, {}, b'{}'))
+    monkeypatch.setattr(runtime.service, 'submit', lambda *a: (400, {}, b'{}'))
+    try:
+        runtime.tick(runtime.job('orphan'))
+        assert runtime.job('orphan')['phase'] == 'done'
+        assert runtime.job('orphan')['error'] == 'EVALUATOR_SERVICE_REJECTED'
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize('during_error_handler', [False, True])
+def test_temporary_fence_failure_keeps_other_requests_pending(tmp_path, monkeypatch, during_error_handler):
+    import loader.runtime as module
+    runtime = seeded(tmp_path)
+    body = system_error(runtime.job('orphan'), 'EVALUATOR_SERVICE_EXITED')
+    with runtime.db() as db:
+        db.execute("UPDATE jobs SET phase='fencing',response=?,response_type='application/json',error='EVALUATOR_SERVICE_EXITED'", (body,))
+        db.execute("INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,forwarded) "
+                   "VALUES('waiting',?,1,'T2','miner','hash','unused','queued',1,0)", ('a' * 64,))
+    calls = []
+    def unavailable(*args):
+        calls.append('fence')
+        if len(calls) == 2:
+            runtime.stop_event.set()
+        raise InstallError('EVALUATOR_FENCE_FAILED')
+    runtime.tools_ready = not during_error_handler
+    if during_error_handler:
+        with runtime.db() as db:
+            db.execute("UPDATE jobs SET phase='running' WHERE request_id='orphan'")
+        def provisioning_failed(*args):
+            raise OSError('temporary provisioning failure')
+        monkeypatch.setattr(module, 'provision_tools', provisioning_failed)
+    monkeypatch.setattr(module, 'fence', unavailable)
+    try:
+        runtime.dispatch()
+        assert runtime.job('waiting')['phase'] == 'queued'
+        assert runtime.job('waiting')['response'] is None
+        assert runtime.job('orphan')['phase'] == 'fencing'
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize('code', ['EVALUATOR_SERVICE_EXITED', 'EVALUATOR_SERVICE_REJECTED', 'EVALUATION_CANCELLED'])
+@pytest.mark.parametrize('status', ['PASSED', 'REJECTED'])
+def test_infrastructure_fence_preserves_committed_result(tmp_path, monkeypatch, code, status):
+    import loader.runtime as module
+    runtime = seeded(tmp_path)
+    real = {'request_id': 'orphan', 'status': status, 'score': {'score': 1}}
+    monkeypatch.setattr(module, 'fence', lambda *a: {'completed_response': real, 'fenced': True, 'drained': True})
+    try:
+        runtime.fail(runtime.job('orphan'), code)
+        assert json.loads(runtime.job('orphan')['response']) == real
+        assert runtime.job('orphan')['error'] is None
+    finally:
+        runtime.close()

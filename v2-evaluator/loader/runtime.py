@@ -277,7 +277,7 @@ class Runtime:
                                    (body, content_type, error, job['request_id']))
                     drained = fence(self.root, self.installer.salt, current, body)
                     completed = (drained or {}).get('completed_response')
-                    if error == 'EVALUATION_CANCELLED' and completed:
+                    if completed:
                         body = json.dumps(completed).encode()
                         if not any(p.get('code') == error for p in completed.get('problems', [])):
                             error = None
@@ -353,14 +353,16 @@ class Runtime:
                 self.tools_error = 'LOADER_INFRASTRUCTURE_UNAVAILABLE'
                 with self.db() as db:
                     pending = [dict(r) for r in db.execute("SELECT * FROM jobs WHERE phase!='done'")]
+                fencing_pending = any(j['phase'] == 'fencing' for j in pending)
                 for job in pending:
                     try:
                         if job['phase'] == 'fencing':
                             self.finish(job, job['response'], job['response_type'], job['error'])
-                        else:
+                        elif not fencing_pending:
                             self.fail(job, self.tools_error)
                     except Exception:
-                        pass  # Keep the durable intent, never expose an unfenced terminal response.
+                        # A fence started in this handler may also need another pass.
+                        fencing_pending = True
             self.wakeup.wait(0.25)
             self.wakeup.clear()
 

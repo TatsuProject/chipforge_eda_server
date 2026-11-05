@@ -21,13 +21,15 @@ def request_lock(root, rid):
 def fence(root, salt, job, response):
     """Success means the evaluator durably fenced admission/recovery and verified its drain.
 
-    Never publish a terminal infrastructure response on an unverified/unsupported fence.
+    Legacy evaluators without the hook retain their pre-fencing lifecycle behaviour.
     """
     tree = Path(root) / 'evaluators' / job['sha']
     service = tree / 'v2/deploy/service.py'
     if not service.is_file():
         if job['forwarded']:
             raise InstallError('EVALUATOR_FENCE_FAILED')
+        return {'fenced': True, 'drained': True, 'jobs': []}
+    if b'--fence-request' not in service.read_bytes():
         return {'fenced': True, 'drained': True, 'jobs': []}
     env = environment(Path(root), job['sha'], Path(salt))
     try:

@@ -163,3 +163,38 @@ print('NO_REPLAY_AFTER_LEASE_EXPIRY')
             sibling.wait()
         if sibling_box is not None:
             subprocess.run(['docker', 'rm', '-f', sibling_box], capture_output=True)
+
+
+@pytest.mark.skipif(not os.environ.get('CF_REAL_EVALUATOR_SOURCE'), reason='explicit real evaluator source required')
+@pytest.mark.parametrize('verdict', ['PASSED', 'REJECTED'])
+def test_service_sigkill_after_queue_completion_preserves_verdict(tmp_path, monkeypatch, verdict):
+    source = Path(os.environ['CF_REAL_EVALUATOR_SOURCE']).resolve()
+    monkeypatch.setenv('CF_MEMORY', '1GiB')
+    monkeypatch.setenv('CF_CPUS', '1')
+    monkeypatch.setenv('CF_V2_ROOT', str(tmp_path / 'root'))
+    sha = 'b' * 64
+    runtime = Runtime(tmp_path / 'root', tmp_path / 'salt', allow_unsigned=True, modes=('DEV',))
+    (runtime.root / 'evaluators' / sha).symlink_to(source, target_is_directory=True)
+    policy = tmp_path / 'policy.json'
+    policy.write_text(json.dumps({'DEV': {'workloads': ['fixture'], 'populations': {'ss': 1, 'offline': 0}}}))
+    monkeypatch.setattr(runtime.installer, 'ready', lambda _: {'manifest': {'service': 'v2/deploy/service.py', 'policy': str(policy)}})
+    env = environment(runtime.root, sha, runtime.installer.salt)
+    real = {'request_id': 'completed', 'status': verdict, 'score': {'score': 1} if verdict == 'PASSED' else None}
+    try:
+        runtime.service.ensure(sha)
+        with runtime.db() as db:
+            db.execute("INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,forwarded) "
+                       "VALUES('completed',?,1,'DEV','miner','hash','unused','running',0,1)", (sha,))
+        seed = 'import json,sys\nsys.path.insert(0,sys.argv[1]); import service\nstate,posix=sys.argv[2:4]\nq=service.connect_orchestrator(state,posix)\nwith service.database(state) as db:\n db.execute("INSERT INTO requests(request_id,upload_sha256,submitter,mode,policy,upload,created_at) VALUES(\'completed\',\'hash\',\'miner\',\'DEV\',\'{}\',\'unused\',0)")\nsub,_=q.submit(\'http:completed\',\'unused\',\'c\'*64,meta={\'mode\':\'DEV\'})\nlease=q.claim(q.register_worker(\'completed-worker\'))\nreal=json.loads(sys.argv[4])\nq.complete(lease,real[\'status\'],\'a\'*64,response=real)\nwith service.database(state) as db: db.execute("UPDATE requests SET job_id=? WHERE request_id=\'completed\'",(sub,))\n'
+        subprocess.run([sys.executable, '-B', '-c', seed, str(source / 'v2/deploy'), env['CF_ORCH_SSD'],
+                        env['CF_ORCH_POSIX'], json.dumps(real)], env=env, check=True)
+        # No loader dispatch/poll has occurred since the durable queue completion.
+        os.kill(runtime.service.proc.pid, signal.SIGKILL)
+        runtime.service.proc.wait(timeout=10)
+        runtime.tick(runtime.job('completed'))
+        row = runtime.job('completed')
+        assert row['phase'] == 'done'
+        assert json.loads(row['response']) == real
+        assert row['error'] is None
+    finally:
+        runtime.close()

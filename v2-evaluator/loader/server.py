@@ -132,7 +132,7 @@ class Handler(BaseHTTPRequestHandler):
         headers = {'X-Request-ID': job['request_id'], 'X-CF-Evaluator-Sha256': job['sha'],
                    'X-CF-Evaluator-Unsigned': str(int(bool(installed and installed['unsigned']))),
                    'X-CF-Phase': job['phase'], 'Location': '/status/' + job['request_id']}
-        if job['response'] is not None:
+        if job['phase'] == 'done' and job['response'] is not None:
             headers['Content-Type'] = job['response_type']
             return self.send(200, job['response'], headers)
         headers['Retry-After'] = '5'

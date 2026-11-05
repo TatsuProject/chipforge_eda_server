@@ -18,10 +18,15 @@ from pathlib import Path
 ap = argparse.ArgumentParser()
 for x in ('host','port','state','posix','policy','workers','cores','lanes'): ap.add_argument('--'+x)
 ap.add_argument('--allow-runc', action='store_true')
-ap.add_argument('--cancel'); ap.add_argument('--reason')
+ap.add_argument('--cancel'); ap.add_argument('--reason'); ap.add_argument('--fence-request')
 a = ap.parse_args()
 state = Path(a.state)
 state.mkdir(parents=True, exist_ok=True)
+if a.fence_request:
+    import sys
+    body = json.load(sys.stdin)
+    (state / (a.fence_request + '.cancelled')).write_text(json.dumps(body))
+    print(json.dumps(dict(fenced=True, drained=True))); raise SystemExit(0)
 if a.cancel:                                   # operator cancellation (service.py --cancel contract)
     p = state / (a.cancel + '.json')
     if not p.exists():
@@ -43,7 +48,7 @@ class H(BaseHTTPRequestHandler):
         p = state / (self.path.rsplit('/',1)[-1] + '.json')
         if not p.exists(): return self.send(404,b'{{}}')
         if p.with_suffix('.cancelled').exists():
-            return self.send(200,b'{{"status":"ERROR","problems":[{{"code":"EVALUATION_CANCELLED"}}]}}')
+            return self.send(200,p.with_suffix('.cancelled').read_bytes())
         if p.with_suffix('.done-without-response').exists():   # an older evaluator's terminal row, no result
             return self.send(202,b'{{"state":"done"}}')
         t = json.loads(p.read_text())['time']

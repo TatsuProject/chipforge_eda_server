@@ -19,6 +19,7 @@ import subprocess
 import sys
 
 from .install import environment, interpreter
+from .lifecycle import fence, request_lock
 from .runtime import system_error
 
 CODE = 'EVALUATION_CANCELLED'
@@ -52,11 +53,41 @@ def evaluator_cancel(root, salt, job, reason):
 
 
 def cancel(root, salt, rid, reason):
+    from .runtime import ID
+    if not ID.fullmatch(rid):
+        return 3, {'request_id': rid, 'cancelled': False, 'reason': 'unknown request ID'}
+    with request_lock(root, rid):
+        return _cancel(root, salt, rid, reason)
+
+
+def _cancel(root, salt, rid, reason):
     with loader_db(root) as db:
         job = db.execute('SELECT * FROM jobs WHERE request_id=?', (rid,)).fetchone()
     if job is None:
         return 3, {'request_id': rid, 'cancelled': False, 'reason': 'unknown request ID'}
     job = dict(job)
+    if job['forwarded'] or (job['phase'] == 'done' and
+            (Path(root) / 'evaluators' / job['sha'] / 'v2/deploy/service.py').is_file()):
+        body = (job['response'] if job['phase'] == 'fencing' else None) or system_error(
+            job, CODE, detail=f'The validator operator cancelled this evaluation ({reason}). '
+                              'Nothing was scored; resubmit under a new request ID.',
+            title='Evaluation cancelled by the validator')
+        if job['phase'] != 'done':
+            with loader_db(root) as db:
+                db.execute("UPDATE jobs SET phase='fencing',response=?,response_type='application/json',error=? WHERE request_id=? AND phase!='done'",
+                           (body, job['error'] if job['phase'] == 'fencing' else CODE, rid))
+        drained = fence(root, salt, job, body)
+        if job['phase'] == 'done':
+            return 0, {'request_id': rid, 'cancelled': False, 'drained': True, 'reason': 'already finished; its result stands'}
+        completed = (drained or {}).get('completed_response')
+        if completed and not any(p.get('code') == CODE for p in completed.get('problems', [])):
+            with loader_db(root) as db:
+                db.execute("UPDATE jobs SET phase='done',response=?,error=NULL WHERE request_id=? AND phase='fencing'",
+                           (json.dumps(completed).encode(), rid))
+            return 0, {'request_id': rid, 'cancelled': False, 'drained': True, 'reason': 'already finished; its result stands'}
+        with loader_db(root) as db:
+            db.execute("UPDATE jobs SET phase='done' WHERE request_id=? AND phase='fencing'", (rid,))
+        return 0, {'request_id': rid, 'cancelled': True, 'by': 'evaluator', 'drained': True, 'status': 'ERROR', 'code': CODE}
     if job['phase'] == 'done':
         return 0, {'request_id': rid, 'cancelled': False, 'reason': 'already finished; its result stands'}
     for _ in range(2):

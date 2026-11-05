@@ -16,6 +16,7 @@ import uuid
 
 from . import cgroups
 from .install import Installer, provision_tools
+from .lifecycle import fence, request_lock
 from .multipart import HTTPError
 from .security import InstallError, SHA, digest, private_locations, sync_dir
 from .supervisor import Service
@@ -225,13 +226,13 @@ class Runtime:
                 raise HTTPError(400, 'INVALID_CHAIN_COMMIT', 'chain_commit must be a JSON object (cf-chain-commit/1).')
             chain = json.dumps(obj, sort_keys=True, separators=(',', ':'))
         sha = self.archive(fields)
-        with self.mutex:
+        with self.mutex, request_lock(self.root, rid):
             old = self.job(rid)
             if old:
                 if (old['sha'], old['mode'], old['submitter'], old['design_hash'], old['chain_commit']) != (
                         sha, mode, submitter, design_hash, chain):
                     raise HTTPError(409, 'REQUEST_ID_CONFLICT', 'This request ID already names a different request.')
-                if old['error'] in (None, 'EVALUATION_CANCELLED'):
+                if old['phase'] == 'fencing' or old['forwarded'] or old['error'] in (None, 'EVALUATION_CANCELLED'):
                     return old
                 # Explicit retries of a system failure may repair the install and resubmit.
                 attempt = self.request_install(sha)
@@ -261,6 +262,32 @@ class Runtime:
         return dict(row) if row else None
 
     def finish(self, job, body, content_type='application/json', error=None):
+        if error:
+            with request_lock(self.root, job['request_id']):
+                current = self.job(job['request_id'])
+                if current['phase'] == 'done':
+                    return
+                if current['phase'] == 'fencing':
+                    body, content_type, error = current['response'], current['response_type'], current['error']
+                if current['forwarded']:
+                    # Durable intent precedes backend mutation and the public terminal row. A crash
+                    # anywhere after this commit resumes cleanup before any service can restart.
+                    with self.db() as db:
+                        db.execute("UPDATE jobs SET phase='fencing',response=?,response_type=?,error=? WHERE request_id=?",
+                                   (body, content_type, error, job['request_id']))
+                    drained = fence(self.root, self.installer.salt, current, body)
+                    completed = (drained or {}).get('completed_response')
+                    if error == 'EVALUATION_CANCELLED' and completed:
+                        body = json.dumps(completed).encode()
+                        if not any(p.get('code') == error for p in completed.get('problems', [])):
+                            error = None
+                self._finish(job, body, content_type, error)
+            return
+        with request_lock(self.root, job['request_id']):
+            if self.job(job['request_id'])['phase'] != 'fencing':
+                self._finish(job, body, content_type, error)
+
+    def _finish(self, job, body, content_type, error):
         self.retry_after.pop(job['request_id'], None)
         with self.db() as db:
             db.execute("UPDATE jobs SET phase='done',response=?,response_type=?,error=? WHERE request_id=? AND phase!='done'",
@@ -271,7 +298,7 @@ class Runtime:
 
     def set_phase(self, rid, phase):
         with self.db() as db:
-            db.execute("UPDATE jobs SET phase=? WHERE request_id=? AND phase!='done'", (phase, rid))
+            db.execute("UPDATE jobs SET phase=? WHERE request_id=? AND phase NOT IN ('done','fencing')", (phase, rid))
 
     def dispatch(self):
         while not self.stop_event.is_set():
@@ -281,6 +308,12 @@ class Runtime:
                     self.tools_ready, self.tools_error = True, None
                 with self.db() as db:
                     jobs = [dict(r) for r in db.execute("SELECT * FROM jobs WHERE phase!='done' ORDER BY created")]
+                # Never restart/prewarm the service while an interrupted terminal fence is pending.
+                fencing = [j for j in jobs if j['phase'] == 'fencing']
+                if fencing:
+                    for job in fencing:
+                        self.finish(job, job['response'], job['response_type'], job['error'])
+                    continue
                 active = next((j for j in jobs if j['forwarded']), None)
                 hold = None     # a refused job keeps its evaluator: other evaluators' jobs wait (no service switching)
                 for job in jobs:
@@ -321,7 +354,13 @@ class Runtime:
                 with self.db() as db:
                     pending = [dict(r) for r in db.execute("SELECT * FROM jobs WHERE phase!='done'")]
                 for job in pending:
-                    self.fail(job, self.tools_error)
+                    try:
+                        if job['phase'] == 'fencing':
+                            self.finish(job, job['response'], job['response_type'], job['error'])
+                        else:
+                            self.fail(job, self.tools_error)
+                    except Exception:
+                        pass  # Keep the durable intent, never expose an unfenced terminal response.
             self.wakeup.wait(0.25)
             self.wakeup.clear()
 
@@ -330,7 +369,8 @@ class Runtime:
             return
         self.retry_after.pop(job['request_id'], None)
         try:
-            if job.get("forwarded") and self.service.sha == job["sha"] and self.service.was_oom_killed():
+            if (job.get("forwarded") and self.service.sha == job["sha"]
+                    and self.service.proc is not None and self.service.proc.poll() is not None):
                 # Preserve a terminal, unscored result before restarting for the next request.
                 self.fail(job, "EVALUATOR_SERVICE_EXITED")
                 self.service.stop()
@@ -341,12 +381,13 @@ class Runtime:
             submitting = status == 404
             if submitting:
                 # Atomic with cf-cancel: a cancelled snapshot cannot forward a design later.
-                with self.db() as db:
-                    claimed = db.execute("UPDATE jobs SET forwarded=1 WHERE request_id=? AND phase!='done'",
-                                         (job['request_id'],)).rowcount
-                if not claimed:
-                    return
-                status, headers, body = self.service.submit(job)
+                with request_lock(self.root, job['request_id']):
+                    with self.db() as db:
+                        claimed = db.execute("UPDATE jobs SET forwarded=1 WHERE request_id=? AND phase NOT IN ('done','fencing')",
+                                             (job['request_id'],)).rowcount
+                    if not claimed:
+                        return
+                    status, headers, body = self.service.submit(job)
             if status == 200:
                 self.finish(job, body, next((v for k, v in headers.items() if k.lower() == 'content-type'), 'application/json'))
             elif status == 202:
@@ -366,12 +407,12 @@ class Runtime:
                     return
                 phase = 'running' if state in ('running', 'leased') else 'queued'
                 with self.db() as db:
-                    db.execute("UPDATE jobs SET phase=?,forwarded=1 WHERE request_id=? AND phase!='done'", (phase, job['request_id']))
+                    db.execute("UPDATE jobs SET phase=?,forwarded=1 WHERE request_id=? AND phase NOT IN ('done','fencing')", (phase, job['request_id']))
             elif status in (429, 503):
                 if submitting:
                     # A restarted evaluator has no accepted copy of this previously forwarded job.
                     with self.db() as db:
-                        db.execute("UPDATE jobs SET phase='queued',forwarded=0 WHERE request_id=? AND phase!='done'", (job['request_id'],))
+                        db.execute("UPDATE jobs SET phase='queued',forwarded=0 WHERE request_id=? AND phase NOT IN ('done','fencing')", (job['request_id'],))
                 delay = 30
                 value = next((v for k, v in headers.items() if k.lower() == 'retry-after'), None)
                 if value is not None:

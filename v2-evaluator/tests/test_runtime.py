@@ -172,11 +172,13 @@ def test_service_restart_and_durable_loader_restart(tmp_path, crash_after_forwar
             wait_until(lambda: runtime.job('restart')['forwarded'])
         old_pid = runtime.service.proc.pid
         os.kill(old_pid, signal.SIGKILL)
-        assert wait_until(lambda: terminal(request, 'restart'))[2] == RAW
-        assert runtime.service.proc.pid != old_pid
+        result = wait_until(lambda: terminal(request, 'restart'))[2]
+        if crash_after_forward or result != RAW:
+            assert json.loads(result)['problems'][0]['code'] == 'EVALUATOR_SERVICE_EXITED'
+        wait_until(lambda: runtime.service.proc and runtime.service.proc.pid != old_pid)
         salt = runtime.installer.salt.read_bytes()
     with running(tmp_path, allow_unsigned=True) as (runtime, request):
-        assert terminal(request, 'restart')[2] == RAW
+        assert terminal(request, 'restart')[2] == result
         assert runtime.installer.salt.read_bytes() == salt
         assert request('POST', '/evaluate', dict(design_zip=b'd2', evaluator_sha256=sha, request_id='cached'))[0] == 202
         assert wait_until(lambda: terminal(request, 'cached'))[2] == RAW

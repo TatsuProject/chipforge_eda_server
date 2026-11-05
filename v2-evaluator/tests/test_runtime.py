@@ -271,6 +271,12 @@ def test_operator_cancel_in_the_evaluator_or_the_loader(tmp_path):
         doc = json.loads(terminal(request, 'waiting')[2])
         assert doc['status'] == 'ERROR' and doc['problems'][0]['code'] == 'EVALUATION_CANCELLED'
         assert 'host maintenance' in doc['problems'][0]['detail']
+        duplicate = request('POST', '/evaluate', dict(design_zip=b'b', evaluator_sha256=sha, request_id='waiting'))
+        assert duplicate[0] == 200 and json.loads(duplicate[2]) == doc
+        runtime.set_phase('waiting', 'queued')
+        runtime.finish(runtime.job('waiting'), b'stale completion')
+        assert runtime.job('waiting')['phase'] == 'done'
+        assert json.loads(runtime.job('waiting')['response']) == doc
         # Running in the evaluator: the evaluator cancels it; the loader picks the ERROR up and is free.
         code, out = cancel(runtime.root, salt, 'running', 'host maintenance')
         assert (code, out['by'], out['cancelled']) == (0, 'evaluator', True)
@@ -669,3 +675,26 @@ def test_kernel_witnessed_service_oom_is_terminal_then_next_job_restarts(tmp_pat
         assert request('POST', '/evaluate', dict(design_zip=b'd2', evaluator_sha256=sha, request_id='after-oom'))[0] == 202
         assert wait_until(lambda: terminal(request, 'after-oom'))[2] == RAW
         assert runtime.service.proc.pid != old_pid
+
+
+def test_cancelled_queued_snapshot_cannot_be_forwarded(tmp_path,monkeypatch):
+    from loader.cancel import cancel
+    runtime=Runtime(tmp_path/'root',tmp_path/'salt',allow_unsigned=True)
+    try:
+        with runtime.db() as db:
+            db.execute("INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,forwarded) VALUES('queued-race',?,1,'T2','fixture','fixture','unused','queued',0,0)",('a'*64,))
+        snapshot=runtime.job('queued-race')
+        def ensure(sha):
+            code,out=cancel(runtime.root,runtime.installer.salt,'queued-race','before dispatch')
+            assert code==0 and out['by']=='loader'
+            return True
+        forwarded=[]
+        runtime.service.ensure=ensure
+        runtime.service.request=lambda *args:(404,{},b'')
+        runtime.service.submit=lambda job:forwarded.append(job)
+        runtime.tick(snapshot)
+        assert not forwarded
+        assert runtime.job('queued-race')['phase']=='done'
+        assert runtime.job('queued-race')['error']=='EVALUATION_CANCELLED'
+    finally:
+        runtime.close()

@@ -231,7 +231,7 @@ class Runtime:
                 if (old['sha'], old['mode'], old['submitter'], old['design_hash'], old['chain_commit']) != (
                         sha, mode, submitter, design_hash, chain):
                     raise HTTPError(409, 'REQUEST_ID_CONFLICT', 'This request ID already names a different request.')
-                if old['error'] is None:
+                if old['error'] in (None, 'EVALUATION_CANCELLED'):
                     return old
                 # Explicit retries of a system failure may repair the install and resubmit.
                 attempt = self.request_install(sha)
@@ -263,7 +263,7 @@ class Runtime:
     def finish(self, job, body, content_type='application/json', error=None):
         self.retry_after.pop(job['request_id'], None)
         with self.db() as db:
-            db.execute("UPDATE jobs SET phase='done',response=?,response_type=?,error=? WHERE request_id=?",
+            db.execute("UPDATE jobs SET phase='done',response=?,response_type=?,error=? WHERE request_id=? AND phase!='done'",
                        (body, content_type, error, job['request_id']))
 
     def fail(self, job, code):
@@ -271,7 +271,7 @@ class Runtime:
 
     def set_phase(self, rid, phase):
         with self.db() as db:
-            db.execute('UPDATE jobs SET phase=? WHERE request_id=?', (phase, rid))
+            db.execute("UPDATE jobs SET phase=? WHERE request_id=? AND phase!='done'", (phase, rid))
 
     def dispatch(self):
         while not self.stop_event.is_set():
@@ -340,6 +340,12 @@ class Runtime:
             status, headers, body = self.service.request('GET', '/status/' + job['request_id'])
             submitting = status == 404
             if submitting:
+                # Atomic with cf-cancel: a cancelled snapshot cannot forward a design later.
+                with self.db() as db:
+                    claimed = db.execute("UPDATE jobs SET forwarded=1 WHERE request_id=? AND phase!='done'",
+                                         (job['request_id'],)).rowcount
+                if not claimed:
+                    return
                 status, headers, body = self.service.submit(job)
             if status == 200:
                 self.finish(job, body, next((v for k, v in headers.items() if k.lower() == 'content-type'), 'application/json'))
@@ -360,12 +366,12 @@ class Runtime:
                     return
                 phase = 'running' if state in ('running', 'leased') else 'queued'
                 with self.db() as db:
-                    db.execute('UPDATE jobs SET phase=?,forwarded=1 WHERE request_id=?', (phase, job['request_id']))
+                    db.execute("UPDATE jobs SET phase=?,forwarded=1 WHERE request_id=? AND phase!='done'", (phase, job['request_id']))
             elif status in (429, 503):
-                if submitting and job.get('forwarded'):
+                if submitting:
                     # A restarted evaluator has no accepted copy of this previously forwarded job.
                     with self.db() as db:
-                        db.execute("UPDATE jobs SET phase='queued',forwarded=0 WHERE request_id=?", (job['request_id'],))
+                        db.execute("UPDATE jobs SET phase='queued',forwarded=0 WHERE request_id=? AND phase!='done'", (job['request_id'],))
                 delay = 30
                 value = next((v for k, v in headers.items() if k.lower() == 'retry-after'), None)
                 if value is not None:

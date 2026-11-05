@@ -282,6 +282,11 @@ def test_a_service_waiting_for_ram_is_kept_not_a_start_failure(tmp_path, docker,
         assert service.not_ready == reason
         failed, rt = [], SimpleNamespace(service=service, start_failures={}, retry_after={}, fail=lambda job, code: failed.append(code),
                                          finish=lambda *a, **kw: failed.append('finished'))
+        from contextlib import contextmanager
+        @contextmanager
+        def db():
+            yield SimpleNamespace(execute=lambda *a: SimpleNamespace(rowcount=1))
+        rt.db = db
         for _ in range(5):                                         # more ticks than the 3 start failures allowed
             Runtime.tick(rt, {'sha': 'a' * 64, 'request_id': 'r1'})
         assert failed == [] and rt.start_failures == {} and service.proc is proc

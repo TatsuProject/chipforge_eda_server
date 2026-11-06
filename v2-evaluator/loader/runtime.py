@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import sqlite3
 import threading
@@ -32,6 +33,34 @@ CREATE TABLE IF NOT EXISTS jobs (
  design TEXT NOT NULL, phase TEXT NOT NULL, created REAL NOT NULL,
  response BLOB, response_type TEXT, error TEXT, forwarded INTEGER NOT NULL DEFAULT 0);
 '''
+
+
+# Old evaluator versions are deleted (state, escrow and the installed tree; the archive stays for a reinstall)
+# after a new one is ready, before a new one's preflight, and this often. CF_V2_KEEP_OLD_EVALUATORS=1: never.
+PRUNE_SECONDS = float(os.environ.get('CF_V2_PRUNE_SECONDS') or 600)
+PRUNED_TREES = ('state', 'escrow', 'evaluators')
+
+
+def _remove(tree):
+    """Delete a tree the evaluator may have made read-only. Never follows symlinks out of it."""
+    try:
+        if tree.is_symlink() or tree.is_file():
+            tree.unlink()
+            return
+        if not tree.is_dir():
+            return
+        os.chmod(tree, 0o755)
+        for dirpath, dirnames, _ in os.walk(tree, followlinks=False):
+            for d in dirnames:
+                path = os.path.join(dirpath, d)
+                if not os.path.islink(path):
+                    try:
+                        os.chmod(path, 0o755)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    shutil.rmtree(tree, ignore_errors=True)
 
 
 # Evaluator progress states that can never become a response by waiting longer.
@@ -73,6 +102,9 @@ class Runtime:
         self.tools_error = None
         self.start_failures = {}
         self.retry_after = {}
+        self.last_cleanup = None          # the latest cleanup that deleted something (reported by health)
+        self.prune_lock = threading.Lock()
+        self.next_prune = 0.0
         with self.db() as db:
             db.executescript(SCHEMA)
             # cf-chain-commit/1 (BEACON.md): forwarded verbatim to the evaluator, which validates it.
@@ -186,12 +218,16 @@ class Runtime:
             with self.db() as db:
                 db.execute('UPDATE installs SET phase=? WHERE sha=? AND attempt=?', (value, sha, attempt))
             self.wakeup.set()
+            if value == 'preflight':
+                # preflight checks free disk: make room first (an old version's runs can fill it)
+                self.prune('before installing ' + sha[:12], wait=True)
         try:
             sig = self.root / 'archives' / (sha + '.sig')
             result = self.installer.install(sha, sig.read_bytes() if sig.exists() else b'', phase)
             with self.db() as db:
                 db.execute('UPDATE installs SET phase=?, unsigned=? WHERE sha=? AND attempt=?',
                            ('ready', result['unsigned'], sha, attempt))
+            self.next_prune = 0.0          # the older versions can go once the service moved to this one
         except Exception as exc:
             code = exc.code if isinstance(exc, InstallError) else 'EVALUATOR_INSTALL_FAILED'
             with self.db() as db:
@@ -341,10 +377,12 @@ class Runtime:
                     elif current['phase'] == 'done' and hold:
                         break      # the slot freed with an older job waiting: the next pass offers it first, in order
                 if not jobs:
-                    with self.db() as db:
-                        latest = db.execute("SELECT sha FROM installs WHERE phase='ready' ORDER BY rowid DESC LIMIT 1").fetchone()
+                    latest = self.latest_ready()
                     if latest:
-                        self.service.ensure(latest['sha'])  # Pre-warm and restart even when idle.
+                        self.service.ensure(latest)  # Pre-warm and restart even when idle.
+                if time.monotonic() >= self.next_prune:
+                    self.next_prune = time.monotonic() + PRUNE_SECONDS
+                    threading.Thread(target=self.prune, daemon=True, name='evaluator-cleanup').start()
                 if os.environ.get('CF_CGROUP_PARENT'):
                     cgroups.reap()
                 self.tools_error = None
@@ -449,6 +487,78 @@ class Runtime:
         except (OSError, http.client.HTTPException):
             pass  # Durable service status/idempotent submission recovers after restart.
 
+    def in_use(self):
+        """Evaluator versions that must stay: the newest ready one, the one the service runs, and any a
+        pending job or an install in progress needs."""
+        keep = {self.latest_ready(), self.service.sha}
+        with self.db() as db:
+            keep |= {r[0] for r in db.execute("SELECT DISTINCT sha FROM jobs WHERE phase!='done'")}
+            keep |= {r[0] for r in db.execute(
+                "SELECT sha FROM installs i WHERE attempt=(SELECT MAX(attempt) FROM installs WHERE sha=i.sha) "
+                "AND phase NOT IN ('ready','failed')")}
+        keep |= {sha for sha, thread in self.install_threads.items() if thread.is_alive()}
+        keep.discard(None)
+        return keep
+
+    def prune(self, why='periodic', wait=False):
+        """Delete evaluator versions no longer in use: state/<sha> (the evaluator's runs and caches, which can
+        reach tens of GB), escrow/<sha> and evaluators/<sha>. archives/<sha>.zip and .sig stay: a version asked
+        for again is reinstalled from them (its ready marker goes first, so a request never finds it half
+        deleted). Returns what was deleted, or None."""
+        if os.environ.get('CF_V2_KEEP_OLD_EVALUATORS') == '1':
+            return None
+        if not self.prune_lock.acquire(blocking=wait):
+            return None
+        try:
+            with self.mutex:
+                keep = self.in_use()
+                if not keep:
+                    return None                    # nothing installed or needed yet: delete nothing
+                victims = sorted({p.name for d in PRUNED_TREES if (self.root / d).is_dir()
+                                  for p in (self.root / d).iterdir() if SHA.fullmatch(p.name) and p.name not in keep})
+                for sha in victims:
+                    marker = self.root / 'evaluators' / sha / '.cf-ready.json'
+                    if marker.exists():
+                        marker.parent.chmod(0o755)
+                        marker.unlink()
+            if not victims:
+                return None
+            before = shutil.disk_usage(self.root).free
+            removed = []
+            (self.root / 'locks').mkdir(parents=True, exist_ok=True)
+            for sha in victims:
+                with (self.root / 'locks' / (sha + '.install.lock')).open('a') as lock:
+                    try:                           # being (re)installed right now: leave it (never wait: no deadlock)
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    with self.mutex:
+                        if sha in self.in_use():
+                            continue               # asked for again meanwhile: it reinstalls
+                    for d in PRUNED_TREES:
+                        _remove(self.root / d / sha)
+                    removed.append(sha)
+            if not removed:
+                return None
+            usage = shutil.disk_usage(self.root)
+            self.last_cleanup = dict(at=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), reason=why,
+                                     evaluators=removed, freed_gib=round(max(0, usage.free - before) / 2**30, 1),
+                                     free_gib=round(usage.free / 2**30, 1))
+            print(f"evaluator cleanup ({why}): removed {len(removed)} old evaluator version(s) "
+                  f"{[s[:12] for s in removed]}, freed {self.last_cleanup['freed_gib']} GiB, "
+                  f"{self.last_cleanup['free_gib']} GiB free", file=sys.stderr, flush=True)
+            return self.last_cleanup
+        finally:
+            self.prune_lock.release()
+
+    def disk(self):
+        """Free and total space where evaluations run, and the evaluator versions with data on it."""
+        usage = shutil.disk_usage(self.root)
+        on_disk = sorted({p.name for d in PRUNED_TREES if (self.root / d).is_dir()
+                          for p in (self.root / d).iterdir() if SHA.fullmatch(p.name)})
+        return dict(free_gib=round(usage.free / 2**30, 1), total_gib=round(usage.total / 2**30, 1),
+                    evaluator_versions=len(on_disk))
+
     def health(self):
         with self.db() as db:
             ready = db.execute("SELECT COUNT(*) FROM installs WHERE phase='ready'").fetchone()[0]
@@ -466,4 +576,5 @@ class Runtime:
                     status='ok' if alive else 'degraded', active_evaluator=self.service.sha,
                     modes=list(self.installer.modes), allow_unsigned=self.allow_unsigned,
                     sandbox_override=self.installer.allow_runc, preflight_min_disk_gib=self.installer.min_disk_gib,
-                    scope_backend='cfscope', install_failures=install_failures)
+                    scope_backend='cfscope', install_failures=install_failures,
+                    disk=self.disk(), last_cleanup=self.last_cleanup)

@@ -112,6 +112,17 @@ and failed checks) in
 (`install failed: ... log=...`) and `GET /health` lists it under `install_failures`; neither
 contains the output itself.
 
+## Old evaluator versions are deleted
+
+Each evaluator version keeps its own `state/<sha>` (its runs and caches, which reach tens of GB),
+`escrow/<sha>` and `evaluators/<sha>`. The loader deletes those of every version nothing needs any more:
+after a new version is ready (once the service runs it), before a new version's preflight (which checks free
+disk) and every `CF_V2_PRUNE_SECONDS` (600). Kept: the newest ready version, the one the service runs, any
+version a pending request or an install in progress needs. `archives/<sha>.zip` and `.sig` stay, so a version
+asked for again is reinstalled automatically. `/health` reports `disk` (`free_gib`, `total_gib`,
+`evaluator_versions`) and `last_cleanup` (`at`, `reason`, `evaluators`, `freed_gib`, `free_gib`); each cleanup
+is logged. `CF_V2_KEEP_OLD_EVALUATORS=1` turns it off.
+
 ## Yosys-only v2.0.5 candidate
 
 When the original `chipforge_eda_server-v2-evaluator:2.0-r63` runtime is local,

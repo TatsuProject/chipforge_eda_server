@@ -25,9 +25,16 @@ services:
       - "${EDA_BIND_ADDRESS:-127.0.0.1}:8080:8080"
     depends_on:
       - v2-evaluator
+    # The evaluator's data root (same path): the gateway reports its free disk and deletes old evaluator
+    # versions there (gateway/housekeeping.py).
+    volumes:
+      - ${CF_V2_ROOT:-/var/lib/chipforge-v2}:${CF_V2_ROOT:-/var/lib/chipforge-v2}
     environment:
       - V2_SERVICE_URL=${V2_SERVICE_URL:-http://v2-evaluator:18080}
       - V2_ADMIN_TOKEN=${V2_ADMIN_TOKEN:-}
+      - CF_V2_ROOT=${CF_V2_ROOT:-/var/lib/chipforge-v2}
+      - CF_V2_PRUNE_SECONDS=${CF_V2_PRUNE_SECONDS:-600}
+      - CF_V2_KEEP_OLD_EVALUATORS=${CF_V2_KEEP_OLD_EVALUATORS:-}
 
   # The box every miner compiler is built and run in. Published, pinned image.
   cf-compiler:

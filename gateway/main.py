@@ -8,10 +8,13 @@ Routes:
 
 npu-v1 has ended; its simulation and synthesis services are no longer part of this server.
 """
+import asyncio
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from v2_proxy import router as _v2_router
+import housekeeping
+from v2_proxy import active_evaluator, router as _v2_router
 import v2_mock
 
 app = FastAPI(title="ChipForge EDA Tools Gateway", version="6.0.0",
@@ -27,7 +30,25 @@ else:
 @app.get("/health")
 async def health():
     """Liveness for validators' pre-flight check (no evaluation is run). /v2/health is the evaluator's."""
-    return {"status": "ok"}
+    return {"status": "ok", "eda_version": housekeeping.VERSION}
+
+
+async def _cleanup_loop():
+    """Old evaluator versions are deleted every CF_V2_PRUNE_SECONDS (housekeeping.py)."""
+    await asyncio.sleep(60)                          # let the evaluator start
+    while True:
+        try:
+            await housekeeping.prune("periodic", await active_evaluator())
+        except Exception as e:                       # never let housekeeping take the gateway down
+            print(f"[cleanup] failed: {type(e).__name__}", flush=True)
+        await asyncio.sleep(housekeeping.prune_seconds())
+
+
+@app.on_event("startup")
+async def _start_cleanup():
+    if not v2_mock.enabled():
+        print(f"[gateway] EDA server {housekeeping.VERSION}", flush=True)
+        app.state.cleanup = asyncio.create_task(_cleanup_loop())
 
 
 V1_GONE = {

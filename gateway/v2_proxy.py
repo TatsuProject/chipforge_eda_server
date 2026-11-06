@@ -18,6 +18,8 @@ import aiohttp
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
+import housekeeping
+
 router = APIRouter(prefix="/v2")
 
 _ID = r"[A-Za-z0-9._-]{1,128}"
@@ -83,9 +85,29 @@ def _check_admin(request: Request):
     return None
 
 
+async def active_evaluator():
+    """The evaluator the service runs (its /health), None if none, False if the service is unreachable."""
+    base, _, t_conn, t_read, _ = _cfg()
+    if not base:
+        return False
+    try:
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=t_conn, sock_read=t_read)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(base + "/health") as r:
+                body = await r.json(content_type=None)
+        return body.get("active_evaluator") if isinstance(body, dict) else False
+    except Exception:
+        return False
+
+
 @router.post("/evaluator")
 async def install_evaluator(request: Request):
-    return _check_admin(request) or await _forward(request, "POST", "/evaluator", upload=True)
+    refused = _check_admin(request)
+    if refused:
+        return refused
+    # an install's preflight checks free disk: delete old evaluator versions first (housekeeping.py)
+    await housekeeping.prune("before installing an evaluator", await active_evaluator())
+    return await _forward(request, "POST", "/evaluator", upload=True)
 
 
 @router.get("/evaluator")
@@ -102,6 +124,7 @@ async def get_evaluator(sha: str, request: Request):
 
 @router.post("/evaluate")
 async def evaluate(request: Request):
+    await housekeeping.wait_if_pruning()
     return await _forward(request, "POST", "/evaluate", upload=True)
 
 
@@ -114,4 +137,17 @@ async def status(request_id: str, request: Request):
 
 @router.get("/health")
 async def health(request: Request):
-    return await _forward(request, "GET", "/health")
+    """The evaluator's health, plus what the gateway knows: eda_version, disk, last_cleanup."""
+    return decorated(await _forward(request, "GET", "/health"))
+
+
+def decorated(response):
+    import json
+    try:
+        body = json.loads(response.body)
+    except (ValueError, AttributeError):
+        return response
+    if not isinstance(body, dict):
+        return response
+    return JSONResponse(housekeeping.decorate(body), status_code=response.status_code,
+                        headers={k: v for k, v in response.headers.items() if k.lower() in ("cache-control", "retry-after")})

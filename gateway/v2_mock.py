@@ -37,6 +37,7 @@ Result fields:
   failure_code    for REJECTED (default NPU_PORT_MISMATCH)
   projection      "deterministic" (default) or "random" (simulates a non-deterministic evaluator)
 """
+import housekeeping
 import asyncio
 import hashlib
 import io
@@ -262,12 +263,12 @@ async def health(request: Request):
         except ValueError:
             return real
         body.update(mock=True, evaluations="simulated (EDA_MOCK_FILE); installs are real")
-        return JSONResponse(body, status_code=real.status_code)
+        return JSONResponse(housekeeping.decorate(body), status_code=real.status_code)
     ready = _ready_shas()
-    return {"ready": True, "status": "ok", "active_evaluator": ready[-1] if ready else MOCK_EVALUATOR_SHA,
+    return housekeeping.decorate({"ready": True, "status": "ok", "active_evaluator": ready[-1] if ready else MOCK_EVALUATOR_SHA,
             "modes": list(MODES), "mock": True, "install_failures": [
                 {"evaluator_sha256": sha, "error": st["error"]} for sha in _installs
-                for st in [_install_phase(sha)] if st["phase"] == "failed"]}
+                for st in [_install_phase(sha)] if st["phase"] == "failed"]})
 
 
 @router.post("/evaluator")

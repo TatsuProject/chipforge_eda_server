@@ -110,6 +110,20 @@ For a new evaluator, point `CF_V2_EVALUATOR_ZIP` at it and run `make start` (val
 evaluators automatically). A server that ran Quest 1 is replaced in place by the same commands (same port 8080);
 the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-api` images can then be removed.
 
+## Version and disk housekeeping
+
+- **EDA server version:** `gateway/VERSION` (now `1.0.0`) is the version of this code. Bump it one point with
+  every change to `main`. It is reported as `eda_version` in `GET /health` and `GET /v2/health`; validators send
+  it to the challenge server and the website shows it on the validator's card.
+- **Old evaluator versions are deleted** by the gateway (`gateway/housekeeping.py`; it mounts the data root
+  `CF_V2_ROOT`). Each evaluator version keeps `state/<sha>` (its runs and caches, tens of GB), `escrow/<sha>`
+  and `evaluators/<sha>`, and nothing else removes them, so after a few bundle updates the disk fills and the
+  next install fails its preflight (100 GiB free needed). Deleted: every version nothing needs. Kept: the
+  newest ready one, the one the evaluator service runs, and any a pending request or an install in progress
+  needs. `archives/<sha>.zip` stays, so a version asked for again is reinstalled. It runs before an evaluator
+  install and every `CF_V2_PRUNE_SECONDS` (600); `GET /v2/health` reports `disk` (free/total GiB) and
+  `last_cleanup`. `CF_V2_KEEP_OLD_EVALUATORS=1` turns it off.
+
 ## Security
 
 - Port 8080 runs submitted code and has no API key. It is bound to `127.0.0.1` by default; never expose it to the

@@ -98,7 +98,8 @@ def test_large_upload_identical_with_content_length(client):
 def test_evaluator_get_and_health(client):
     assert client.get("/v2/evaluator/abc123").json() == {"phase": "ready"}
     r = client.get("/v2/health")
-    assert r.status_code == 503 and r.content == b'{"ready":false}'
+    assert r.status_code == 503 and r.json()["ready"] is False      # the evaluator's answer, plus the gateway's
+    assert r.json()["eda_version"] == main.housekeeping.VERSION and "disk" in r.json()
 
 
 def test_bad_ids_not_forwarded(client):
@@ -127,7 +128,7 @@ def test_admin_token(client, monkeypatch):
 
 
 def test_gateway_health(client):
-    assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/health").json() == {"status": "ok", "eda_version": main.housekeeping.VERSION}
 
 
 @pytest.mark.parametrize("method", ["get", "post"])

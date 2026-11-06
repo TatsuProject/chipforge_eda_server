@@ -11,7 +11,8 @@ reuses it until a new one is released.
 ## Requirements
 
 - Linux x86-64 with cgroup v2 (Ubuntu 22.04 or 24.04), Docker Engine with the Compose plugin.
-- Validators: 16 cores and 64 GB RAM minimum (e.g. EC2 m7a.4xlarge), 300 GiB disk, on a machine used only for this.
+- Validators: 16 physical cores / 32 threads (32 vCPUs, e.g. EC2 c7i.8xlarge), 64 GB RAM, 300 GB SSD minimum (500 GB
+  recommended), on a machine used only for this. Each design gets the whole machine for up to the evaluation window.
 - Miners: the same for a full evaluation; a smaller machine runs the quick checks.
 - Data directories on a local ext4 or xfs filesystem (NTFS, FUSE, SMB and NFS are refused).
 - Outbound HTTPS. No inbound access is needed.
@@ -21,7 +22,7 @@ reuses it until a new one is released.
 ## Set up
 
 ```sh
-git clone -b launch-v2-eda https://github.com/TatsuProject/chipforge_eda_server
+git clone https://github.com/TatsuProject/chipforge_eda_server
 cd chipforge_eda_server
 cp .env.example .env
 sudo mkdir -p /var/lib/chipforge-v2 /var/lib/chipforge-v2-secrets
@@ -31,7 +32,7 @@ Edit `.env`:
 
 | Setting | Value |
 |---|---|
-| `CF_V2_ROOT` | `/var/lib/chipforge-v2` (data directory, 40 GiB free from v2.0.1) |
+| `CF_V2_ROOT` | `/var/lib/chipforge-v2` (data directory on the SSD: evaluator installs need 100 GiB free; old evaluator versions are deleted automatically) |
 | `CF_V2_SECRETS` | `/var/lib/chipforge-v2-secrets` |
 | `CF_V2_EVALUATOR_ZIP` | absolute path of the evaluator zip, with its `.sshsig` next to it. Optional: leave empty if your validator neuron installs the evaluator |
 
@@ -189,7 +190,7 @@ evaluator service or any tool image. **Never use it on a validator that evaluate
 
 | mode | command | evaluations | evaluator installs | machine |
 |---|---|---|---|---|
-| real | `make start` | real (1.5-2 h per design) | real | 16 cores, 32 GiB RAM, 300 GiB disk |
+| real | `make start` | real (hours per design) | real | 16 cores / 32 threads, 64 GB RAM, 300 GB disk |
 | **mock** | `make mock-start` | simulated (`delay_seconds`) | simulated (`install_seconds`) | anything (one small container) |
 | hybrid | `make hybrid-start` | simulated | real (signature, ~1 GB assets, post-install, preflight) | **at least ~22 GiB free RAM** |
 
@@ -200,7 +201,7 @@ and an IDE open, cannot run `make start` or hybrid mode. Use mock mode there.
 ### Quick start (mock)
 
 ```sh
-cd chipforge_eda_server        # branch launch-v2-eda
+cd chipforge_eda_server        # branch main
 make down                      # stop the real server if it runs (same port 8080); never needed otherwise
 make mock-start                # builds the gateway, creates shared/eda_mock.json from gateway/mock_result.example.json
 curl -s localhost:8080/v2/health      # {"ready": true, ..., "mock": true}

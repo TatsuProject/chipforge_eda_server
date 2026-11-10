@@ -12,6 +12,16 @@
   preflight checks) and every CF_V2_PRUNE_SECONDS (600). While it decides and moves the trees aside (renames,
   instant) new /v2 evaluations and installs wait; the trees are then deleted in the background.
   last_cleanup in GET /v2/health. CF_V2_KEEP_OLD_EVALUATORS=1 turns it off.
+- Everything a finished evaluation leaves is deleted (sweep_designs, since 1.0.2). The evaluator keeps each
+  design's working files after its result is out, 15-25 GB per design (state/<sha>/components/*/wp-o/sub_*,
+  components/wp-o/sub_*, runs/jobs/sub_*), and simulation scratch (tmp/cf-sim-*); a few designs fill the disk. The
+  result (with the full public report) is with the validator and the challenge server, and nothing here is used
+  again (a confirmation always runs on another validator). Deleted: every design folder whose evaluation is not
+  unfinished in the loader (passed, rejected, failed, timed out, cancelled), once untouched for
+  CF_V2_DESIGN_QUIET_SECONDS (600); scratch folders only while no evaluation runs. Kept: the folders of every
+  unfinished evaluation (mapped request -> sub_ through the evaluator's own database), and everything shared by
+  all evaluations (caches, tools, models, workloads). last_design_cleanup in GET /v2/health.
+  CF_V2_KEEP_DESIGN_FILES=1 turns it off.
 """
 import asyncio
 import os
@@ -29,6 +39,8 @@ VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.is_file() else "unk
 
 lock = asyncio.Lock()          # held while deciding and moving: /v2/evaluate and installs wait for it
 last_cleanup = None            # the latest cleanup that removed something
+last_design_cleanup = None     # the latest sweep of finished designs' files that removed something
+SUB = re.compile(r"sub_[0-9a-f]{16,64}\Z")
 
 
 def root() -> Path:
@@ -63,7 +75,8 @@ def disk():
 def decorate(health: dict) -> dict:
     """What the gateway adds to the evaluator's /v2/health."""
     import jobs
-    return {**health, "eda_version": VERSION, "disk": disk(), "last_cleanup": last_cleanup, "watchdog": jobs.health()}
+    return {**health, "eda_version": VERSION, "disk": disk(), "last_cleanup": last_cleanup,
+            "last_design_cleanup": last_design_cleanup, "watchdog": jobs.health()}
 
 
 def in_use(active):
@@ -163,3 +176,110 @@ async def wait_if_pruning():
     """New evaluations and installs wait while old versions are being moved aside (a few seconds at most)."""
     async with lock:
         pass
+
+
+# ------------------------------------------------------------------ finished designs' files
+def _quiet(p: Path, seconds: float, now: float) -> bool:
+    """Neither the folder nor anything directly in it changed for `seconds` (cheap: no deep walk)."""
+    try:
+        latest = p.stat().st_mtime
+        with os.scandir(p) as it:
+            for e in it:
+                try:
+                    latest = max(latest, e.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    pass
+        return now - latest > seconds
+    except OSError:
+        return False
+
+
+def _design_folders(state_dir: Path, depth: int = 4):
+    """Every sub_<id> folder under one evaluator version's state (not descending into them or into symlinks)."""
+    out, level = [], [state_dir]
+    for _ in range(depth):
+        nxt = []
+        for d in level:
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        if not e.is_dir(follow_symlinks=False):
+                            continue
+                        (out if SUB.match(e.name) else nxt).append(Path(e.path))
+            except OSError:
+                pass
+        level = nxt
+    return out
+
+
+def _in_use():
+    """(sub_ IDs of every unfinished evaluation, whether one is unfinished at all) from the loader's and the
+    evaluators' own databases. Raises when they cannot be read: then nothing is deleted."""
+    loader = sqlite3.connect(f"file:{root() / 'loader' / 'http.sqlite'}?mode=ro", uri=True, timeout=10)
+    try:
+        rids = [r[0] for r in loader.execute("SELECT request_id FROM jobs WHERE phase NOT IN "
+                                             "('done','failed','cancelled','error')")]
+    finally:
+        loader.close()
+    subs = set()
+    for svc in (root() / "state").glob("*/http.sqlite"):
+        if not SHA.fullmatch(svc.parent.name) or not rids:
+            continue
+        db = sqlite3.connect(f"file:{svc}?mode=ro", uri=True, timeout=10)
+        try:
+            marks = ",".join("?" * len(rids))
+            subs |= {r[0] for r in db.execute(f"SELECT job_id FROM requests WHERE request_id IN ({marks})", rids) if r[0]}
+        finally:
+            db.close()
+    return subs, bool(rids)
+
+
+def _sweep_plan(now: float, quiet: float):
+    keep, busy = _in_use()
+    victims = []
+    for state_dir in (root() / "state").iterdir() if (root() / "state").is_dir() else []:
+        if not SHA.fullmatch(state_dir.name):
+            continue
+        for p in _design_folders(state_dir):
+            if p.name not in keep and _quiet(p, quiet, now):
+                victims.append(p)
+    if not busy and (root() / "tmp").is_dir():           # simulation scratch, only while nothing runs
+        victims += [p for p in (root() / "tmp").glob("cf-sim-*") if p.is_dir() and _quiet(p, quiet, now)]
+    return victims
+
+
+def sweep_seconds() -> float:
+    return float(os.environ.get("CF_V2_SWEEP_SECONDS") or 120)
+
+
+async def sweep_designs(reason: str = "periodic", quiet: float = None):
+    """Delete what finished evaluations left (see the module docstring). Returns what was removed, or None."""
+    global last_design_cleanup
+    if os.environ.get("CF_V2_KEEP_DESIGN_FILES") == "1" or not (root() / "loader" / "http.sqlite").is_file():
+        return None
+    quiet = float(os.environ.get("CF_V2_DESIGN_QUIET_SECONDS") or 600) if quiet is None else quiet
+    try:
+        before = shutil.disk_usage(root()).free
+        async with lock:                                  # new evaluations wait while folders are moved aside
+            victims = await asyncio.to_thread(_sweep_plan, time.time(), quiet)
+            if not victims:
+                return None
+            trash, moved = _trash(), []
+            for p in victims:
+                try:
+                    os.rename(p, trash / f"design-{p.name}-{time.time_ns()}")
+                    moved.append(p.name)
+                except OSError:
+                    pass
+        await asyncio.to_thread(_empty_trash)
+        free = shutil.disk_usage(root()).free
+    except (OSError, sqlite3.Error) as e:
+        print(f"[cleanup] design files skipped ({reason}): {type(e).__name__}", flush=True)
+        return None
+    designs = sorted({m for m in moved if m.startswith("sub_")})
+    last_design_cleanup = {"at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "reason": reason,
+                           "designs": designs, "folders": len(moved),
+                           "freed_gib": round(max(0, free - before) / 2**30, 1), "free_gib": round(free / 2**30, 1)}
+    print(f"[cleanup] {reason}: deleted the files of {len(designs)} finished design(s) ({len(moved)} folders), "
+          f"freed {last_design_cleanup['freed_gib']} GiB, {last_design_cleanup['free_gib']} GiB free", flush=True)
+    return last_design_cleanup

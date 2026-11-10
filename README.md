@@ -119,7 +119,7 @@ the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-
 
 ## Version and disk housekeeping
 
-- **EDA server version:** `gateway/VERSION` (now `1.0.2`) is the version of this code. Bump it one point with
+- **EDA server version:** `gateway/VERSION` (now `1.0.3`) is the version of this code. Bump it one point with
   every change to `main`. It is reported as `eda_version` in `GET /health` and `GET /v2/health`; validators send
   it to the challenge server and the website shows it on the validator's card.
 - **Old evaluator versions are deleted** by the gateway (`gateway/housekeeping.py`; it mounts the data root
@@ -141,6 +141,14 @@ the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-
   gateway mounts the Docker socket for it). `GET /v2/jobs` lists unfinished evaluations, `POST
   /v2/cancel/<request_id>` cancels one, `GET /v2/health` shows `watchdog`. `CF_V2_WATCHDOG=0` turns the automatic
   cancelling off.
+- **A finished evaluation's files are deleted** (since 1.0.3). The evaluator keeps each design's working folders
+  after its result is out (15-25 GB per design: `state/<sha>/components/*/wp-o/sub_*`, `runs/jobs/sub_*`) and
+  simulation scratch (`tmp/cf-sim-*`), so a few designs filled the disk. The result, with its full public report, is
+  with the validator and the challenge server; nothing here is used again. Every `CF_V2_SWEEP_SECONDS` (120) and at
+  start, the gateway deletes the folders of every design whose evaluation is no longer unfinished (passed,
+  rejected, failed, timed out, cancelled) once untouched for `CF_V2_DESIGN_QUIET_SECONDS` (600); the running and
+  queued designs' folders and everything shared (caches, tools, models) stay. `GET /v2/health` shows
+  `last_design_cleanup`; `CF_V2_KEEP_DESIGN_FILES=1` keeps them (debugging only).
 
 ## Security
 

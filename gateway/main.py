@@ -47,11 +47,23 @@ async def _cleanup_loop():
         await asyncio.sleep(housekeeping.prune_seconds())
 
 
+async def _sweep_loop():
+    """What finished evaluations left is deleted every CF_V2_SWEEP_SECONDS, from the start (housekeeping.py)."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await housekeeping.sweep_designs("periodic")
+        except Exception as e:
+            print(f"[cleanup] design sweep failed: {type(e).__name__}", flush=True)
+        await asyncio.sleep(housekeeping.sweep_seconds())
+
+
 @app.on_event("startup")
 async def _start_cleanup():
     print(f"[gateway] EDA server {housekeeping.VERSION}", flush=True)
     if not v2_mock.enabled():
         app.state.cleanup = asyncio.create_task(_cleanup_loop())
+        app.state.sweep = asyncio.create_task(_sweep_loop())
     # from the start: evaluations an older version left running for nobody are cancelled (jobs.py)
     app.state.watchdog = asyncio.create_task(jobs.loop())
 

@@ -45,6 +45,7 @@ ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")   # the loader's rule: ne
 router = APIRouter(prefix="/v2")
 lock = asyncio.Lock()             # one watchdog pass or cancel at a time
 recent: List[dict] = []           # the latest cancellations (GET /v2/health)
+_sweeps: set = set()              # file sweeps scheduled after a kill (a reference keeps each task alive)
 last_pass: Optional[str] = None
 
 
@@ -355,6 +356,16 @@ async def cancel_all(request: Request):
         print(f"[watchdog] cleanup after the kill switch failed: {type(e).__name__}", flush=True)
     print(f"[watchdog] kill switch: {sum(r['cancelled'] for r in results)} of {len(results)} evaluation(s) "
           f"cancelled ({reason})", flush=True)
+
+    async def sweep_soon():                          # the cancelled runs' files, once their stages have stopped
+        await asyncio.sleep(90)
+        import housekeeping
+        await housekeeping.sweep_designs("kill switch", quiet=60)
+    if results:
+        _sweeps.add(asyncio.create_task(sweep_soon()))
+        for t in list(_sweeps):
+            if t.done():
+                _sweeps.discard(t)
     return JSONResponse({"cancelled": [r["request_id"] for r in results if r["cancelled"]],
                          "failed": [r["request_id"] for r in results if not r["cancelled"]], "cleanup": cleanup},
                         status_code=200 if all(r["cancelled"] for r in results) else 502)

@@ -1,5 +1,5 @@
 """Gateway housekeeping: EDA version, free disk, deleting old evaluator versions. Run: pytest gateway/tests"""
-import asyncio, os, sqlite3, sys
+import asyncio, os, sqlite3, sys, time
 from pathlib import Path
 
 import pytest
@@ -107,3 +107,89 @@ def test_deleting_never_follows_symlinks_out(tmp_path):
 def test_disk_is_none_without_the_data_root(monkeypatch, tmp_path):
     monkeypatch.setenv("CF_V2_ROOT", str(tmp_path / "missing"))
     assert housekeeping.disk() is None
+
+
+# ------------------------------------------------------------------ finished designs' files (sweep_designs)
+def design_tree(root, sha, sub, old=True):
+    paths = [root / "state" / sha / "components" / "campaign" / "wp-o" / sub,
+             root / "state" / sha / "components" / "physical" / "wp-o" / sub,
+             root / "state" / sha / "runs" / "jobs" / sub]
+    for p in paths:
+        (p / "slot1").mkdir(parents=True, exist_ok=True)
+        (p / "slot1" / "big.bin").write_bytes(b"x" * 1000)
+        if old:
+            t = time.time() - 3600
+            for q in (p, p / "slot1", p / "slot1" / "big.bin"):
+                os.utime(q, (t, t))
+    return paths
+
+
+def evaluator_db(root, sha, rows):
+    db = sqlite3.connect(root / "state" / sha / "http.sqlite")
+    db.execute("CREATE TABLE IF NOT EXISTS requests (request_id TEXT, job_id TEXT)")
+    db.executemany("INSERT INTO requests VALUES (?,?)", rows); db.commit(); db.close()
+
+
+SUBS = {k: "sub_" + c * 24 for k, c in (("done", "a"), ("running", "b"), ("timedout", "c"), ("fresh", "d"), ("queued", "e"))}
+
+
+@pytest.fixture
+def designs(root):
+    import time as _t
+    version(root, A)
+    sql(root, "ALTER TABLE jobs ADD COLUMN created REAL")
+    for rid, phase in (("r-done", "done"), ("r-running", "running"), ("r-timedout", "done"), ("r-fresh", "done"),
+                       ("r-queued", "queued")):
+        sql(root, "INSERT INTO jobs (request_id, sha, phase) VALUES (?,?,?)", rid, A, phase)
+    evaluator_db(root, A, [("r-" + k, v) for k, v in SUBS.items()])
+    trees = {k: design_tree(root, A, v, old=(k != "fresh")) for k, v in SUBS.items()}
+    shared = [root / "state" / A / "components" / "physical" / "cache" / "x", root / "cache" / "platform-sim" / "y"]
+    for p in shared:
+        p.mkdir(parents=True); (p / "f").write_bytes(b"keep")
+    return trees, shared
+
+
+def test_finished_designs_files_are_deleted_and_the_running_ones_kept(root, designs):
+    trees, shared = designs
+    out = asyncio.run(housekeeping.sweep_designs("test"))
+    gone = lambda k: not any(p.exists() for p in trees[k])
+    kept = lambda k: all(p.exists() for p in trees[k])
+    assert gone("done") and gone("timedout")                       # passed / failed / timed out / cancelled
+    assert kept("running") and kept("queued")                     # unfinished: never touched
+    assert kept("fresh")                                          # finished seconds ago: after the quiet time
+    assert all((p / "f").exists() for p in shared)                # caches every evaluation uses stay
+    assert sorted(out["designs"]) == [SUBS["done"], SUBS["timedout"]] and out["folders"] == 6
+    assert housekeeping.decorate({})["last_design_cleanup"]["designs"] == out["designs"]
+    assert not list((root / "tmp" / "cf-old-evaluators").iterdir())   # emptied
+
+
+def test_simulation_scratch_only_while_nothing_runs(root, designs):
+    scratch = root / "tmp" / "cf-sim-abc"
+    scratch.mkdir(parents=True); (scratch / "w").write_bytes(b"x")
+    t = time.time() - 3600; os.utime(scratch, (t, t)); os.utime(scratch / "w", (t, t))
+    asyncio.run(housekeeping.sweep_designs("test"))
+    assert scratch.exists()                                       # an evaluation is running: it may be its scratch
+    sql(root, "UPDATE jobs SET phase='done'")
+    asyncio.run(housekeeping.sweep_designs("test"))
+    assert not scratch.exists()
+
+
+def test_nothing_is_deleted_when_the_databases_cannot_be_read(root, designs):
+    trees, _ = designs
+    (root / "loader" / "http.sqlite").write_bytes(b"not a database")
+    assert asyncio.run(housekeeping.sweep_designs("test")) is None
+    assert all(p.exists() for ps in trees.values() for p in ps)
+
+
+def test_switched_off(root, designs, monkeypatch):
+    monkeypatch.setenv("CF_V2_KEEP_DESIGN_FILES", "1")
+    trees, _ = designs
+    assert asyncio.run(housekeeping.sweep_designs("test")) is None and all(p.exists() for p in trees["done"])
+
+
+def test_a_symlink_named_like_a_design_is_not_followed(root, designs, tmp_path):
+    outside = tmp_path / "outside"; outside.mkdir(); (outside / "precious").write_bytes(b"keep")
+    link = root / "state" / A / "runs" / "jobs" / ("sub_" + "f" * 24)
+    link.symlink_to(outside)
+    asyncio.run(housekeeping.sweep_designs("test"))
+    assert (outside / "precious").exists()

@@ -21,7 +21,8 @@ the gateway (rebuilt on every `make start`; the evaluator image is pinned) watch
   stage and its sandboxes are stopped, the request ends ERROR / EVALUATION_CANCELLED (never scored) and the next
   evaluation starts.
 - GET /v2/jobs lists the unfinished evaluations (phase, sent, started, deadline); POST /v2/cancel/<request_id>
-  cancels one (validators call it when they give up). When an evaluation started running is recorded, so a
+  cancels one (validators call it when they give up); POST /v2/cancel-all cancels every one and cleans up the disk
+  (the challenge server's kill switch, relayed by validators). When an evaluation started running is recorded, so a
   validator can tell a slow design from one that waited for the machine.
 
 CF_V2_WATCHDOG=0 turns the automatic cancelling off (the endpoints stay).
@@ -332,3 +333,28 @@ async def cancel_route(request_id: str, request: Request):
     async with lock:
         out = await cancel(request_id, reason, "validator")
     return JSONResponse(out, status_code=200 if out["cancelled"] else 502)
+
+
+@router.post("/cancel-all")
+async def cancel_all(request: Request):
+    """Kill switch (the challenge server's KILL_EVALUATIONS, relayed by validators 1.0.8+): cancel every unfinished
+    evaluation now, then clean up the disk (old evaluator versions, housekeeping.py)."""
+    refused = _refused(request)
+    if refused:
+        return refused
+    reason = (request.headers.get("X-CF-Reason") or "kill switch: every evaluation stopped")[:150]
+    async with lock:
+        unfinished = await asyncio.to_thread(backend().unfinished)
+        results = [await cancel(j["request_id"], reason, "kill switch") for j in unfinished]
+    cleanup = None
+    try:
+        import housekeeping
+        from v2_proxy import active_evaluator
+        cleanup = await housekeeping.prune("kill switch", await active_evaluator())
+    except Exception as e:                           # cleaning up is best effort; the cancels are what matter
+        print(f"[watchdog] cleanup after the kill switch failed: {type(e).__name__}", flush=True)
+    print(f"[watchdog] kill switch: {sum(r['cancelled'] for r in results)} of {len(results)} evaluation(s) "
+          f"cancelled ({reason})", flush=True)
+    return JSONResponse({"cancelled": [r["request_id"] for r in results if r["cancelled"]],
+                         "failed": [r["request_id"] for r in results if not r["cancelled"]], "cleanup": cleanup},
+                        status_code=200 if all(r["cancelled"] for r in results) else 502)

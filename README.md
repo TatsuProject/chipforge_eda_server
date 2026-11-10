@@ -169,6 +169,7 @@ the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-
 | `GET /v2/status/<request_id>` | 202 while running, 200 with the result, 404 unknown |
 | `GET /v2/jobs` | unfinished evaluations: phase (queued/running), sent, started, deadline |
 | `POST /v2/cancel/<request_id>` | cancel an evaluation (validators call it when they give up on a design) |
+| `POST /v2/cancel-all` | cancel every evaluation and clean up the disk (the challenge server's kill switch, relayed by the validator) |
 
 | Command | Purpose |
 |---|---|

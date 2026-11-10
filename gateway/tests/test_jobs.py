@@ -263,3 +263,19 @@ def test_unknown_or_bad_ids(mock):
     assert mock.post("/v2/cancel/..%2F..").status_code in (404, 405)
     r = mock.post("/v2/cancel/nope")
     assert r.status_code == 200 and r.json()["cancelled"]                       # unknown: nothing to stop
+
+
+def test_the_kill_switch_cancels_everything(mock):
+    for rid in ("k1", "k2", "k3"):
+        send(mock, rid, rid)
+    r = mock.post("/v2/cancel-all", headers={"X-CF-Reason": "kill switch #1"})
+    assert r.status_code == 200 and sorted(r.json()["cancelled"]) == ["k1", "k2", "k3"]
+    assert mock.get("/v2/jobs").json()["jobs"] == []
+    assert mock.get("/v2/status/k2").json()["problems"][0]["code"] == "EVALUATION_CANCELLED"
+    assert mock.post("/v2/cancel-all").json()["cancelled"] == []              # nothing left: fine
+
+
+def test_the_kill_switch_needs_the_token_when_set(mock, monkeypatch):
+    monkeypatch.setenv("V2_ADMIN_TOKEN", "s3cret")
+    assert mock.post("/v2/cancel-all").status_code == 401
+    assert mock.post("/v2/cancel-all", headers={"Authorization": "Bearer s3cret"}).status_code == 200

@@ -451,8 +451,9 @@ async def evaluate(request: Request):
            "received_utc": datetime.now(timezone.utc).isoformat(), "accepted": time.monotonic(), "delay": delay,
            "ready_at": time.monotonic() + delay, "created": time.time(), "started": None, "cancelled": None,
            "result": None}
-    import jobs
-    jobs.note_deadline(rid, request.headers.get("x-cf-deadline"))
+    if request.headers.get("x-cf-request-id") == rid:           # like the real gateway (v2_proxy.evaluate)
+        import jobs
+        jobs.note_deadline(rid, request.headers.get("x-cf-deadline"))
     _jobs[rid] = job
     _forget_oldest(_jobs, MAX_JOBS)
     print(f"[MOCK] accepted {rid} ({len(data)} bytes, {mode}, chain_commit {'yes' if chain else 'no'}, "

@@ -13,9 +13,9 @@ the gateway (rebuilt on every `make start`; the evaluator image is pinned) watch
     1. its deadline passed (plus CF_V2_DEADLINE_GRACE_SECONDS, 30); or
     2. it has no deadline (sent by an older validator, or before this version) and is older than
        CF_V2_MAX_JOB_SECONDS (27600 = 7 h 40 min; the challenge server gives up after 7 h 10 min); or
-    3. it was sent more than CF_V2_ABANDONED_GAP_SECONDS (900) before the newest unfinished one: a validator
-       works on one design at a time (a batch's designs are sent within seconds of each other), so an older one
-       is a design it gave up on.
+    3. it has no deadline and was sent more than CF_V2_ABANDONED_GAP_SECONDS (900) before the newest unfinished
+       one: an older validator works on one design at a time, so an older one is a design it gave up on. (An
+       evaluation with a deadline is bounded by it alone: a batch's designs may be sent hours apart.)
   A validator's current evaluation matches none of them: nothing legitimate is cancelled.
 - Cancelling uses the evaluator's own `cf-cancel` inside its container (through the Docker socket): the running
   stage and its sandboxes are stopped, the request ends ERROR / EVALUATION_CANCELLED (never scored) and the next
@@ -40,7 +40,7 @@ import aiohttp
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-ID = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")   # the loader's rule: never starts with "-"
 router = APIRouter(prefix="/v2")
 lock = asyncio.Lock()             # one watchdog pass or cancel at a time
 recent: List[dict] = []           # the latest cancellations (GET /v2/health)
@@ -112,15 +112,19 @@ def store() -> Store:
 
 
 def note_deadline(rid: Optional[str], deadline: Optional[str]) -> None:
-    """From POST /v2/evaluate's X-CF-Request-Id / X-CF-Deadline headers (validators 1.0.8+)."""
+    """From POST /v2/evaluate's X-CF-Request-Id / X-CF-Deadline headers (validators 1.0.8+). Called only once the
+    evaluator accepted the request under that same ID (so no request can set another one's deadline). Never more
+    than CF_V2_MAX_JOB_SECONDS ahead: no deadline lets an evaluation outlive the age cap."""
     if not rid or not ID.match(rid) or not deadline:
         return
     try:
         dl = float(deadline)
     except ValueError:
         return
-    if not (time.time() - 86400 < dl < time.time() + 7 * 86400):
+    now = time.time()
+    if not (now - 86400 < dl < now + 7 * 86400):
         return
+    dl = min(dl, now + _env_float("CF_V2_MAX_JOB_SECONDS", 27600))
     rec = store().get(rid)
     rec["deadline"] = dl
     rec["seen"] = time.time()
@@ -144,7 +148,7 @@ class RealBackend:
         return [{"request_id": r[0], "phase": r[1], "created": float(r[2] or 0)} for r in rows]
 
     async def cancel(self, rid: str, reason: str) -> dict:
-        return await docker_exec(["cf-cancel", rid, "--reason", reason])
+        return await docker_exec(["cf-cancel", "--reason", reason, "--", rid])
 
 
 _backend = None
@@ -228,7 +232,7 @@ def stale(jobs: List[dict], st: Store, now: float) -> Dict[str, str]:
             out[j["request_id"]] = f"its deadline passed {(now - rec['deadline']) / 60:.0f} min ago"
         elif not rec.get("deadline") and now - j["created"] > cap:
             out[j["request_id"]] = f"sent {(now - j['created']) / 3600:.1f} h ago, longer than any evaluation may run"
-        elif newest - j["created"] > gap:
+        elif not rec.get("deadline") and newest - j["created"] > gap:      # a deadline bounds the others (batches)
             out[j["request_id"]] = (f"a newer evaluation was sent {(newest - j['created']) / 60:.0f} min after it: the "
                                     "validator gave up on this one")
     return out
@@ -297,8 +301,21 @@ def health() -> dict:
 
 
 # ------------------------------------------------------------------ routes (same in mock mode)
+def _refused(request: Request):
+    """With V2_ADMIN_TOKEN set (as for installs), listing and cancelling need `Authorization: Bearer <token>`: the
+    list names the designs being evaluated, and a cancel stops one. Validators send EDA_ADMIN_TOKEN."""
+    import secrets
+    tok = os.environ.get("V2_ADMIN_TOKEN", "")
+    if tok and not secrets.compare_digest(request.headers.get("authorization", ""), "Bearer " + tok):
+        return JSONResponse({"error": "ADMIN_TOKEN_REQUIRED", "message": "This needs the admin token."}, status_code=401)
+    return None
+
+
 @router.get("/jobs")
-async def list_jobs():
+async def list_jobs(request: Request):
+    refused = _refused(request)
+    if refused:
+        return refused
     jobs = await asyncio.to_thread(backend().unfinished)
     st = store()
     return {"jobs": [view(j, st.data.get(j["request_id"], {})) for j in jobs], "watchdog": health()}
@@ -306,6 +323,9 @@ async def list_jobs():
 
 @router.post("/cancel/{request_id}")
 async def cancel_route(request_id: str, request: Request):
+    refused = _refused(request)
+    if refused:
+        return refused
     if not ID.match(request_id):
         return JSONResponse({"error": "NOT_FOUND", "message": "Unknown request id."}, status_code=404)
     reason = (request.headers.get("X-CF-Reason") or "the validator gave up on it")[:150]

@@ -148,7 +148,11 @@ the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-
   internet. If the neuron runs on another machine, set `EDA_BIND_ADDRESS=0.0.0.0` and allow port 8080 only from
   that machine's IP.
 - The evaluator container is privileged and controls Docker, and the gateway uses the Docker socket to run
-  `cf-cancel` in it: use a dedicated machine.
+  `cf-cancel` in it: whoever controls the gateway controls the machine, so use a dedicated machine and keep port
+  8080 local.
+- `POST /v2/cancel` and `GET /v2/jobs` (like `POST /v2/evaluate`) have no API key unless you set
+  `V2_ADMIN_TOKEN`: then they need `Authorization: Bearer <token>` (validators send `EDA_ADMIN_TOKEN`). Set it
+  whenever port 8080 is reachable from another machine (`EDA_BIND_ADDRESS=0.0.0.0`).
 - Designs are compiled, simulated and analysed in containers with no network access.
 - Every download (evaluator assets, Gate B images, the drand random value) is checked against a pinned
   fingerprint or signature, so a proxy or relay cannot change any data.

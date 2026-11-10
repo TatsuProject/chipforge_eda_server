@@ -125,9 +125,13 @@ async def get_evaluator(sha: str, request: Request):
 @router.post("/evaluate")
 async def evaluate(request: Request):
     await housekeeping.wait_if_pruning()
-    import jobs                                   # the validator's deadline for this evaluation (jobs.py)
-    jobs.note_deadline(request.headers.get("x-cf-request-id"), request.headers.get("x-cf-deadline"))
-    return await _forward(request, "POST", "/evaluate", upload=True)
+    response = await _forward(request, "POST", "/evaluate", upload=True)
+    # the validator's deadline for this evaluation (jobs.py), once the evaluator accepted it under the same ID
+    rid = request.headers.get("x-cf-request-id")
+    if response.status_code in (200, 202) and rid and response.headers.get("x-request-id") == rid:
+        import jobs
+        jobs.note_deadline(rid, request.headers.get("x-cf-deadline"))
+    return response
 
 
 @router.get("/status/{request_id}")

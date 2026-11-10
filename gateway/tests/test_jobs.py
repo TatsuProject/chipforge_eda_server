@@ -68,8 +68,8 @@ def test_the_stuck_validators_are_cleaned_up(root, docker):
     job(root, "current", "queued", now - 3.3 * H)
     done = run(jobs.watch_once())
     assert sorted(done) == ["abandoned-1", "abandoned-2", "old-running"]
-    assert [c[1] for c in docker] == sorted(done, key=lambda r: ["old-running", "abandoned-1", "abandoned-2"].index(r))
-    assert all(c[0] == "cf-cancel" and c[2] == "--reason" for c in docker)
+    assert [c[-1] for c in docker] == sorted(done, key=lambda r: ["old-running", "abandoned-1", "abandoned-2"].index(r))
+    assert all(c[:2] == ["cf-cancel", "--reason"] and c[3] == "--" for c in docker)   # the ID never reads as an option
 
 
 def test_a_healthy_validator_loses_nothing(root, docker):
@@ -85,6 +85,25 @@ def test_a_batch_sent_together_is_kept(root, docker):
     for i in range(4):
         job(root, f"b{i}", "queued" if i else "running", now - 2 * H + i * 20)
     assert run(jobs.watch_once()) == [] and docker == []
+
+
+def test_an_all_mode_batch_sent_over_hours_is_kept(root, docker):
+    """Pen test: a batch of 8 sent 4 at a time; the 5th goes out hours after the first ones. They all carry the
+    batch's deadline: none is cancelled for being older than the newest."""
+    now = time.time()
+    for i in range(1, 4):
+        job(root, f"b{i}", "queued", now - 3 * H)
+        jobs.note_deadline(f"b{i}", str(now + 4 * H))
+    job(root, "b5", "running", now)
+    jobs.note_deadline("b5", str(now + 4 * H))
+    assert run(jobs.watch_once()) == [] and docker == []
+
+
+def test_ids_that_could_read_as_options_are_refused(root):
+    for bad in ("-h", "--reason", ".hidden", "a" * 129):
+        assert not jobs.ID.match(bad)
+        jobs.note_deadline(bad, str(time.time() + 60))
+    assert jobs.store().data == {}
 
 
 def test_a_passed_deadline_is_enforced(root, docker, monkeypatch):

@@ -170,3 +170,31 @@ def test_unsigned_override_headers_preserved(client, monkeypatch):
     assert r.headers['x-cf-evaluator-unsigned'] == '1'
     assert r.headers['x-cf-phase'] == 'done'
     assert r.headers['x-cf-scope-backend'] == 'cfscope'
+
+
+def test_a_deadline_is_kept_only_for_an_accepted_evaluation_under_the_same_id(client, monkeypatch, tmp_path):
+    """Pen test: a refused request, or one whose header names another evaluation, must not set a deadline (the
+    watchdog would cancel that other evaluation)."""
+    import time, jobs
+    monkeypatch.setattr(jobs, "_store", jobs.Store(None))
+    past = str(time.time() - 100)
+    client.post("/v2/evaluate", data={"request_id": "mismatch"}, headers={"X-CF-Request-Id": "r1", "X-CF-Deadline": past})
+    assert jobs.store().data == {}                                   # refused by the evaluator (409)
+    client.post("/v2/evaluate", files={"design_zip": ("d.zip", b"x")}, data={"request_id": "r1"},
+                headers={"X-CF-Request-Id": "victim-5HjH8ZqfoW-a", "X-CF-Deadline": past})
+    assert jobs.store().data == {}                                   # accepted as r1, header named another one
+    future = time.time() + 3600
+    client.post("/v2/evaluate", files={"design_zip": ("d.zip", b"x")}, data={"request_id": "r1"},
+                headers={"X-CF-Request-Id": "r1", "X-CF-Deadline": str(future)})
+    assert jobs.store().data["r1"]["deadline"] == pytest.approx(future)
+    client.post("/v2/evaluate", files={"design_zip": ("d.zip", b"x")}, data={"request_id": "r1"},
+                headers={"X-CF-Request-Id": "r1", "X-CF-Deadline": str(time.time() + 6 * 86400)})
+    assert jobs.store().data["r1"]["deadline"] < time.time() + 27700        # never beyond the age cap
+
+
+def test_cancel_and_jobs_need_the_admin_token_when_set(client, monkeypatch):
+    monkeypatch.setenv("V2_ADMIN_TOKEN", "s3cret")
+    assert client.get("/v2/jobs").status_code == 401
+    assert client.post("/v2/cancel/r1").status_code == 401
+    assert client.post("/v2/cancel/r1", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert client.get("/v2/jobs", headers={"Authorization": "Bearer s3cret"}).status_code == 200

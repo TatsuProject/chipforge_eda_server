@@ -4,6 +4,7 @@ Routes:
   GET  /health   liveness of the gateway itself (no evaluation is run)
   /v2/*          pass-through to the v2 evaluator service (v2_proxy.py); with EDA_MOCK_FILE set, answered by
                  the mock instead (v2_mock.py, testing only)
+  /v2/jobs, /v2/cancel/<id>   unfinished evaluations; cancel one (jobs.py: abandoned ones are cancelled automatically)
   /evaluate      the retired npu-v1 route: 410 Gone, with a pointer to /v2/evaluate
 
 npu-v1 has ended; its simulation and synthesis services are no longer part of this server.
@@ -14,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import housekeeping
+import jobs
 from v2_proxy import active_evaluator, router as _v2_router
 import v2_mock
 
@@ -25,6 +27,7 @@ if v2_mock.enabled():             # TESTING ONLY: EDA_MOCK_FILE answers /v2/* it
     app.include_router(v2_mock.router)
 else:
     app.include_router(_v2_router)   # /v2/* pass-through; 503 unless V2_SERVICE_URL is set
+app.include_router(jobs.router)       # /v2/jobs, /v2/cancel/<id>: abandoned evaluations are cancelled (jobs.py)
 
 
 @app.get("/health")
@@ -46,9 +49,11 @@ async def _cleanup_loop():
 
 @app.on_event("startup")
 async def _start_cleanup():
+    print(f"[gateway] EDA server {housekeeping.VERSION}", flush=True)
     if not v2_mock.enabled():
-        print(f"[gateway] EDA server {housekeeping.VERSION}", flush=True)
         app.state.cleanup = asyncio.create_task(_cleanup_loop())
+    # from the start: evaluations an older version left running for nobody are cancelled (jobs.py)
+    app.state.watchdog = asyncio.create_task(jobs.loop())
 
 
 V1_GONE = {

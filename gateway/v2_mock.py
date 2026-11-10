@@ -28,8 +28,12 @@ Evaluator installs (POST /v2/evaluator, GET /v2/evaluator/<sha>), as validators 
   Either way an evaluation names its evaluator (evaluator_sha256) and is refused unless that evaluator is
   installed and ready here, exactly like the real server.
 
+Like the real evaluator (1.0.2+), it runs one evaluation at a time, in the order they were sent: a later one waits
+(phase "queued") until the one before it finished or was cancelled (GET /v2/jobs, POST /v2/cancel/<id>, and the
+gateway's watchdog, jobs.py). EDA_MOCK_PARALLEL=1 runs them all at once, as before.
+
 Result fields:
-  delay_seconds   seconds until the result is ready (default 10)
+  delay_seconds   seconds the evaluation runs once it started (default 10)
   status          PASSED | REJECTED | INCOMPLETE | ERROR (default PASSED)
   S               a number, or [low, high]: a value derived from the design's sha256, so every validator
                   gets the same S for the same design (default [1.0, 6.0])
@@ -49,6 +53,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -61,6 +66,7 @@ INSTALL_MODE = os.environ.get("EDA_MOCK_INSTALL", "simulated").strip().lower()  
 PHASES = ("verify", "extract", "fetch_assets", "post_install", "preflight")
 MAX_UPLOAD_BYTES = int(float(os.environ.get("EDA_MOCK_MAX_UPLOAD_MB", "300")) * 1024 * 1024)
 MAX_JOBS, MAX_INSTALLS = 5000, 20      # remembered jobs / simulated installs (oldest forgotten first)
+PARALLEL = os.environ.get("EDA_MOCK_PARALLEL", "") == "1"
 
 
 def _too_large(request: Request):
@@ -207,18 +213,78 @@ def _result(job: dict) -> dict:
     }
 
 
+def _advance(now: Optional[float] = None) -> None:
+    """Like the real evaluator, one evaluation at a time in the order they were sent: a job starts when the one
+    before it finished or was cancelled, and takes its delay_seconds from then. EDA_MOCK_PARALLEL=1: all at once
+    (the behaviour before 1.0.2)."""
+    now = time.monotonic() if now is None else now
+    free_at = None
+    for job in _jobs.values():
+        if job.get("cancelled") is not None:
+            continue
+        if PARALLEL:
+            job.setdefault("started", job["accepted"])
+            job["ready_at"] = job["started"] + job["delay"]
+            continue
+        if job.get("started") is None:
+            start = job["accepted"] if free_at is None else max(free_at, job["accepted"])
+            if start > now:
+                break
+            job["started"] = start
+        job["ready_at"] = job["started"] + job["delay"]
+        if job["ready_at"] > now:
+            break
+        free_at = job["ready_at"]
+
+
+def _phase(job: dict) -> str:
+    _advance()
+    if job.get("cancelled") is not None:
+        return "done"
+    if job.get("started") is None:
+        return "queued"
+    return "done" if time.monotonic() >= job["ready_at"] else "running"
+
+
+class MockBackend:
+    """jobs.py's view of the mock: its unfinished jobs, and cancelling one."""
+
+    def unfinished(self) -> list:
+        return [{"request_id": j["request_id"], "phase": p, "created": j["created"]}
+                for j in list(_jobs.values()) for p in [_phase(j)] if p != "done"]
+
+    async def cancel(self, rid: str, reason: str) -> dict:
+        job = _jobs.get(rid)
+        if job is None:
+            return {"exit": 3, "output": "unknown request"}
+        if _phase(job) != "done":
+            job["cancelled"] = reason
+            job["result"] = _cancelled(job, reason)
+            print(f"[MOCK] cancelled {rid}: {reason}", flush=True)
+        return {"exit": 0, "output": json.dumps({"request_id": rid, "cancelled": True})}
+
+
+def _cancelled(job: dict, reason: str) -> dict:
+    return {"schema": "cf-response/1", "mock": True, "request_id": job["request_id"], "mode": job["mode"],
+            "status": "ERROR", "tier_reached": "T0", "summary": "MOCK: evaluation cancelled",
+            "problems": [{"code": "EVALUATION_CANCELLED", "fault": "system", "public_reason": reason[:200]}],
+            "score": None, "reward_eligible": False, "evaluator_sha256": job["evaluator"],
+            "created_at": datetime.now(timezone.utc).isoformat()}
+
+
 def _job_response(job: dict, accepted: bool = False) -> JSONResponse:
     """accepted=True: a new job, which (like the real server) always gets 202 first."""
+    phase = _phase(job)
     headers = {"X-Request-ID": job["request_id"], "X-CF-Evaluator-Sha256": job["evaluator"],
-               "Location": "/v2/status/" + job["request_id"], "Cache-Control": "no-store"}
-    if not accepted and time.monotonic() >= job["ready_at"]:
+               "Location": "/v2/status/" + job["request_id"], "Cache-Control": "no-store", "X-CF-Phase": phase}
+    if not accepted and phase == "done":
         if job["result"] is None:
             job["result"] = _result(job)
             print(f"[MOCK] {job['request_id']}: {job['status']} S={job['S'] if job['status'] == 'PASSED' else '-'} "
                   f"(no EDA tools ran)", flush=True)
         return JSONResponse(job["result"], status_code=200, headers=headers)
     headers["Retry-After"] = "5"
-    return JSONResponse({"request_id": job["request_id"], "evaluator_sha256": job["evaluator"], "phase": "running",
+    return JSONResponse({"request_id": job["request_id"], "evaluator_sha256": job["evaluator"], "phase": phase,
                          "status_url": "/v2/status/" + job["request_id"], "mode": job["mode"]},
                         status_code=202, headers=headers)
 
@@ -382,8 +448,11 @@ async def evaluate(request: Request):
     delay = max(0.0, float(cfg.get("delay_seconds", 10)))
     job = {"request_id": rid, "mode": mode, "digest": digest, "chain_commit": chain, "cfg": cfg, "evaluator": sha,
            "submitter": str(form.get("submitter") or rid), "status": status, "S": s,
-           "received_utc": datetime.now(timezone.utc).isoformat(), "ready_at": time.monotonic() + delay,
+           "received_utc": datetime.now(timezone.utc).isoformat(), "accepted": time.monotonic(), "delay": delay,
+           "ready_at": time.monotonic() + delay, "created": time.time(), "started": None, "cancelled": None,
            "result": None}
+    import jobs
+    jobs.note_deadline(rid, request.headers.get("x-cf-deadline"))
     _jobs[rid] = job
     _forget_oldest(_jobs, MAX_JOBS)
     print(f"[MOCK] accepted {rid} ({len(data)} bytes, {mode}, chain_commit {'yes' if chain else 'no'}, "

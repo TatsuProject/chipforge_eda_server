@@ -107,13 +107,19 @@ that passes locally passes on any draw only if it is correct in general, which i
 git pull && make start
 ```
 
+To update only the gateway (this repository's code; most updates) without stopping an evaluation in progress:
+
+```sh
+git pull && docker compose up -d --build eda-gateway
+```
+
 For a new evaluator, point `CF_V2_EVALUATOR_ZIP` at it and run `make start` (validator neurons install new
 evaluators automatically). A server that ran Quest 1 is replaced in place by the same commands (same port 8080);
 the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-api` images can then be removed.
 
 ## Version and disk housekeeping
 
-- **EDA server version:** `gateway/VERSION` (now `1.0.0`) is the version of this code. Bump it one point with
+- **EDA server version:** `gateway/VERSION` (now `1.0.2`) is the version of this code. Bump it one point with
   every change to `main`. It is reported as `eda_version` in `GET /health` and `GET /v2/health`; validators send
   it to the challenge server and the website shows it on the validator's card.
 - **Old evaluator versions are deleted** by the gateway (`gateway/housekeeping.py`; it mounts the data root
@@ -124,13 +130,25 @@ the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-
   needs. `archives/<sha>.zip` stays, so a version asked for again is reinstalled. It runs before an evaluator
   install and every `CF_V2_PRUNE_SECONDS` (600); `GET /v2/health` reports `disk` (free/total GiB) and
   `last_cleanup`. `CF_V2_KEEP_OLD_EVALUATORS=1` turns it off.
+- **Abandoned evaluations are cancelled** (`gateway/jobs.py`, since 1.0.2). The evaluator runs one evaluation at
+  a time and never stops one by itself, so a design the validator had given up on (deadline passed, validator
+  restarted) used to keep the machine busy for hours while every later design waited behind it and timed out.
+  Validators (neuron 1.0.8+) send each evaluation's deadline; the gateway keeps it on disk
+  (`CF_V2_ROOT/gateway/jobs.json`) and, every 15 s and right after it starts, cancels an unfinished evaluation
+  whose deadline passed, one with no deadline older than 7 h 40 min (`CF_V2_MAX_JOB_SECONDS`), or one sent more
+  than 15 min before a newer one (`CF_V2_ABANDONED_GAP_SECONDS`): a validator works on one design at a time. A
+  validator's current evaluation matches none of these. Cancelling uses the evaluator's own `cf-cancel` (the
+  gateway mounts the Docker socket for it). `GET /v2/jobs` lists unfinished evaluations, `POST
+  /v2/cancel/<request_id>` cancels one, `GET /v2/health` shows `watchdog`. `CF_V2_WATCHDOG=0` turns the automatic
+  cancelling off.
 
 ## Security
 
 - Port 8080 runs submitted code and has no API key. It is bound to `127.0.0.1` by default; never expose it to the
   internet. If the neuron runs on another machine, set `EDA_BIND_ADDRESS=0.0.0.0` and allow port 8080 only from
   that machine's IP.
-- The evaluator container is privileged and controls Docker: use a dedicated machine.
+- The evaluator container is privileged and controls Docker, and the gateway uses the Docker socket to run
+  `cf-cancel` in it: use a dedicated machine.
 - Designs are compiled, simulated and analysed in containers with no network access.
 - Every download (evaluator assets, Gate B images, the drand random value) is checked against a pinned
   fingerprint or signature, so a proxy or relay cannot change any data.
@@ -145,6 +163,8 @@ the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-
 | `GET /v2/evaluator/<sha256>` | install progress (`phase`: ... `ready` or `failed`) |
 | `POST /v2/evaluate` | start an evaluation |
 | `GET /v2/status/<request_id>` | 202 while running, 200 with the result, 404 unknown |
+| `GET /v2/jobs` | unfinished evaluations: phase (queued/running), sent, started, deadline |
+| `POST /v2/cancel/<request_id>` | cancel an evaluation (validators call it when they give up on a design) |
 
 | Command | Purpose |
 |---|---|

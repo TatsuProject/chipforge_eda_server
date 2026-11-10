@@ -29,12 +29,19 @@ services:
     # versions there (gateway/housekeeping.py).
     volumes:
       - ${CF_V2_ROOT:-/var/lib/chipforge-v2}:${CF_V2_ROOT:-/var/lib/chipforge-v2}
+      # to cancel abandoned evaluations with the evaluator's own cf-cancel (gateway/jobs.py); the port stays local
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - V2_SERVICE_URL=${V2_SERVICE_URL:-http://v2-evaluator:18080}
       - V2_ADMIN_TOKEN=${V2_ADMIN_TOKEN:-}
       - CF_V2_ROOT=${CF_V2_ROOT:-/var/lib/chipforge-v2}
       - CF_V2_PRUNE_SECONDS=${CF_V2_PRUNE_SECONDS:-600}
       - CF_V2_KEEP_OLD_EVALUATORS=${CF_V2_KEEP_OLD_EVALUATORS:-}
+      - CF_V2_WATCHDOG=${CF_V2_WATCHDOG:-1}
+      - CF_V2_WATCHDOG_SECONDS=${CF_V2_WATCHDOG_SECONDS:-15}
+      - CF_V2_MAX_JOB_SECONDS=${CF_V2_MAX_JOB_SECONDS:-27600}
+      - CF_V2_ABANDONED_GAP_SECONDS=${CF_V2_ABANDONED_GAP_SECONDS:-900}
+      - CF_V2_DEADLINE_GRACE_SECONDS=${CF_V2_DEADLINE_GRACE_SECONDS:-30}
 
   # The box every miner compiler is built and run in. Published, pinned image.
   cf-compiler:

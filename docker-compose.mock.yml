@@ -9,5 +9,9 @@ services:
       - "${EDA_BIND_ADDRESS:-127.0.0.1}:8080:8080"
     environment:
       - EDA_MOCK_FILE=/shared/eda_mock.json
+      - EDA_MOCK_PARALLEL=${EDA_MOCK_PARALLEL:-}
+      - CF_V2_WATCHDOG=${CF_V2_WATCHDOG:-1}
+      - CF_V2_ABANDONED_GAP_SECONDS=${CF_V2_ABANDONED_GAP_SECONDS:-900}
+      - CF_V2_MAX_JOB_SECONDS=${CF_V2_MAX_JOB_SECONDS:-27600}
     volumes:
       - ./shared:/shared:ro

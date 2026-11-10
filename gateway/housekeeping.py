@@ -62,7 +62,8 @@ def disk():
 
 def decorate(health: dict) -> dict:
     """What the gateway adds to the evaluator's /v2/health."""
-    return {**health, "eda_version": VERSION, "disk": disk(), "last_cleanup": last_cleanup}
+    import jobs
+    return {**health, "eda_version": VERSION, "disk": disk(), "last_cleanup": last_cleanup, "watchdog": jobs.health()}
 
 
 def in_use(active):

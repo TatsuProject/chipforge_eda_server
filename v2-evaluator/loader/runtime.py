@@ -20,7 +20,7 @@ _poll_clock = time.monotonic    # the status-poll pace: its own clock, separate 
 
 from . import cgroups
 from .install import Installer, provision_tools
-from .lifecycle import fence, ops_api, request_lock
+from .lifecycle import fence, ops_api, prune_request_locks, request_lock
 from .multipart import HTTPError
 from .security import InstallError, SHA, digest, private_locations, sync_dir
 from .supervisor import Service
@@ -40,8 +40,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 # v2.0.6 ops columns (cf-eval-ops/1, INTERFACE.md). Added in place: older rows read NULL. Never part of a
 # request's identity. The gateway reads only request_id/phase/created/sha from this table.
+# sent_deadline: the deadline a cf-eval-ops/1 evaluator is known to hold for the request (it answered 202 to a POST
+# carrying it). The loader's +90 s backstop applies only while it equals the row's deadline (INTERFACE.md 2).
 OPS_COLUMNS = (('deadline', 'REAL'), ('started', 'REAL'), ('finished', 'REAL'), ('stage', 'TEXT'),
-               ('tier', 'TEXT'), ('progress', 'TEXT'), ('queue_position', 'INTEGER'))
+               ('tier', 'TEXT'), ('progress', 'TEXT'), ('queue_position', 'INTEGER'), ('sent_deadline', 'REAL'))
 
 
 # Evaluator progress states that can never become a response by waiting longer.
@@ -72,6 +74,32 @@ def iso(ts):
     return None if ts is None else datetime.fromtimestamp(ts, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
+def finite(value):
+    """A JSON number as a finite float, or None (bools, non-numbers, NaN/inf and ints too large for a float)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def finish_time(doc):
+    """When an evaluator's terminal response says it finished: timing.finished_at (cf-eval-ops/1), else created_at
+    (every cf-response/1). ISO UTC -> UNIX seconds, or None."""
+    timing = doc.get('timing') if isinstance(doc.get('timing'), dict) else {}
+    for value in (timing.get('finished_at'), doc.get('created_at')):
+        if isinstance(value, str) and len(value) <= 40:
+            try:
+                when = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            except ValueError:
+                continue
+            if when.tzinfo is not None:
+                return when.timestamp()
+    return None
+
+
 def decimal(text):
     """ASCII decimal seconds (cf-eval-ops/1 form) -> float, or None."""
     text = text.strip() if isinstance(text, str) else ''
@@ -81,11 +109,12 @@ def decimal(text):
 def deadline_of(fields, headers, rid, accepted, now=None):
     """Effective deadline (UNIX seconds) of a request, or None (INTERFACE.md section 1).
 
-    Form fields deadline_unix / time_limit_s (from `accepted`, the loader's acceptance time) are an explicit
-    API: malformed -> 400 INVALID_DEADLINE. The X-CF-Deadline header is honoured only when X-CF-Request-Id is
-    absent or names this request, and only within (now - 1 d, now + 7 d) like the gateway; otherwise it is
-    ignored, never a refusal (validators already send it). The earliest wins, clamped to accepted +
-    CF_V2_MAX_JOB_SECONDS. A deadline already past is valid: the request is accepted and times out unstarted."""
+    Form fields deadline_unix / time_limit_s (from `accepted`, the loader's acceptance time) and the X-CF-Deadline
+    header take the same parse as service.py: positive ASCII decimal seconds, at most 32 characters, no more than
+    7 days ahead; anything else is 400 INVALID_DEADLINE. The header counts only when X-CF-Request-Id is absent
+    (or empty) or names this request; a header naming another request is ignored, whatever it holds, and an empty
+    header is absent. The earliest wins, clamped to accepted + CF_V2_MAX_JOB_SECONDS. A deadline already past,
+    by any amount and from any source, is valid: the request is accepted and times out unstarted."""
     now = time.time() if now is None else now
     found = []
     for name in ('deadline_unix', 'time_limit_s'):
@@ -99,10 +128,14 @@ def deadline_of(fields, headers, rid, accepted, now=None):
         found.append(value if name == 'deadline_unix' else accepted + value)
     headers = headers or {}
     header, owner = headers.get('X-CF-Deadline'), headers.get('X-CF-Request-Id')
-    if header is not None and (owner is None or owner.strip() == rid):
+    header = header.strip() if isinstance(header, str) else ''
+    owner = owner.strip() if isinstance(owner, str) else ''
+    if header and (not owner or owner == rid):
         value = decimal(header)
-        if value is not None and now - 86400 < value < now + 7 * 86400:
-            found.append(value)
+        if value is None or value <= 0 or value > now + 7 * 86400:
+            raise HTTPError(400, 'INVALID_DEADLINE', 'X-CF-Deadline must be positive decimal UNIX seconds no more '
+                            'than 7 days ahead.')
+        found.append(value)
     return min(min(found), accepted + max_job_seconds()) if found else None
 
 
@@ -137,6 +170,23 @@ def past_deadline(job):
     return job.get('deadline') is not None and time.time() >= float(job['deadline'])
 
 
+def reached_stage(job):
+    return job.get('stage') if job.get('started') and job.get('stage') else 'queued'
+
+
+def deadline_received(job):
+    """True when the evaluator is known to hold the row's current deadline: it answered 202 to a POST carrying it
+    (deadlines only tighten, so a held value at or below the row's is the row's). Only then does the loader trust
+    it to enforce the deadline itself."""
+    deadline, sent = job.get('deadline'), job.get('sent_deadline')
+    return deadline is not None and sent is not None and sent <= deadline + 0.001
+
+
+def sent_form(deadline):
+    """The deadline exactly as Service.submit writes it into deadline_unix."""
+    return float(f'{float(deadline):.3f}')
+
+
 def timeout_error(job, stage, why=None):
     """The loader's own EVALUATION_TIMEOUT (same text as the evaluator's catalogue entry, INTERFACE.md 5)."""
     started = bool(job.get('started'))
@@ -159,9 +209,7 @@ def clean_progress(doc):
             continue
         entry = {'stage': item['stage']}
         for key in ('started_unix', 'finished_unix'):
-            value = item.get(key)
-            entry[key] = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) \
-                and math.isfinite(value) else None
+            entry[key] = finite(item.get(key))
         attempt = item.get('attempt')
         entry['attempt'] = attempt if isinstance(attempt, int) and not isinstance(attempt, bool) else None
         out.append(entry)
@@ -192,6 +240,9 @@ class Runtime:
         self.poll_after = {}
         with self.db() as db:
             db.executescript(SCHEMA)
+            # Every column migration and the `sent` back-fill below commit together or not at all (sqlite3 runs a
+            # bare ALTER TABLE outside a transaction: a failure between it and the UPDATE left older rows unsent).
+            db.execute('BEGIN IMMEDIATE')
             # cf-chain-commit/1 (BEACON.md): forwarded verbatim to the evaluator, which validates it.
             columns = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
             if 'chain_commit' not in columns:
@@ -368,9 +419,13 @@ class Runtime:
                         sha, mode, submitter, design_hash, chain):
                     raise HTTPError(409, 'REQUEST_ID_CONFLICT', 'This request ID already names a different request.')
                 if deadline is not None and old['phase'] != 'done' and (old['deadline'] is None or deadline < old['deadline']):
+                    # Durable first. A forwarded request's evaluator is re-sent the tighter deadline on the next
+                    # pass (tick -> propagate_deadline); until it answers 202 the loader fences at the deadline
+                    # itself, without the +90 s grace (expire).
                     with self.db() as db:
                         db.execute("UPDATE jobs SET deadline=? WHERE request_id=? AND phase!='done'", (deadline, rid))
                     old['deadline'] = deadline
+                    self.poll_after.pop(rid, None)
                     self.wakeup.set()
                 if old['phase'] == 'fencing' or old['forwarded'] or old['error'] in (None, 'EVALUATION_CANCELLED', TIMEOUT, CONFLICT):
                     return old
@@ -386,7 +441,8 @@ class Runtime:
                 kept = [d for d in (old['deadline'], deadline) if d is not None]
                 with self.db() as db:
                     db.execute("UPDATE jobs SET attempt=?,phase='installing_evaluator',response=NULL,response_type=NULL,error=NULL,forwarded=0,"
-                               "started=NULL,finished=NULL,stage=NULL,tier=NULL,progress=NULL,queue_position=NULL,deadline=? WHERE request_id=?",
+                               "started=NULL,finished=NULL,stage=NULL,tier=NULL,progress=NULL,queue_position=NULL,sent_deadline=NULL,deadline=? "
+                               "WHERE request_id=?",
                                (attempt, min(kept) if kept else None, rid))
             else:
                 attempt = self.request_install(sha)
@@ -412,30 +468,54 @@ class Runtime:
         return dict(row) if row else None
 
     def finish(self, job, body, content_type='application/json', error=None):
-        if error:
-            with request_lock(self.root, job['request_id']):
-                current = self.job(job['request_id'])
-                if current['phase'] == 'done':
-                    return
-                if current['phase'] == 'fencing':
-                    body, content_type, error = current['response'], current['response_type'], current['error']
-                if current['forwarded']:
-                    # Durable intent precedes backend mutation and the public terminal row. A crash
-                    # anywhere after this commit resumes cleanup before any service can restart.
-                    with self.db() as db:
-                        db.execute("UPDATE jobs SET phase='fencing',response=?,response_type=?,error=? WHERE request_id=?",
-                                   (body, content_type, error, job['request_id']))
-                    drained = fence(self.root, self.installer.salt, current, body)
-                    completed = (drained or {}).get('completed_response')
-                    if completed:
-                        body = json.dumps(completed).encode()
-                        if not any(p.get('code') == error for p in completed.get('problems', [])):
-                            error = None
-                self._finish(job, body, content_type, error)
-            return
         with request_lock(self.root, job['request_id']):
-            if self.job(job['request_id'])['phase'] != 'fencing':
-                self._finish(job, body, content_type, error)
+            current = self.job(job['request_id'])
+            if current is None or current['phase'] == 'done':
+                return
+            if not error:
+                if current['phase'] == 'fencing':
+                    return          # a terminal fence already in progress decides (the dispatcher resumes it)
+                if not self.result_late(current, body):
+                    self._finish(job, body, content_type, error)
+                    return
+                # An evaluator result that finished at or after a deadline this evaluator never received is not
+                # accepted: the request ends EVALUATION_TIMEOUT through the fence (INTERFACE.md sections 1-2).
+                body, content_type, error = timeout_error(current, reached_stage(current)), 'application/json', TIMEOUT
+            if current['phase'] == 'fencing':
+                body, content_type, error = current['response'], current['response_type'], current['error']
+            if current['forwarded']:
+                # Durable intent precedes backend mutation and the public terminal row. A crash
+                # anywhere after this commit resumes cleanup before any service can restart.
+                with self.db() as db:
+                    db.execute("UPDATE jobs SET phase='fencing',response=?,response_type=?,error=? WHERE request_id=?",
+                               (body, content_type, error, job['request_id']))
+                drained = fence(self.root, self.installer.salt, current, body)
+                completed = (drained or {}).get('completed_response')
+                # A result the fence finds already recorded stands, unless it is one that must not (result_late).
+                if completed and not (error == TIMEOUT and self.result_late(current, completed)):
+                    body = json.dumps(completed).encode()
+                    if not any(p.get('code') == error for p in completed.get('problems', [])):
+                        error = None
+            self._finish(job, body, content_type, error)
+
+    def result_late(self, job, body):
+        """True when an evaluator's terminal result must not stand because the request's deadline passed first:
+        the job has a deadline its evaluator was not known to hold (an older evaluator, or one tightened since it
+        was forwarded and not yet re-sent), the result is scored (status other than ERROR), and the result's own
+        finish time (timing.finished_at, else created_at) is at or after that deadline - or unknown and the
+        deadline has passed. An evaluator that holds the deadline enforces it itself: its result is not judged
+        here. A result that stands is passed on byte for byte."""
+        deadline = job.get('deadline')
+        if deadline is None or deadline_received(job):
+            return False
+        try:
+            doc = json.loads(body) if isinstance(body, (bytes, str)) else body
+        except ValueError:
+            return False
+        if not isinstance(doc, dict) or doc.get('status') == 'ERROR':
+            return False
+        finished = finish_time(doc)
+        return (time.time() if finished is None else finished) >= float(deadline)
 
     def _finish(self, job, body, content_type, error):
         self.retry_after.pop(job['request_id'], None)
@@ -577,6 +657,7 @@ class Runtime:
                     return
                 phase = 'running' if state in ('running', 'leased') else 'queued'
                 self.note_progress(job, phase, json.loads(body), headers)
+                self.propagate_deadline(job['request_id'])
             elif status in (429, 503):
                 if submitting:
                     # A restarted evaluator has no accepted copy of this previously forwarded job.
@@ -635,6 +716,7 @@ class Runtime:
                     return None
                 result = self.service.submit(fresh)
                 if result is not None:
+                    self.note_deadline_sent(fresh, result[0])
                     return result
                 # The deadline passed while the body was written: nothing was sent. The claim is undone.
                 with self.db() as db:
@@ -644,9 +726,31 @@ class Runtime:
                 return None
         # Forwarded earlier, but the evaluator no longer holds it (404) and its deadline has passed: it is not
         # handed over again; it ends as a timeout through the fence, like any forwarded request.
-        stage = fresh.get('stage') if fresh.get('started') and fresh.get('stage') else 'queued'
-        self.finish(fresh, timeout_error(fresh, stage), error=TIMEOUT)
+        self.finish(fresh, timeout_error(fresh, reached_stage(fresh)), error=TIMEOUT)
         return None
+
+    def note_deadline_sent(self, job, status):
+        """After a POST carrying deadline_unix (cf-eval-ops/1 evaluators only): a 202 means the evaluator holds the
+        request with that deadline (or a tighter one). A 200 means it had already finished and did not apply it."""
+        if status == 202 and job.get('deadline') is not None and ops_api(self.root, job['sha']):
+            with self.db() as db:
+                db.execute("UPDATE jobs SET sent_deadline=? WHERE request_id=? AND phase NOT IN ('done','fencing')",
+                           (sent_form(job['deadline']), job['request_id']))
+
+    def propagate_deadline(self, rid):
+        """Re-send a forwarded request whose deadline was tightened after it was sent (cf-eval-ops/1 evaluators):
+        the same request_id and bytes with the tighter deadline_unix, which service.py takes as tighten-only, never
+        as a new request. Under the request lock, from the row as it is now. Idempotent and durable: until the
+        evaluator answers 202 the deadline counts as not received, so the next pass (or the next start) sends it
+        again, and expire() fences at the deadline itself without the +90 s grace."""
+        with request_lock(self.root, rid):
+            fresh = self.job(rid)
+            if (not fresh or fresh['phase'] in ('done', 'fencing') or not fresh['forwarded']
+                    or fresh['deadline'] is None or deadline_received(fresh) or not ops_api(self.root, fresh['sha'])):
+                return
+            result = self.service.submit(fresh)     # None: the deadline passed while the body was written; not sent
+            if result is not None:
+                self.note_deadline_sent(fresh, result[0])
 
     def time_out_unsent(self, job, why=None):
         """Terminal EVALUATION_TIMEOUT for a request never handed over (stage installing/queued). The caller
@@ -666,7 +770,7 @@ class Runtime:
         """A 202 from the evaluator: phase, and (cf-eval-ops/1 evaluators) the current stage, tier, queue position,
         start time and stage timeline, kept for /status and /jobs. Polled no faster than the evaluator's
         Retry-After (at most 5 s): one poll per 0.25 s filled service.log with 1.25 M lines."""
-        number = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+        number = finite
         current = doc.get('current_stage')
         stage = current if isinstance(current, str) and STAGE.fullmatch(current) else None
         tier = doc.get('tier') if doc.get('tier') in ('T0', 'T1', 'T2') else (
@@ -691,8 +795,9 @@ class Runtime:
     def expire(self, jobs, startup=False):
         """Deadline enforcement in the loader (INTERFACE.md section 2). Not yet forwarded and past its deadline:
         terminal EVALUATION_TIMEOUT at stage queued/installing, never forwarded. Forwarded: an evaluator that
-        enforces deadlines itself (cf-eval-ops/1) is given 90 s to answer first; an older one is stopped at the
-        deadline through the fence (its boxes and stages killed). At start-up also the gateway's age rule:
+        enforces deadlines itself (cf-eval-ops/1) and is known to hold this deadline (deadline_received) is given
+        90 s to answer first; any other - an older evaluator, or a deadline tightened since it was sent and not yet
+        re-sent - is stopped at the deadline through the fence (its boxes and stages killed). At start-up also the gateway's age rule:
         an unfinished request without a deadline older than CF_V2_MAX_JOB_SECONDS is not resumed.
         -> True when a job was finished (the caller re-reads the table)."""
         now, changed = time.time(), False
@@ -704,11 +809,10 @@ class Runtime:
                 if not (startup and now - job['created'] > max_job_seconds()):
                     continue
                 why = 'stale after restart: no deadline and older than the longest evaluation'
-            elif now < deadline + (90 if job['forwarded'] and ops_api(self.root, job['sha']) else 0):
+            elif now < deadline + (90 if job['forwarded'] and deadline_received(job) and ops_api(self.root, job['sha']) else 0):
                 continue
             if job['forwarded']:
-                stage = job.get('stage') if job.get('started') and job.get('stage') else 'queued'
-                self.finish(job, timeout_error(job, stage, why), error=TIMEOUT)
+                self.finish(job, timeout_error(job, reached_stage(job), why), error=TIMEOUT)
                 changed = True
                 continue
             with request_lock(self.root, job['request_id']):
@@ -736,6 +840,12 @@ class Runtime:
                 with self.mutex, self.db() as db:
                     db.execute("DELETE FROM jobs WHERE phase='done' AND COALESCE(finished, created) < ?",
                                (time.time() - days * 86400,))
+            # Lock files of request IDs with no row (forgotten by retention, or never accepted, e.g. a cf-cancel of
+            # an unknown ID). Under the acceptance mutex; a lock someone holds is left (prune_request_locks).
+            with self.mutex:
+                with self.db() as db:
+                    known = {r[0] for r in db.execute('SELECT request_id FROM jobs')}
+                prune_request_locks(self.root, known)
             self.cap_logs()
         except Exception:
             print('loader housekeeping pass failed; retried in 60 s', file=sys.stderr, flush=True)

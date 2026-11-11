@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 import fcntl
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -30,11 +31,50 @@ def ops_api(root, sha):
 
 @contextmanager
 def request_lock(root, rid):
+    """Exclusive per-request lock (loader, cf-cancel and the HTTP routes). Lock files are pruned under their own
+    lock (prune_request_locks), so after locking the holder checks that its file is still the one at the path;
+    if it was removed meanwhile it locks the file now there instead."""
     locks = Path(root) / 'loader/request-locks'
     locks.mkdir(exist_ok=True)
-    with (locks / rid).open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    path = locks / rid
+    while True:
+        lock = path.open('a')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                current = os.stat(path).st_ino == os.fstat(lock.fileno()).st_ino
+            except FileNotFoundError:
+                current = False
+        except BaseException:
+            lock.close()
+            raise
+        if current:
+            break
+        lock.close()
+    try:
         yield
+    finally:
+        lock.close()
+
+
+def prune_request_locks(root, keep):
+    """Remove the lock files of request IDs not in `keep` that nobody holds: each is locked without waiting and
+    removed while held, so a holder never loses its lock (request_lock re-checks its file after locking)."""
+    locks = Path(root) / 'loader/request-locks'
+    try:
+        paths = [p for p in locks.iterdir() if p.name not in keep]
+    except FileNotFoundError:
+        return
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            with path.open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if os.stat(path).st_ino == os.fstat(lock.fileno()).st_ino:
+                    path.unlink()
+        except OSError:
+            continue        # held (BlockingIOError) or already gone: left for the next pass
 
 
 def fence(root, salt, job, response):

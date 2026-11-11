@@ -26,7 +26,8 @@ if a.fence_request:
     import sys
     body = json.load(sys.stdin)
     (state / (a.fence_request + '.cancelled')).write_text(json.dumps(body))
-    print(json.dumps(dict(fenced=True, drained=True))); raise SystemExit(0)
+    # drained only when the stub's runs really stopped; a test sets fence-not-drained to model a drain that fails
+    print(json.dumps(dict(fenced=True, drained=not (state / 'fence-not-drained').exists()))); raise SystemExit(0)
 if a.cancel:                                   # operator cancellation (service.py --cancel contract)
     p = state / (a.cancel + '.json')
     if not p.exists():
@@ -78,7 +79,11 @@ ThreadingHTTPServer((a.host,int(a.port)),H).serve_forever()
 def ops_stub(text):
     """The synthetic service as a cf-eval-ops/1 (v2.0.6) evaluator: carries the marker, takes deadline_unix /
     accepted_unix (kept in its state file), answers 202 with stage/tier/progress (names and times only), and
-    takes --by. Times out by itself at its deadline only when told to (self_timeout file in its state)."""
+    takes --by. Enforces its deadline like service.py: a re-POST of a held request may only tighten it, and a run
+    not finished by its deadline answers its own terminal EVALUATION_TIMEOUT (summary 'stub: evaluator timed out').
+    State-file switches for tests: `no-self-timeout` (an evaluator that fails to enforce it), `refuse-repost` (a
+    re-POST of a held request answers 503, so a tightened deadline never reaches it). Success bodies carry
+    timing.finished_at (the run's own finish time)."""
     def rep(old, new):
         assert text.count(old) == 1, old
         return text.replace(old, new)
@@ -86,6 +91,29 @@ def ops_stub(text):
     text = rep("ap.add_argument('--fence-request')", "ap.add_argument('--fence-request'); ap.add_argument('--by')")
     text = rep("p.with_suffix('.cancelled').write_text(a.reason or '')",
                "p.with_suffix('.cancelled').write_text(json.dumps(dict(reason=a.reason, by=a.by)))")
+    text = rep("        if not p.exists(): p.write_text(",
+               "        if p.exists() and (state / 'refuse-repost').exists():\n"
+               "            return self.send(503,b'{\"error\":{\"code\":\"BUSY\"}}')\n"
+               "        if p.exists() and fields.get('deadline_unix'):\n"
+               "            held = json.loads(p.read_text()); new = fields['deadline_unix'].decode()\n"
+               "            if held.get('deadline_unix') is None or float(new) < float(held['deadline_unix']):\n"
+               "                held['deadline_unix'] = new; p.write_text(json.dumps(held))\n"
+               "        if not p.exists(): p.write_text(")
+    text = rep("        t = json.loads(p.read_text())['time']\n",
+               "        t = json.loads(p.read_text())['time']\n"
+               "        dl = json.loads(p.read_text()).get('deadline_unix')\n"
+               "        if dl and time.time() >= float(dl) and t + DELAY > float(dl) and not (state / 'no-self-timeout').exists():\n"
+               "            out = p.with_suffix('.timeout')\n"
+               "            if not out.exists():\n"
+               "                out.write_text(json.dumps(dict(schema='cf-response/1', request_id=p.stem, status='ERROR', score=None, "
+               "summary='stub: evaluator timed out', receipt=None, problems=[dict(code='EVALUATION_TIMEOUT', fault='system', "
+               "metadata=dict(stage='compile', started=True, deadline_unix=float(dl)))], outcome=dict(fault='timeout', "
+               "code='EVALUATION_TIMEOUT', stage='compile', reason='deadline', started=True), "
+               "timing=dict(finished_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))))\n"
+               "            return self.send(200,out.read_bytes())\n")
+    text = rep("        return self.send(200,RAW)\n",
+               "        return self.send(200,RAW.replace(b'\"timing\":{}', ('\"timing\":{\"finished_at\":\"%s\"}' % "
+               "time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t + DELAY))).encode()))\n")
     text = rep("assert set(fields) - {'chain_commit'} ==", "assert set(fields) - {'chain_commit', 'deadline_unix', 'accepted_unix'} ==")
     text = rep("chain_commit=chain)))",
                "chain_commit=chain, deadline_unix=fields.get('deadline_unix', b'').decode() or None, "

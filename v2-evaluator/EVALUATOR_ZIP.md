@@ -298,23 +298,32 @@ receipt, projection, public report or score.
 
 - **Deadline.** `POST /v2/evaluate` takes optional `deadline_unix` (absolute UNIX seconds) and
   `time_limit_s` (seconds from the loader's acceptance), ASCII decimals of at most 32 characters, and the
-  header `X-CF-Deadline` (honoured when `X-CF-Request-Id` is absent or equals `request_id`; an unusable
-  header is ignored, a malformed field is 400 `INVALID_DEADLINE`). The earliest wins, never later than
-  acceptance + `CF_V2_MAX_JOB_SECONDS` (27600). Not part of request identity: a re-sent request may only
-  tighten it. A request not yet handed to its evaluator when its deadline passes, including one already
-  past at intake, ends ERROR `EVALUATION_TIMEOUT` at stage `queued` (or `installing`) and never starts. An
-  evaluator carrying `CF_EVAL_OPS_API = "cf-eval-ops/1"` in its `service.py` is sent `deadline_unix` and
-  `accepted_unix` and enforces the deadline itself; the loader stops it 90 s later if it has not. An older
-  evaluator is sent neither field and is stopped by the loader at the deadline through its fence.
-  The deadline is checked again at hand-over, under the request's lock and against its current (possibly
-  tightened) value, and once more after the request body is written: a slow service start or a large upload
-  never carries a request past its deadline into the evaluator.
+  header `X-CF-Deadline` (UNIX seconds, same parse as `deadline_unix`). The header counts when
+  `X-CF-Request-Id` is absent or equals `request_id`; one naming another request is ignored, and an empty one
+  is absent. A malformed or non-positive value, or one more than 7 days ahead, in a field or a counted header
+  is 400 `INVALID_DEADLINE`. A deadline in the past, by any amount and from any source, is valid. The
+  earliest wins, never later than acceptance + `CF_V2_MAX_JOB_SECONDS` (27600). Not part of request
+  identity: a re-sent request may only tighten it. A request not yet handed to its evaluator when its
+  deadline passes, including one already past at intake, ends ERROR `EVALUATION_TIMEOUT` at stage `queued`
+  (or `installing`) and never starts. An evaluator carrying `CF_EVAL_OPS_API = "cf-eval-ops/1"` in its
+  `service.py` is sent `deadline_unix` and `accepted_unix` and enforces the deadline itself. A deadline
+  tightened after hand-over is re-sent to it (the same request ID and bytes; its `service.py` only tightens),
+  and the loader records the deadline the evaluator acknowledged with a 202. The loader stops a run 90 s after
+  a deadline the evaluator acknowledged if it has not ended, and at the deadline itself in every other case:
+  an older evaluator (sent neither field), or a tightened deadline not yet acknowledged. Either way the stop
+  goes through the evaluator's fence, and a request is only finished once the fence reports its work drained.
+  An evaluator result is not accepted when the evaluator never acknowledged the deadline and the result's
+  own finish time (`timing.finished_at`, else `created_at`) is at or after it: such a request ends
+  `EVALUATION_TIMEOUT`. A result that stands is passed on byte for byte. The deadline is checked again at
+  hand-over, under the request's lock and against its current (possibly tightened) value, and once more
+  after the request body is written: a request is not sent once its deadline has passed.
 - **Restart.** At start the loader finishes, unstarted or fenced, every unfinished request past its
   deadline, and one without a deadline older than `CF_V2_MAX_JOB_SECONDS`.
 - **Progress.** A 202 carries `stage` (also header `X-CF-Stage`), `tier`, `queue_position`, `accepted_at`,
   `started_at`, `deadline_unix` and `progress` (stage names and times only, at most 200; never values or
   scores). The loader polls its evaluator no faster than the evaluator's `Retry-After` (1-5 s).
-- **Admin routes** (`Authorization: Bearer $V2_ADMIN_TOKEN` when the token is set): `GET /jobs` (each
+- **Admin routes** (`Authorization: Bearer $V2_ADMIN_TOKEN` when the token is set in the loader's own
+  environment; without it they are open to anything that can reach the loader's port): `GET /jobs` (each
   unfinished request in dispatch order plus those finished in the last hour: `request_id`, `phase`
   queued/running/done, `queue_position`, `stage`, `sent_at`, `started_at`, `deadline`, `finished_at` and
   their `_unix` forms), `POST /cancel/<request_id>` (200 cancelled or already finished, 404 unknown, 502 retry)
@@ -331,7 +340,8 @@ receipt, projection, public report or score.
 - **Housekeeping** (every 60 s): uploaded designs are deleted once their request is finished;
   finished requests are forgotten `CF_V2_REQUEST_RETENTION_DAYS` (7; 0 keeps them) after finishing, never
   unfinished ones; an older evaluator's `service.log` / `workers.log` are copy-truncated at
-  `CF_V2_LOG_MAX_MIB` (64), one `.1` kept. `V2_ADMIN_TOKEN` is removed from the evaluator's environment.
+  `CF_V2_LOG_MAX_MIB` (64), one `.1` kept. Per-request lock files with no request row are removed when no
+  one holds them. `V2_ADMIN_TOKEN` is removed from the evaluator's environment.
   A request ID reused after it was forgotten, while the evaluator still holds its own record of the earlier
   request, ends ERROR `REQUEST_ID_CONFLICT` (not retryable; nothing run): the earlier design's result is
   never served for it. Use a new request ID.

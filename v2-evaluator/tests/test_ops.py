@@ -31,11 +31,20 @@ def test_deadline_sources_validation_and_clamp(monkeypatch):
     assert deadline_of({'time_limit_s': '300.5'}, {}, 'r', now - 100, now) == now + 200.5
     both = {'deadline_unix': str(int(now + 900)), 'time_limit_s': '600'}
     assert deadline_of(both, {'X-CF-Deadline': str(now + 400)}, 'r', now, now) == now + 400   # earliest wins
-    # the header only for this request (or no request id named), and silently ignored when unusable
+    # the header only for this request (or no request id named); another request's header is ignored, whatever it says
     assert deadline_of({}, {'X-CF-Deadline': str(now + 50), 'X-CF-Request-Id': 'other'}, 'r', now, now) is None
+    assert deadline_of({}, {'X-CF-Deadline': 'soon', 'X-CF-Request-Id': 'other'}, 'r', now, now) is None
     assert deadline_of({}, {'X-CF-Deadline': str(now + 50), 'X-CF-Request-Id': 'r'}, 'r', now, now) == now + 50
-    for junk in ('soon', 'nan', '-5', str(now + 8 * 86400), str(now - 2 * 86400), '1e9'):
-        assert deadline_of({}, {'X-CF-Deadline': junk}, 'r', now, now) is None
+    assert deadline_of({}, {'X-CF-Deadline': str(now + 50), 'X-CF-Request-Id': ''}, 'r', now, now) == now + 50
+    assert deadline_of({}, {'X-CF-Deadline': '  '}, 'r', now, now) is None                    # empty: absent
+    # Codex final MF2: a matching header in the past, by any amount, is a deadline that has passed (the request is
+    # accepted and times out unstarted), never "no deadline"; a malformed one is refused like the form fields
+    for ago in (1, 2 * 86400, 30 * 86400):
+        assert deadline_of({}, {'X-CF-Deadline': str(now - ago)}, 'r', now, now) == now - ago
+    for junk in ('soon', 'nan', '-5', '0', str(now + 8 * 86400), '1e9', '1' * 33):
+        with pytest.raises(HTTPError) as e:
+            deadline_of({}, {'X-CF-Deadline': junk, 'X-CF-Request-Id': 'r'}, 'r', now, now)
+        assert e.value.code == 'INVALID_DEADLINE'
     # the form fields are an explicit API: malformed is a refusal
     for name, value in (('deadline_unix', 'x'), ('deadline_unix', '0'), ('deadline_unix', str(now + 8 * 86400)),
                         ('time_limit_s', '-1'), ('time_limit_s', 'inf'), ('time_limit_s', str(8 * 86400)),
@@ -94,6 +103,15 @@ def test_past_deadline_never_starts_and_reports_timeout(tmp_path):
         assert doc['timing']['started_at'] is None and doc['timing']['queued_s'] >= 0
         assert stub_state(runtime, sha, 'late') is None                          # never handed to the evaluator
         assert not runtime.job('late')['forwarded']
+        # the same through a matching X-CF-Deadline header two days old (was: ignored, and the request ran)
+        old = f'{time.time() - 2 * 86400:.0f}'
+        assert request('POST', '/evaluate', dict(design_zip=b'h', evaluator_sha256=sha, request_id='late-h'),
+                       headers={'X-CF-Deadline': old, 'X-CF-Request-Id': 'late-h'})[0] == 202
+        assert problem(wait_until(lambda: terminal(request, 'late-h'))[2])['code'] == 'EVALUATION_TIMEOUT'
+        assert stub_state(runtime, sha, 'late-h') is None and not runtime.job('late-h')['sent']
+        bad = request('POST', '/evaluate', dict(design_zip=b'j', evaluator_sha256=sha, request_id='junk-h'),
+                      headers={'X-CF-Deadline': 'tomorrow', 'X-CF-Request-Id': 'junk-h'})
+        assert bad[0] == 400 and json.loads(bad[2])['error']['code'] == 'INVALID_DEADLINE' and runtime.job('junk-h') is None
 
 
 def test_waiting_request_times_out_while_the_running_one_continues(tmp_path):
@@ -142,13 +160,57 @@ def test_ops_evaluator_gets_the_deadline_progress_and_a_grace(tmp_path):
         assert doc['progress'] == [dict(stage='admit', started_unix=doc['progress'][0]['started_unix'],
                                         finished_unix=doc['progress'][0]['finished_unix'], attempt=1)]
         assert 'score' not in body.decode() and 'bad stage' not in body.decode()
-        # Past its deadline, the evaluator (which enforces it itself) gets 90 s before the loader steps in.
-        dl = time.time() + 0.5
+        # Codex final MF1: a tighter deadline re-sent while it runs is re-forwarded to the evaluator (an idempotent
+        # re-POST), which then times the run out itself. Was: only the loader's row changed, the loader granted
+        # another 90 s, and the run's later PASSED was accepted.
+        dl = time.time() + 1.0
         request('POST', '/evaluate', dict(design_zip=b'a', evaluator_sha256=sha, request_id='ops', deadline_unix=f'{dl:.3f}'))
         assert runtime.job('ops')['deadline'] == pytest.approx(dl, abs=0.001)
-        wait_until(lambda: time.time() > dl + 1.5, timeout=10)
-        assert runtime.job('ops')['phase'] == 'running' and not (runtime.root / 'state' / sha / 'ops.cancelled').exists()
-        assert wait_until(lambda: terminal(request, 'ops'), timeout=20)[2] == RAW
+        wait_until(lambda: float(stub_state(runtime, sha, 'ops')['deadline_unix']) == pytest.approx(dl, abs=0.001), timeout=10)
+        wait_until(lambda: runtime.job('ops')['sent_deadline'] == pytest.approx(dl, abs=0.001), timeout=10)
+        doc = json.loads(wait_until(lambda: terminal(request, 'ops'), timeout=20)[2])
+        assert time.time() < dl + 15                                                # the evaluator's own, not D + 90
+        assert doc['summary'] == 'stub: evaluator timed out' and problem(json.dumps(doc))['code'] == 'EVALUATION_TIMEOUT'
+        assert not (runtime.root / 'state' / sha / 'ops.cancelled').exists()     # the loader never had to fence
+
+
+def test_tightened_deadline_the_evaluator_never_got_is_fenced_at_once(tmp_path):
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=30, ops=True)
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        far = time.time() + 600
+        request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=archive, request_id='nr', deadline_unix=f'{far:.3f}'))
+        wait_until(lambda: runtime.job('nr')['phase'] == 'running', timeout=60)
+        assert runtime.job('nr')['sent_deadline'] == pytest.approx(far, abs=0.001)
+        (runtime.root / 'state' / sha / 'refuse-repost').write_text('')       # the re-forward never lands
+        dl = time.time() + 1.0
+        request('POST', '/evaluate', dict(design_zip=b'a', evaluator_sha256=sha, request_id='nr'),
+                headers={'X-CF-Deadline': f'{dl:.3f}', 'X-CF-Request-Id': 'nr'})
+        doc = json.loads(wait_until(lambda: terminal(request, 'nr'), timeout=15)[2])   # was: D + 90, then PASSED
+        assert time.time() < dl + 10 and doc['problems'][0]['code'] == 'EVALUATION_TIMEOUT'
+        assert doc['outcome']['started'] is True and doc['summary'] != 'stub: evaluator timed out'   # the loader's
+        fenced = json.loads((runtime.root / 'state' / sha / 'nr.cancelled').read_text())
+        assert fenced['problems'][0]['code'] == 'EVALUATION_TIMEOUT'
+        assert float(stub_state(runtime, sha, 'nr')['deadline_unix']) == pytest.approx(far, abs=0.001)
+        assert runtime.job('nr')['sent_deadline'] == pytest.approx(far, abs=0.001)
+
+
+def test_fence_that_does_not_drain_never_finishes_the_request_or_frees_the_machine(tmp_path):
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=60)           # old zip: the loader fences at D
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        fields = dict(design_zip=b'a', evaluator_zip=archive, request_id='nd')
+        request('POST', '/evaluate', fields)
+        wait_until(lambda: runtime.job('nd')['phase'] == 'running', timeout=60)
+        blocker = runtime.root / 'state' / sha / 'fence-not-drained'
+        blocker.write_text('')
+        request('POST', '/evaluate', fields, headers={'X-CF-Deadline': f'{time.time() + 0.5:.3f}', 'X-CF-Request-Id': 'nd'})
+        request('POST', '/evaluate', dict(design_zip=b'b', evaluator_sha256=sha, request_id='after'))
+        wait_until(lambda: runtime.job('nd')['phase'] == 'fencing', timeout=10)
+        time.sleep(2)
+        assert runtime.job('nd')['phase'] == 'fencing' and terminal(request, 'nd') is None   # not drained: not done
+        assert not runtime.job('after')['forwarded'] and stub_state(runtime, sha, 'after') is None
+        blocker.unlink()                                                         # the drain completes
+        assert problem(wait_until(lambda: terminal(request, 'nd'), timeout=15)[2])['code'] == 'EVALUATION_TIMEOUT'
+        wait_until(lambda: runtime.job('after')['forwarded'], timeout=15)
 
 
 def test_restart_does_not_resume_stale_requests(tmp_path, monkeypatch):
@@ -407,6 +469,181 @@ def _queued(tmp_path, monkeypatch, deadline, forwarded=0, design='unused', clock
     monkeypatch.setattr(runtime.service, 'request', lambda *a, **k: (404, {}, b'{}'))
     monkeypatch.setattr(runtime.service, 'submit', lambda job: sent.append(dict(job)) or (202, {}, b'{"state":"queued"}'))
     return runtime, sent
+
+
+@pytest.mark.parametrize('sent, ops, fires_at', [
+    (1100.0, True, 1190.0),      # the evaluator was sent this deadline and enforces it: the loader backstop at D + 90
+    (2000.0, True, 1100.0),      # tightened after it was forwarded and not yet re-forwarded: at D, no grace
+    (None, True, 1100.0),        # forwarded without a deadline, tightened since: at D
+    (None, False, 1100.0),       # an older evaluator (no cf-eval-ops/1): at D
+])
+def test_loader_backstop_fires_at_the_right_time(tmp_path, monkeypatch, sent, ops, fires_at):
+    # Opus final NICE 1 / Codex final MF3: the +90 s backstop really fires, and only for a deadline the evaluator got.
+    clock = [1000.0]
+    runtime, _ = _queued(tmp_path, monkeypatch, 1100.0, forwarded=1, clock=clock)
+    monkeypatch.setattr(runtime_module, 'ops_api', lambda *a: ops)
+    fenced = []
+    monkeypatch.setattr(runtime_module, 'fence', lambda root, salt, job, body: fenced.append(json.loads(body)) or
+                        {'fenced': True, 'drained': True})
+    with runtime.db() as db:
+        db.execute("UPDATE jobs SET phase='running',started=950,stage='compile',tier='T1',sent_deadline=?", (sent,))
+    try:
+        for t in (1099.9, fires_at - 0.1, fires_at):
+            clock[0] = t
+            runtime.expire([runtime.job('q')])
+            assert (runtime.job('q')['phase'] == 'done') is (t >= fires_at), t
+        doc = json.loads(runtime.job('q')['response'])
+        assert doc['problems'][0]['code'] == 'EVALUATION_TIMEOUT' and doc['outcome']['stage'] == 'compile'
+        assert len(fenced) == 1 and fenced[0]['problems'][0]['code'] == 'EVALUATION_TIMEOUT'
+    finally:
+        runtime.close()
+
+
+def _result(status, finished):
+    from loader.runtime import iso
+    return json.dumps(dict(schema='cf-response/1', request_id='q', status=status, score=0.87 if status == 'PASSED' else None,
+                           created_at='2026-01-01T00:00:00Z', problems=[], receipt={'sig': 'x'},
+                           timing=dict(finished_at=iso(finished)))).encode()
+
+
+@pytest.mark.parametrize('sent, status, finished, stands', [
+    (2000.0, 'PASSED', 1150, False),    # finished after a deadline its evaluator never got: EVALUATION_TIMEOUT
+    (2000.0, 'REJECTED', 1150, False),
+    (None, 'PASSED', 1150, False),
+    (2000.0, 'PASSED', 1050, True),     # finished before it: the result stands, byte for byte
+    (1100.0, 'PASSED', 1150, True),     # the evaluator got this deadline and enforces it itself: its result stands
+    (2000.0, 'ERROR', 1150, True),      # unscored either way: the evaluator's own ERROR stands
+])
+def test_result_finished_after_a_deadline_its_evaluator_never_got_is_a_timeout(tmp_path, monkeypatch, sent, status, finished, stands):
+    # Codex final MF1: the late-success probe (tightened deadline, then a PASSED with score 0.87 accepted).
+    clock = [1200.0]
+    runtime, _ = _queued(tmp_path, monkeypatch, 1100.0, forwarded=1, clock=clock)
+    body = _result(status, finished)
+    monkeypatch.setattr(runtime_module, 'ops_api', lambda *a: True)
+    monkeypatch.setattr(runtime.service, 'request', lambda *a, **k: (200, {'Content-Type': 'application/json'}, body))
+    fenced = []
+    monkeypatch.setattr(runtime_module, 'fence', lambda root, salt, job, b: fenced.append(json.loads(b)) or
+                        {'fenced': True, 'drained': True, 'completed_response': json.loads(body)})
+    with runtime.db() as db:
+        db.execute("UPDATE jobs SET phase='running',started=950,stage='compile',sent_deadline=?", (sent,))
+    try:
+        runtime.tick(runtime.job('q'))
+        job = runtime.job('q')
+        assert job['phase'] == 'done'
+        if stands:
+            assert job['response'] == body and job['error'] is None and fenced == []
+        else:
+            doc = json.loads(job['response'])
+            assert job['error'] == 'EVALUATION_TIMEOUT' and doc['status'] == 'ERROR' and doc['score'] is None
+            assert doc['outcome'] == dict(fault='timeout', code='EVALUATION_TIMEOUT', stage='compile',
+                                          reason=doc['outcome']['reason'], started=True)
+            assert fenced and fenced[0]['problems'][0]['code'] == 'EVALUATION_TIMEOUT'
+    finally:
+        runtime.close()
+
+
+def test_deadline_propagation_survives_a_restart(tmp_path, monkeypatch):
+    # The tightened deadline is durable on the row; until a re-forward is answered 202 it counts as not received,
+    # so a restart in between re-sends it (idempotent) and the backstop never grants grace on an unsent deadline.
+    clock = [1000.0]
+    runtime, sent = _queued(tmp_path, monkeypatch, 1100.0, forwarded=1, clock=clock)
+    monkeypatch.setattr(runtime_module, 'ops_api', lambda *a: True)
+    monkeypatch.setattr(runtime.service, 'request', lambda *a, **k: (202, {}, b'{"state":"running"}'))
+    with runtime.db() as db:
+        db.execute("UPDATE jobs SET phase='running',sent_deadline=2000.0")
+    monkeypatch.setattr(runtime.service, 'submit', lambda job: sent.append(dict(job)) or (503, {}, b'{}'))
+    runtime.tick(runtime.job('q'))
+    assert [j['deadline'] for j in sent] == [1100.0] and runtime.job('q')['sent_deadline'] == 2000.0
+    runtime.close()
+    runtime = Runtime(tmp_path / 'root', tmp_path / 'salt', allow_unsigned=True)       # a restart
+    monkeypatch.setattr(runtime.service, 'ensure', lambda sha: None)
+    monkeypatch.setattr(runtime.service, 'request', lambda *a, **k: (202, {}, b'{"state":"running"}'))
+    monkeypatch.setattr(runtime.service, 'submit', lambda job: sent.append(dict(job)) or (202, {}, b'{"state":"running"}'))
+    try:
+        runtime.tick(runtime.job('q'))
+        assert [j['deadline'] for j in sent] == [1100.0, 1100.0] and runtime.job('q')['sent_deadline'] == 1100.0
+        runtime.poll_after.clear()
+        runtime.tick(runtime.job('q'))
+        assert len(sent) == 2                                                     # received: not sent again
+    finally:
+        runtime.close()
+
+
+def test_sent_column_migration_is_one_transaction(tmp_path):
+    # Opus final NICE 2: ALTER and UPDATE used to commit separately; a failure between them left every older row
+    # never-sent (and so a REQUEST_ID_CONFLICT on its own evaluator's record).
+    import gc
+    root = tmp_path / 'root'; (root / 'loader').mkdir(parents=True)
+    db = sqlite3.connect(root / 'loader/http.sqlite')
+    with db:
+        db.executescript(runtime_module.SCHEMA)
+        db.execute("INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,forwarded) "
+                   "VALUES('old',?,1,'T2','s','h','/x','running',1,1)", ('a' * 64,))
+        db.execute("CREATE TRIGGER boom BEFORE UPDATE ON jobs BEGIN SELECT RAISE(ABORT, 'injected'); END")
+    try:
+        Runtime(root, tmp_path / 'salt', allow_unsigned=True)
+        raise AssertionError('migration did not fail')
+    except sqlite3.Error:
+        pass
+    gc.collect()                                                                # release the half-built loader lock
+    columns = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
+    assert 'sent' not in columns and 'deadline' not in columns                  # nothing half-applied
+    with db:
+        db.execute('DROP TRIGGER boom')
+    db.close()
+    runtime = Runtime(root, tmp_path / 'salt', allow_unsigned=True)
+    try:
+        assert runtime.job('old')['sent'] == 1
+    finally:
+        runtime.close()
+
+
+def test_huge_progress_numbers_are_dropped_not_fatal(tmp_path, monkeypatch):
+    # Opus final NICE 3: math.isfinite(10**400) raises OverflowError, and the dispatcher's catch-all then failed
+    # every pending job.
+    from loader.runtime import clean_progress
+    huge = 10 ** 400
+    assert clean_progress({'progress': [{'stage': 'a', 'started_unix': huge, 'finished_unix': 1, 'attempt': 1}]}) == \
+        [{'stage': 'a', 'started_unix': None, 'finished_unix': 1.0, 'attempt': 1}]
+    clock = [1000.0]
+    runtime, _ = _queued(tmp_path, monkeypatch, None, forwarded=1, clock=clock)
+    try:
+        runtime.note_progress(runtime.job('q'), 'running', {'started_unix': huge, 'progress': [{'stage': 'b', 'finished_unix': huge}]}, {})
+        assert runtime.job('q')['started'] == 1000.0 and runtime.job('q')['phase'] == 'running'
+    finally:
+        runtime.close()
+
+
+def test_request_locks_are_pruned_safely(tmp_path, monkeypatch):
+    # Opus final NICE 5: loader/request-locks/<rid> files were never removed.
+    from loader import lifecycle
+    from loader.lifecycle import request_lock
+    clock = [1000.0]
+    runtime, _ = _queued(tmp_path, monkeypatch, None, clock=clock)
+    locks = runtime.root / 'loader/request-locks'
+    try:
+        for rid in ('q', 'forgotten', 'busy'):
+            with request_lock(runtime.root, rid):
+                pass
+        with request_lock(runtime.root, 'busy'):                                # held (an unknown ID being accepted)
+            runtime.housekeeping()
+        assert sorted(p.name for p in locks.iterdir()) == ['busy', 'q']         # 'forgotten' (no row) removed
+        # a holder whose file was removed between its open and its lock locks the file now at the path instead
+        real, raced = lifecycle.fcntl.flock, []
+        def racing(f, op):
+            if not raced and not op & lifecycle.fcntl.LOCK_NB:
+                raced.append(1)
+                os.unlink(f.name)
+            return real(f, op)
+        monkeypatch.setattr(lifecycle.fcntl, 'flock', racing)
+        with request_lock(runtime.root, 'x'):
+            monkeypatch.setattr(lifecycle.fcntl, 'flock', real)
+            assert raced and (locks / 'x').exists()
+            with open(locks / 'x', 'a') as other:
+                with pytest.raises(BlockingIOError):
+                    real(other, lifecycle.fcntl.LOCK_EX | lifecycle.fcntl.LOCK_NB)
+    finally:
+        runtime.close()
 
 
 def _timed_out_unsent(runtime):

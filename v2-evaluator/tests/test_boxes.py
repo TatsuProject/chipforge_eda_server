@@ -289,6 +289,8 @@ def test_a_service_waiting_for_ram_is_kept_not_a_start_failure(tmp_path, docker,
         rt.db = db
         rt.job = lambda rid: dict(request_id=rid, sha='a' * 64, phase='queued', forwarded=0, sent=0, deadline=None)
         rt.forward = lambda job: Runtime.forward(rt, job)
+        rt.note_deadline_sent = lambda job, status: Runtime.note_deadline_sent(rt, job, status)
+        rt.propagate_deadline = lambda rid: Runtime.propagate_deadline(rt, rid)
         for _ in range(5):                                         # more ticks than the 3 start failures allowed
             Runtime.tick(rt, {'sha': 'a' * 64, 'request_id': 'r1'})
         assert failed == [] and rt.start_failures == {} and service.proc is proc

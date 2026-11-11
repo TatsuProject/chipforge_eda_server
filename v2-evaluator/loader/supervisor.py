@@ -195,4 +195,6 @@ class Service:
                     f.write(data)
             f.write(f'\r\n--{boundary}--\r\n'.encode())
             f.flush()
+            if job.get('deadline') is not None and time.time() >= float(job['deadline']):
+                return None     # the deadline passed while the body was written: never sent (the caller times it out)
             return self.request('POST', '/evaluate', f.name, 'multipart/form-data; boundary=' + boundary)

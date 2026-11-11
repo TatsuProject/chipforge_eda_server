@@ -47,6 +47,7 @@ OPS_COLUMNS = (('deadline', 'REAL'), ('started', 'REAL'), ('finished', 'REAL'), 
 # Evaluator progress states that can never become a response by waiting longer.
 TERMINAL_STATES = frozenset({'done', 'failed', 'cancelled', 'error'})
 TIMEOUT = 'EVALUATION_TIMEOUT'
+CONFLICT = 'REQUEST_ID_CONFLICT'
 TIMEOUT_CHECKED = 'the request\'s deadline (deadline_unix / time_limit_s / X-CF-Deadline)'
 API = 'cf-eval-ops/1'
 FEATURES = ['deadline', 'cancel', 'jobs', 'progress', 'outcome', 'retention']
@@ -107,12 +108,16 @@ def deadline_of(fields, headers, rid, accepted, now=None):
 
 def system_error(job, code, detail='Evaluator infrastructure unavailable; retry this request.',
                  title='Evaluator infrastructure failure', stage=None, retryable=True, metadata=None,
-                 checked='loader provisioning and service supervision', tier='T0'):
+                 checked='loader provisioning and service supervision', tier=None):
     # No scores for infrastructure/provisioning faults. Never include exception text or subprocess output.
     instance = 'urn:chipforge:eval:' + job['request_id']
     now = time.time()
     created, started, deadline = job.get('created'), job.get('started'), job.get('deadline')
+    # One stage and one tier everywhere in the body (outcome, problem location, metadata): the stage given, else
+    # the one the run reached, else evaluator_install; the tier given, else the one reached once started, else T0.
     reached = stage or (job.get('stage') if started else None) or ('evaluator_install' if not started else 'running')
+    if tier is None:
+        tier = job.get('tier') if started and job.get('tier') in ('T0', 'T1', 'T2') else 'T0'
     timing = dict(accepted_at=iso(created), started_at=iso(started), finished_at=iso(now),
                   queued_s=None if created is None else round(max(0.0, (started or now) - created), 3),
                   ran_s=None if started is None else round(max(0.0, now - started), 3), deadline_unix=deadline)
@@ -124,8 +129,12 @@ def system_error(job, code, detail='Evaluator infrastructure unavailable; retry 
         reward_eligible=False, pending=[], tier_reached=tier, summary=detail, stages=[], logs=[], receipt=None,
         timing=timing, problems=[dict(type='urn:chipforge:problem:npu-v2:' + code, title=title,
         detail=detail, instance=instance + '#problem-1', code=code, category='infrastructure', fault='system',
-        exploit=False, retryable=retryable, severity='error', where={'tier': tier, 'stage': stage or 'evaluator_install'},
+        exploit=False, retryable=retryable, severity='error', where={'tier': tier, 'stage': reached},
         checked=checked, metadata=metadata or {})], outcome=outcome)).encode()
+
+
+def past_deadline(job):
+    return job.get('deadline') is not None and time.time() >= float(job['deadline'])
 
 
 def timeout_error(job, stage, why=None):
@@ -190,6 +199,13 @@ class Runtime:
             for name, kind in OPS_COLUMNS:
                 if name not in columns:
                     db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
+            if 'sent' not in columns:
+                # 1 once this loader has handed the row's request to an evaluator; never reset (a 429/503 resets
+                # `forwarded`, not this). An evaluator record under an ID whose row was never sent belongs to an
+                # earlier request whose row has since expired: never adopted. Rows from an older loader (which
+                # kept every row forever) count as sent, so their behaviour is unchanged.
+                db.execute('ALTER TABLE jobs ADD COLUMN sent INTEGER NOT NULL DEFAULT 0')
+                db.execute('UPDATE jobs SET sent=1')
         self.startup_sweep = True          # first dispatch pass: stale requests left by a restart are not resumed
         self.next_housekeeping = 0.0
         self.sweep_uploads()               # before any request is accepted: uploads of finished/unknown jobs
@@ -356,7 +372,7 @@ class Runtime:
                         db.execute("UPDATE jobs SET deadline=? WHERE request_id=? AND phase!='done'", (deadline, rid))
                     old['deadline'] = deadline
                     self.wakeup.set()
-                if old['phase'] == 'fencing' or old['forwarded'] or old['error'] in (None, 'EVALUATION_CANCELLED', TIMEOUT):
+                if old['phase'] == 'fencing' or old['forwarded'] or old['error'] in (None, 'EVALUATION_CANCELLED', TIMEOUT, CONFLICT):
                     return old
                 # Explicit retries of a system failure may repair the install and resubmit. The finished job's
                 # upload was deleted: the same bytes (design_hash matched) take its place.
@@ -364,6 +380,7 @@ class Runtime:
                 os.replace(design, old['design'])
                 with open(old['design'], 'rb') as f:
                     os.fsync(f.fileno())
+                sync_dir(Path(old['design']).parent)
                 # A retry keeps the tighten-only rule: the earlier of the stored and the re-sent deadline, so a
                 # deadline first sent with the retry is enforced (and forwarded to a cf-eval-ops service).
                 kept = [d for d in (old['deadline'], deadline) if d is not None]
@@ -524,15 +541,23 @@ class Runtime:
             self.start_failures.pop(job['sha'], None)
             status, headers, body = self.service.request('GET', '/status/' + job['request_id'])
             submitting = status == 404
+            if status in (200, 202) and not (job.get('sent') or job.get('forwarded')):
+                # The evaluator holds a request under this ID that this row never sent: an earlier request whose
+                # loader row expired (CF_V2_REQUEST_RETENTION_DAYS) while the evaluator kept its own. Its result
+                # is another design's: never adopted, and the new design is never run under the reused ID.
+                fresh = self.job(job['request_id'])
+                if fresh and not (fresh['sent'] or fresh['forwarded']) and fresh['phase'] not in ('done', 'fencing'):
+                    self.finish(fresh, system_error(
+                        fresh, CONFLICT, title='Request ID already used', retryable=False,
+                        detail='The evaluator already holds an earlier request under this request ID. Nothing was '
+                               'evaluated or scored; resubmit under a new request ID.'), error=CONFLICT)
+                    return
             if submitting:
-                # Atomic with cf-cancel: a cancelled snapshot cannot forward a design later.
-                with request_lock(self.root, job['request_id']):
-                    with self.db() as db:
-                        claimed = db.execute("UPDATE jobs SET forwarded=1 WHERE request_id=? AND phase NOT IN ('done','fencing')",
-                                             (job['request_id'],)).rowcount
-                    if not claimed:
-                        return
-                    status, headers, body = self.service.submit(job)
+                sent = self.forward(job)
+                if sent is None:
+                    return
+                status, headers, body = sent
+                job = self.job(job['request_id'])
             if status == 200:
                 self.finish(job, body, next((v for k, v in headers.items() if k.lower() == 'content-type'), 'application/json'))
             elif status == 202:
@@ -591,6 +616,52 @@ class Runtime:
         except (OSError, http.client.HTTPException):
             pass  # Durable service status/idempotent submission recovers after restart.
 
+    def forward(self, job):
+        """Hand a request to its evaluator. Under the request lock (atomic with cf-cancel and with a re-sent,
+        tighter deadline), from the row as it is now, not this pass's snapshot: the deadline forwarded is the
+        current one, and a request whose deadline has passed is never handed over - checked under the lock, and
+        again by Service.submit once the body is written, just before it is sent.
+        -> the evaluator's (status, headers, body), or None when nothing was sent."""
+        rid = job['request_id']
+        with request_lock(self.root, rid):
+            fresh = self.job(rid)
+            if not fresh or fresh['phase'] in ('done', 'fencing'):
+                return None
+            if not past_deadline(fresh):
+                with self.db() as db:
+                    claimed = db.execute("UPDATE jobs SET forwarded=1,sent=1 WHERE request_id=? AND phase NOT IN ('done','fencing')",
+                                         (rid,)).rowcount
+                if not claimed:
+                    return None
+                result = self.service.submit(fresh)
+                if result is not None:
+                    return result
+                # The deadline passed while the body was written: nothing was sent. The claim is undone.
+                with self.db() as db:
+                    db.execute('UPDATE jobs SET forwarded=?,sent=? WHERE request_id=?', (fresh['forwarded'], fresh['sent'], rid))
+            if not fresh['forwarded']:
+                self.time_out_unsent(fresh)
+                return None
+        # Forwarded earlier, but the evaluator no longer holds it (404) and its deadline has passed: it is not
+        # handed over again; it ends as a timeout through the fence, like any forwarded request.
+        stage = fresh.get('stage') if fresh.get('started') and fresh.get('stage') else 'queued'
+        self.finish(fresh, timeout_error(fresh, stage), error=TIMEOUT)
+        return None
+
+    def time_out_unsent(self, job, why=None):
+        """Terminal EVALUATION_TIMEOUT for a request never handed over (stage installing/queued). The caller
+        holds the request lock. -> True when this call finished it."""
+        stage = 'installing' if job['phase'] == 'installing_evaluator' else 'queued'
+        with self.db() as db:
+            n = db.execute("UPDATE jobs SET phase='done',response=?,response_type='application/json',error=?,"
+                           "finished=?,queue_position=NULL WHERE request_id=? AND forwarded=0 AND phase NOT IN ('done','fencing')",
+                           (timeout_error(job, stage, why), TIMEOUT, time.time(), job['request_id'])).rowcount
+        if n:
+            self.retry_after.pop(job['request_id'], None)
+            self.poll_after.pop(job['request_id'], None)
+            print(f'request {job["request_id"]} timed out unstarted ({stage})', file=sys.stderr, flush=True)
+        return bool(n)
+
     def note_progress(self, job, phase, doc, headers):
         """A 202 from the evaluator: phase, and (cf-eval-ops/1 evaluators) the current stage, tier, queue position,
         start time and stage timeline, kept for /status and /jobs. Polled no faster than the evaluator's
@@ -640,17 +711,8 @@ class Runtime:
                 self.finish(job, timeout_error(job, stage, why), error=TIMEOUT)
                 changed = True
                 continue
-            stage = 'installing' if job['phase'] == 'installing_evaluator' else 'queued'
             with request_lock(self.root, job['request_id']):
-                with self.db() as db:
-                    n = db.execute("UPDATE jobs SET phase='done',response=?,response_type='application/json',error=?,"
-                                   "finished=?,queue_position=NULL WHERE request_id=? AND forwarded=0 AND phase NOT IN ('done','fencing')",
-                                   (timeout_error(job, stage, why), TIMEOUT, time.time(), job['request_id'])).rowcount
-            changed = changed or bool(n)
-            if n:
-                self.retry_after.pop(job['request_id'], None)
-                self.poll_after.pop(job['request_id'], None)
-                print(f'request {job["request_id"]} timed out unstarted ({stage})', file=sys.stderr, flush=True)
+                changed = self.time_out_unsent(job, why) or changed
         return changed
 
     def sweep_uploads(self):

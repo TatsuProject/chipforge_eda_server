@@ -306,6 +306,9 @@ receipt, projection, public report or score.
   evaluator carrying `CF_EVAL_OPS_API = "cf-eval-ops/1"` in its `service.py` is sent `deadline_unix` and
   `accepted_unix` and enforces the deadline itself; the loader stops it 90 s later if it has not. An older
   evaluator is sent neither field and is stopped by the loader at the deadline through its fence.
+  The deadline is checked again at hand-over, under the request's lock and against its current (possibly
+  tightened) value, and once more after the request body is written: a slow service start or a large upload
+  never carries a request past its deadline into the evaluator.
 - **Restart.** At start the loader finishes, unstarted or fenced, every unfinished request past its
   deadline, and one without a deadline older than `CF_V2_MAX_JOB_SECONDS`.
 - **Progress.** A 202 carries `stage` (also header `X-CF-Stage`), `tier`, `queue_position`, `accepted_at`,
@@ -320,13 +323,21 @@ receipt, projection, public report or score.
   (`validator`, `kill_switch`, `operator`, `watchdog`) are kept in the problem's metadata.
 - **Responses made by the loader** (install faults, cancels, timeouts) carry `outcome` {fault
   system/timeout, code, stage, reason, started} and `timing` {accepted_at, started_at, finished_at,
-  queued_s, ran_s, deadline_unix}.
+  queued_s, ran_s, deadline_unix}, for every evaluator version (a strict check against the 2.0.5
+  `cf-response/1` schema, which has no `outcome`, must allow the key on ERROR bodies). The stage and tier in
+  `outcome`, the problem's `where` and its metadata are always the same.
 - **Health** adds `api`, `features`, `disk` {path, free_gib, total_gib, used_gib} and `queue` {installing,
   queued, running, oldest_queued_s}.
 - **Housekeeping** (every 60 s): uploaded designs are deleted once their request is finished;
   finished requests are forgotten `CF_V2_REQUEST_RETENTION_DAYS` (7; 0 keeps them) after finishing, never
   unfinished ones; an older evaluator's `service.log` / `workers.log` are copy-truncated at
   `CF_V2_LOG_MAX_MIB` (64), one `.1` kept. `V2_ADMIN_TOKEN` is removed from the evaluator's environment.
+  A request ID reused after it was forgotten, while the evaluator still holds its own record of the earlier
+  request, ends ERROR `REQUEST_ID_CONFLICT` (not retryable; nothing run): the earlier design's result is
+  never served for it. Use a new request ID.
+- **`POST /cancel-all` is synchronous**: each running evaluation is stopped and drained before it answers
+  (up to ~10 min per request in the worst case). Give the call a long timeout; a timed-out call has not
+  stopped the work, and calling it again is safe.
 
 ## Minimal fixture compatibility
 

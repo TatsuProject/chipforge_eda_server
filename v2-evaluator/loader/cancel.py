@@ -31,9 +31,11 @@ BY = ('operator', 'validator', 'kill_switch', 'watchdog')
 
 
 def cancelled_error(job, reason, by):
+    # One stage in outcome, problem location and metadata: the stage reached once started, else queued; and
+    # the tier reached once started (system_error's default).
     stage = (job.get('stage') if job.get('started') else None) or 'queued'
     return system_error(job, CODE, detail=f'The validator operator cancelled this evaluation ({reason}). '
-                        'Nothing was scored; resubmit under a new request ID.',
+                        'Nothing was scored; resubmit under a new request ID.', stage=stage,
                         title='Evaluation cancelled by the validator', metadata={'by': by, 'stage': stage})
 
 

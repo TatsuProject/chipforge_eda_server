@@ -85,8 +85,9 @@ def test_past_deadline_never_starts_and_reports_timeout(tmp_path):
         doc = json.loads(body)
         p = doc['problems'][0]
         assert doc['status'] == 'ERROR' and doc['score'] is None and doc['reward_eligible'] is False
-        assert (p['code'], p['retryable'], p['metadata']['started'], p['where']['stage']) == ('EVALUATION_TIMEOUT', False, False, 'queued') \
-            or p['where']['stage'] == 'installing'
+        assert (p['code'], p['retryable'], p['metadata']['started']) == ('EVALUATION_TIMEOUT', False, False)
+        assert p['where']['stage'] in ('queued', 'installing')
+        assert p['where']['stage'] == p['metadata']['stage'] == doc['outcome']['stage']
         assert p['detail'].startswith('The evaluation reached its deadline during the ')
         assert doc['outcome']['fault'] == 'timeout' and doc['outcome']['code'] == 'EVALUATION_TIMEOUT'
         assert doc['outcome']['started'] is False and doc['timing']['ran_s'] is None
@@ -263,17 +264,17 @@ def test_uploads_deleted_retention_and_retry_restores_bytes(tmp_path, monkeypatc
         (uploads / 'orphan.zip').write_bytes(b'x')                           # a crash between upload and acceptance
         runtime.sweep_uploads()
         assert list(uploads.iterdir()) == []
-        # a system failure retried under the same ID gets its bytes back
-        request('POST', '/evaluate', dict(design_zip=b'r', evaluator_sha256=sha, request_id='retry', mode='T2'))
-        wait_until(lambda: runtime.job('retry')['forwarded'])
-        wait_until(lambda: terminal(request, 'retry'))
-        with runtime.db() as db:
-            db.execute("UPDATE jobs SET error='EVALUATOR_SERVICE_EXITED', forwarded=0 WHERE request_id='retry'")
+        # a system failure retried under the same ID gets its bytes back (a real install failure, r3 review:
+        # never a hand-made forwarded=0 on a forwarded row, a state production never makes)
+        failing = tmp_path / 'f.zip'; build_zip(failing, delay=0.2, fail_preflight=True)
+        assert request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=failing, request_id='retry'))[0] == 202
+        assert json.loads(wait_until(lambda: terminal(request, 'retry'), timeout=60)[2])['problems'][0]['retryable'] is True
         runtime.sweep_uploads()
         assert not os.path.exists(runtime.job('retry')['design'])
-        assert request('POST', '/evaluate', dict(design_zip=b'r', evaluator_sha256=sha, request_id='retry'))[0] == 202
-        assert open(runtime.job('retry')['design'], 'rb').read() == b'r'
-        wait_until(lambda: terminal(request, 'retry') and runtime.job('retry')['error'] is None)
+        (runtime.root / 'permit-preflight').write_text('')
+        assert request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=failing, request_id='retry'))[0] == 202
+        assert open(runtime.job('retry')['design'], 'rb').read() == b'a'
+        wait_until(lambda: terminal(request, 'retry') and runtime.job('retry')['error'] is None, timeout=60)
         # request IDs expire CF_V2_REQUEST_RETENTION_DAYS after finishing; unfinished ones never do
         with runtime.db() as db:
             db.execute("UPDATE jobs SET finished=finished-8*86400 WHERE request_id='done1'")
@@ -390,3 +391,154 @@ def test_loader_errors_carry_outcome_and_timing_and_no_token_reaches_the_evaluat
     from loader.install import environment
     monkeypatch.setenv('V2_ADMIN_TOKEN', 'tok')
     assert 'V2_ADMIN_TOKEN' not in environment(tmp_path, 'a' * 64, tmp_path / 'salt')
+
+
+# ------------------------------------------------------------------ r3 review fixes
+def _queued(tmp_path, monkeypatch, deadline, forwarded=0, design='unused', clock=None):
+    """A Runtime with no dispatcher and one queued row; the loader's clock is `clock` (a one-element list)."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(runtime_module, 'time', SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic))
+    runtime = Runtime(tmp_path / 'root', tmp_path / 'salt', allow_unsigned=True)
+    with runtime.db() as db:
+        db.execute("INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,forwarded,sent,deadline) "
+                   "VALUES('q',?,1,'T2','miner','hash',?,'queued',900,?,?,?)", ('a' * 64, design, forwarded, forwarded, deadline))
+    sent = []
+    monkeypatch.setattr(runtime.service, 'ensure', lambda sha: None)
+    monkeypatch.setattr(runtime.service, 'request', lambda *a, **k: (404, {}, b'{}'))
+    monkeypatch.setattr(runtime.service, 'submit', lambda job: sent.append(dict(job)) or (202, {}, b'{"state":"queued"}'))
+    return runtime, sent
+
+
+def _timed_out_unsent(runtime):
+    job = runtime.job('q')
+    doc = json.loads(job['response'])
+    assert (job['phase'], job['error'], job['forwarded'], job['sent']) == ('done', 'EVALUATION_TIMEOUT', 0, 0)
+    assert doc['outcome']['started'] is False and doc['problems'][0]['where']['stage'] == 'queued'
+
+
+def test_slow_service_start_past_the_deadline_never_forwards(tmp_path, monkeypatch):
+    # Codex r3 MF1: expiry ran before tick(); a slow service start crossed the deadline and the request was sent.
+    clock = [1000.0]
+    runtime, sent = _queued(tmp_path, monkeypatch, 1001.0, clock=clock)
+    monkeypatch.setattr(runtime.service, 'ensure', lambda sha: clock.__setitem__(0, 1002.0))
+    try:
+        runtime.tick(runtime.job('q'))
+        assert sent == []
+        _timed_out_unsent(runtime)
+    finally:
+        runtime.close()
+
+
+def test_deadline_tightened_after_the_snapshot_is_the_one_enforced_and_forwarded(tmp_path, monkeypatch):
+    clock = [1000.0]
+    runtime, sent = _queued(tmp_path, monkeypatch, 999.0, clock=clock)        # tightened to the past
+    try:
+        snapshot = dict(runtime.job('q'), deadline=1001.0)                       # the pass's stale view
+        runtime.tick(snapshot)
+        assert sent == []
+        _timed_out_unsent(runtime)
+    finally:
+        runtime.close()
+    clock = [1000.0]
+    runtime, sent = _queued(tmp_path / 'b', monkeypatch, 1500.0, clock=clock)   # tightened, still ahead
+    try:
+        runtime.tick(dict(runtime.job('q'), deadline=2000.0))
+        assert [j['deadline'] for j in sent] == [1500.0]                         # the current one is forwarded
+        assert (runtime.job('q')['forwarded'], runtime.job('q')['sent']) == (1, 1)
+    finally:
+        runtime.close()
+
+
+def test_body_preparation_crossing_the_deadline_never_sends(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from loader import supervisor
+    from loader.supervisor import Service
+    clock = [1000.0]
+    design = tmp_path / 'design.zip'; design.write_bytes(b'd' * 4096)
+    runtime, _ = _queued(tmp_path, monkeypatch, 1001.0, design=str(design), clock=clock)
+    posts = []
+    monkeypatch.setattr(runtime.service, 'submit', Service.submit.__get__(runtime.service))
+    monkeypatch.setattr(runtime.service, 'request', lambda method, path, *a: posts.append(path) or (404, {}, b'{}'))
+    monkeypatch.setattr(supervisor, 'time', SimpleNamespace(time=lambda: clock[0]))
+    # the body is written slowly (ops_api is consulted while it is written): the clock crosses the deadline
+    monkeypatch.setattr(supervisor, 'ops_api', lambda *a: clock.__setitem__(0, 1002.0) or False)
+    try:
+        runtime.tick(runtime.job('q'))
+        assert posts == ['/status/q']                                            # never POST /evaluate
+        _timed_out_unsent(runtime)
+    finally:
+        runtime.close()
+
+
+def test_lost_forwarded_request_past_its_deadline_is_not_resubmitted(tmp_path, monkeypatch):
+    clock = [1000.0]
+    runtime, sent = _queued(tmp_path, monkeypatch, 999.0, forwarded=1, clock=clock)
+    fenced = []
+    monkeypatch.setattr(runtime_module, 'fence', lambda root, salt, job, body: fenced.append(json.loads(body)) or
+                        {'fenced': True, 'drained': True})
+    try:
+        runtime.tick(runtime.job('q'))                                           # the evaluator answers 404
+        assert sent == [] and fenced[0]['problems'][0]['code'] == 'EVALUATION_TIMEOUT'
+        assert (runtime.job('q')['phase'], runtime.job('q')['error']) == ('done', 'EVALUATION_TIMEOUT')
+    finally:
+        runtime.close()
+
+
+def test_request_id_reused_after_retention_never_gets_the_earlier_result(tmp_path):
+    # Opus r3 MF1 (the reviewer's probe): the loader row expired, the evaluator kept its own record.
+    import hashlib
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=0.2)
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        assert request('POST', '/evaluate', dict(design_zip=b'AAAA', evaluator_zip=archive, request_id='reuse'))[0] == 202
+        first = wait_until(lambda: terminal(request, 'reuse'))[2]
+        assert first == RAW and runtime.job('reuse')['sent'] == 1
+        with runtime.db() as db:
+            db.execute("UPDATE jobs SET finished=finished-8*86400 WHERE request_id='reuse'")
+        runtime.housekeeping()
+        assert runtime.job('reuse') is None
+        assert request('POST', '/evaluate', dict(design_zip=b'BBBBBBBB', evaluator_sha256=sha, request_id='reuse'))[0] == 202
+        doc = json.loads(wait_until(lambda: terminal(request, 'reuse'))[2])
+        p = doc['problems'][0]
+        assert (doc['status'], doc['score'], doc['receipt'], p['code'], p['retryable']) == (
+            'ERROR', None, None, 'REQUEST_ID_CONFLICT', False)
+        state = json.loads((runtime.root / 'state' / sha / 'reuse.json').read_text())
+        assert state['design_sha256'] == hashlib.sha256(b'AAAA').hexdigest()     # the new bytes never ran under it
+        assert runtime.job('reuse')['sent'] == 0
+        # re-sending it is answered with the same conflict, not retried into the earlier result
+        again = request('POST', '/evaluate', dict(design_zip=b'BBBBBBBB', evaluator_sha256=sha, request_id='reuse'))
+        assert again[0] == 200 and problem(again[2])['code'] == 'REQUEST_ID_CONFLICT'
+        # a new ID runs the new bytes
+        request('POST', '/evaluate', dict(design_zip=b'BBBBBBBB', evaluator_sha256=sha, request_id='reuse-2'))
+        assert wait_until(lambda: terminal(request, 'reuse-2'))[2] == RAW
+
+
+def test_rows_from_an_older_loader_count_as_sent(tmp_path):
+    root = tmp_path / 'root'; (root / 'loader').mkdir(parents=True)
+    db = sqlite3.connect(root / 'loader/http.sqlite')
+    with db:
+        db.executescript(runtime_module.SCHEMA)
+        db.execute("INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,forwarded) "
+                   "VALUES('old',?,1,'T2','m','h','unused','queued',0,0)", ('a' * 64,))
+    db.close()
+    runtime = Runtime(root, tmp_path / 'salt', allow_unsigned=True)
+    try:
+        assert runtime.job('old')['sent'] == 1                                   # adopted exactly as before
+    finally:
+        runtime.close()
+
+
+def test_cancel_and_system_errors_report_one_stage_and_tier():
+    # Codex r3 MF2: the problem location said evaluator_install while outcome/metadata said queued or compile.
+    from loader.cancel import cancelled_error
+    now = time.time()
+    queued = dict(request_id='r', submitter='s', mode='T2', created=now - 5)
+    run = dict(queued, started=now - 2, stage='compile', tier='T1')
+    for job, stage, tier in ((queued, 'queued', 'T0'), (run, 'compile', 'T1')):
+        doc = json.loads(cancelled_error(job, 'x', 'operator'))
+        p = doc['problems'][0]
+        assert doc['outcome']['stage'] == p['where']['stage'] == p['metadata']['stage'] == stage
+        assert doc['tier_reached'] == p['where']['tier'] == tier
+        doc = json.loads(system_error(job, 'EVALUATOR_SERVICE_EXITED'))
+        p = doc['problems'][0]
+        assert doc['outcome']['stage'] == p['where']['stage'] == (stage if job is run else 'evaluator_install')
+        assert doc['tier_reached'] == p['where']['tier'] == tier

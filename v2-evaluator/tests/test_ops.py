@@ -109,26 +109,28 @@ def test_waiting_request_times_out_while_the_running_one_continues(tmp_path):
 
 
 def test_old_evaluator_is_stopped_at_the_deadline_through_the_fence(tmp_path):
-    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=8)            # no cf-eval-ops marker; runs 4-8 s
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=12)           # no cf-eval-ops marker; runs 6-12 s
     with running(tmp_path, allow_unsigned=True) as (runtime, request):
-        request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=archive, request_id='long',
-                                          time_limit_s='5'))
-        wait_until(lambda: runtime.job('long')['phase'] == 'running', timeout=20)
+        fields = dict(design_zip=b'a', evaluator_zip=archive, request_id='long')
+        request('POST', '/evaluate', dict(fields, time_limit_s='600'))
+        wait_until(lambda: runtime.job('long')['phase'] == 'running', timeout=60)
         assert set(stub_state(runtime, sha, 'long')) == {'time', 'design_sha256', 'chain_commit'}   # no new fields
+        # the validator re-sends with a tighter deadline (header form): the loader stops the run at it
+        request('POST', '/evaluate', fields, headers={'X-CF-Deadline': f'{time.time() + 1:.3f}', 'X-CF-Request-Id': 'long'})
         doc = json.loads(wait_until(lambda: terminal(request, 'long'), timeout=20)[2])
         assert doc['problems'][0]['code'] == 'EVALUATION_TIMEOUT' and doc['outcome']['started'] is True
         fenced = runtime.root / 'state' / sha / 'long.cancelled'               # the stub's --fence-request record
         assert json.loads(fenced.read_text())['problems'][0]['code'] == 'EVALUATION_TIMEOUT'
         request('POST', '/evaluate', dict(design_zip=b'b', evaluator_sha256=sha, request_id='next'))
-        wait_until(lambda: runtime.job('next')['forwarded'])                   # the machine is free again
+        wait_until(lambda: runtime.job('next')['forwarded'], timeout=30)       # the machine is free again
 
 
 def test_ops_evaluator_gets_the_deadline_progress_and_a_grace(tmp_path):
-    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=8, ops=True)
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=12, ops=True)
     with running(tmp_path, allow_unsigned=True) as (runtime, request):
-        dl = time.time() + 5
+        dl = time.time() + 600
         request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=archive, request_id='ops', deadline_unix=f'{dl:.3f}'))
-        wait_until(lambda: runtime.job('ops')['phase'] == 'running', timeout=20)
+        wait_until(lambda: runtime.job('ops')['phase'] == 'running', timeout=60)
         state = stub_state(runtime, sha, 'ops')
         assert float(state['deadline_unix']) == pytest.approx(dl, abs=0.001)
         assert float(state['accepted_unix']) == pytest.approx(runtime.job('ops')['created'], abs=0.001)
@@ -140,6 +142,9 @@ def test_ops_evaluator_gets_the_deadline_progress_and_a_grace(tmp_path):
                                         finished_unix=doc['progress'][0]['finished_unix'], attempt=1)]
         assert 'score' not in body.decode() and 'bad stage' not in body.decode()
         # Past its deadline, the evaluator (which enforces it itself) gets 90 s before the loader steps in.
+        dl = time.time() + 0.5
+        request('POST', '/evaluate', dict(design_zip=b'a', evaluator_sha256=sha, request_id='ops', deadline_unix=f'{dl:.3f}'))
+        assert runtime.job('ops')['deadline'] == pytest.approx(dl, abs=0.001)
         wait_until(lambda: time.time() > dl + 1.5, timeout=10)
         assert runtime.job('ops')['phase'] == 'running' and not (runtime.root / 'state' / sha / 'ops.cancelled').exists()
         assert wait_until(lambda: terminal(request, 'ops'), timeout=20)[2] == RAW

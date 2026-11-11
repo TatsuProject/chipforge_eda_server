@@ -49,6 +49,7 @@ OPS_COLUMNS = (('deadline', 'REAL'), ('started', 'REAL'), ('finished', 'REAL'), 
 # Evaluator progress states that can never become a response by waiting longer.
 TERMINAL_STATES = frozenset({'done', 'failed', 'cancelled', 'error'})
 TIMEOUT = 'EVALUATION_TIMEOUT'
+CANCELLED = 'EVALUATION_CANCELLED'
 CONFLICT = 'REQUEST_ID_CONFLICT'
 TIMEOUT_CHECKED = 'the request\'s deadline (deadline_unix / time_limit_s / X-CF-Deadline)'
 API = 'cf-eval-ops/1'
@@ -180,6 +181,44 @@ def deadline_received(job):
     it to enforce the deadline itself."""
     deadline, sent = job.get('deadline'), job.get('sent_deadline')
     return deadline is not None and sent is not None and sent <= deadline + 0.001
+
+
+def result_late(job, body):
+    """True when an evaluator's terminal result must not stand because the request's deadline passed first:
+    the job has a deadline its evaluator was not known to hold (an older evaluator, or one tightened since it
+    was forwarded and not yet re-sent), the result is scored (status other than ERROR), and the result's own
+    finish time (timing.finished_at, else created_at) is at or after that deadline - or unknown and the
+    deadline has passed. An evaluator that holds the deadline enforces it itself: its result is not judged
+    here. A result that stands is passed on byte for byte."""
+    deadline = job.get('deadline')
+    if deadline is None or deadline_received(job):
+        return False
+    try:
+        doc = json.loads(body) if isinstance(body, (bytes, str)) else body
+    except ValueError:
+        return False
+    if not isinstance(doc, dict) or doc.get('status') == 'ERROR':
+        return False
+    finished = finish_time(doc)
+    return (time.time() if finished is None else finished) >= float(deadline)
+
+
+def admit_completed(job, completed, body, content_type, error):
+    """Deadline admission for a terminal result a fence finds already recorded (completed_response), shared by
+    every fence: the dispatcher's (timeout, system fault, resumed after a crash) and cf-cancel's.
+    -> (body, content_type, error) the request ends with.
+    No recorded result: the fence's own intent stands. A recorded result that is late (result_late) never stands:
+    a cancellation keeps its intent, every other fence ends EVALUATION_TIMEOUT (INTERFACE.md 1-2). Otherwise the
+    recorded result stands (its error column cleared unless the result itself carries that code)."""
+    if not completed:
+        return body, content_type, error
+    if result_late(job, completed):
+        if error in (TIMEOUT, CANCELLED):
+            return body, content_type, error
+        return timeout_error(job, reached_stage(job)), 'application/json', TIMEOUT
+    if not any(p.get('code') == error for p in completed.get('problems', [])):
+        error = None
+    return json.dumps(completed).encode(), 'application/json', error
 
 
 def sent_form(deadline):
@@ -427,7 +466,7 @@ class Runtime:
                     old['deadline'] = deadline
                     self.poll_after.pop(rid, None)
                     self.wakeup.set()
-                if old['phase'] == 'fencing' or old['forwarded'] or old['error'] in (None, 'EVALUATION_CANCELLED', TIMEOUT, CONFLICT):
+                if old['phase'] == 'fencing' or old['forwarded'] or old['error'] in (None, CANCELLED, TIMEOUT, CONFLICT):
                     return old
                 # Explicit retries of a system failure may repair the install and resubmit. The finished job's
                 # upload was deleted: the same bytes (design_hash matched) take its place.
@@ -475,7 +514,7 @@ class Runtime:
             if not error:
                 if current['phase'] == 'fencing':
                     return          # a terminal fence already in progress decides (the dispatcher resumes it)
-                if not self.result_late(current, body):
+                if not result_late(current, body):
                     self._finish(job, body, content_type, error)
                     return
                 # An evaluator result that finished at or after a deadline this evaluator never received is not
@@ -490,32 +529,11 @@ class Runtime:
                     db.execute("UPDATE jobs SET phase='fencing',response=?,response_type=?,error=? WHERE request_id=?",
                                (body, content_type, error, job['request_id']))
                 drained = fence(self.root, self.installer.salt, current, body)
-                completed = (drained or {}).get('completed_response')
-                # A result the fence finds already recorded stands, unless it is one that must not (result_late).
-                if completed and not (error == TIMEOUT and self.result_late(current, completed)):
-                    body = json.dumps(completed).encode()
-                    if not any(p.get('code') == error for p in completed.get('problems', [])):
-                        error = None
+                # A result the fence finds already recorded stands only if deadline admission allows it, whatever
+                # the fence was for (an evaluator may exit after the expiry check with a late result recorded).
+                body, content_type, error = admit_completed(current, (drained or {}).get('completed_response'),
+                                                            body, content_type, error)
             self._finish(job, body, content_type, error)
-
-    def result_late(self, job, body):
-        """True when an evaluator's terminal result must not stand because the request's deadline passed first:
-        the job has a deadline its evaluator was not known to hold (an older evaluator, or one tightened since it
-        was forwarded and not yet re-sent), the result is scored (status other than ERROR), and the result's own
-        finish time (timing.finished_at, else created_at) is at or after that deadline - or unknown and the
-        deadline has passed. An evaluator that holds the deadline enforces it itself: its result is not judged
-        here. A result that stands is passed on byte for byte."""
-        deadline = job.get('deadline')
-        if deadline is None or deadline_received(job):
-            return False
-        try:
-            doc = json.loads(body) if isinstance(body, (bytes, str)) else body
-        except ValueError:
-            return False
-        if not isinstance(doc, dict) or doc.get('status') == 'ERROR':
-            return False
-        finished = finish_time(doc)
-        return (time.time() if finished is None else finished) >= float(deadline)
 
     def _finish(self, job, body, content_type, error):
         self.retry_after.pop(job['request_id'], None)

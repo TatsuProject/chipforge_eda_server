@@ -542,6 +542,121 @@ def test_result_finished_after_a_deadline_its_evaluator_never_got_is_a_timeout(t
         runtime.close()
 
 
+
+@pytest.mark.parametrize('code', ['EVALUATOR_SERVICE_EXITED', 'EVALUATOR_SERVICE_REJECTED', 'EVALUATION_CANCELLED', 'EVALUATION_TIMEOUT'])
+@pytest.mark.parametrize('sent, ops, finished, stands', [
+    (2000.0, True, 1150, False),     # tightened, never re-sent; recorded after the deadline: never adopted
+    (None, False, 1150, False),      # an older evaluator: same
+    (2000.0, True, 1050, True),      # recorded before the deadline: stands, byte for byte
+    (1100.0, True, 1150, True),      # the evaluator held this deadline and enforces it itself
+])
+def test_every_fence_applies_the_deadline_to_a_result_it_finds(tmp_path, monkeypatch, code, sent, ops, finished, stands):
+    # Codex verify r1 MF1: the evaluator exits after the expiry check; a fence for ANY reason found a late PASSED
+    # (score 0.87) and adopted it. Deadline admission now applies to every completed_response.
+    clock = [1200.0]
+    runtime, _ = _queued(tmp_path, monkeypatch, 1100.0, forwarded=1, clock=clock)
+    body = _result('PASSED', finished)
+    monkeypatch.setattr(runtime_module, 'ops_api', lambda *a: ops)
+    monkeypatch.setattr(runtime_module, 'fence', lambda root, salt, job, b:
+                        {'fenced': True, 'drained': True, 'completed_response': json.loads(body)})
+    with runtime.db() as db:
+        db.execute("UPDATE jobs SET phase='running',started=950,stage='compile',tier='T1',sent_deadline=?", (sent,))
+    try:
+        runtime.fail(runtime.job('q'), code)
+        job = runtime.job('q')
+        assert job['phase'] == 'done'
+        if stands:
+            assert json.loads(job['response']) == json.loads(body) and job['error'] is None
+        else:
+            doc = json.loads(job['response'])
+            assert doc['status'] == 'ERROR' and doc['score'] is None
+            # a cancellation keeps its intent; every other fence ends EVALUATION_TIMEOUT (INTERFACE.md 1-2)
+            want = 'EVALUATION_CANCELLED' if code == 'EVALUATION_CANCELLED' else 'EVALUATION_TIMEOUT'
+            assert job['error'] == want and doc['problems'][0]['code'] == want
+    finally:
+        runtime.close()
+
+
+def test_resumed_fence_applies_the_deadline_to_a_result_it_finds(tmp_path, monkeypatch):
+    clock = [1200.0]
+    runtime, _ = _queued(tmp_path, monkeypatch, 1100.0, forwarded=1, clock=clock)
+    body = _result('PASSED', 1150)
+    monkeypatch.setattr(runtime_module, 'ops_api', lambda *a: False)
+    monkeypatch.setattr(runtime_module, 'fence', lambda root, salt, job, b:
+                        {'fenced': True, 'drained': True, 'completed_response': json.loads(body)})
+    exited = system_error(dict(runtime.job('q'), started=950, stage='compile'), 'EVALUATOR_SERVICE_EXITED')
+    with runtime.db() as db:
+        db.execute("UPDATE jobs SET phase='fencing',started=950,stage='compile',response=?,response_type='application/json',"
+                   "error='EVALUATOR_SERVICE_EXITED'", (exited,))
+    try:
+        job = runtime.job('q')
+        runtime.finish(job, job['response'], job['response_type'], job['error'])
+        job = runtime.job('q')
+        assert job['phase'] == 'done' and job['error'] == 'EVALUATION_TIMEOUT'
+        assert json.loads(job['response'])['score'] is None
+    finally:
+        runtime.close()
+
+
+def _fencing_timeout(tmp_path, monkeypatch, finished):
+    """A forwarded row whose timeout fence failed (durable fencing/EVALUATION_TIMEOUT); the evaluator has recorded a
+    PASSED that finished at `finished` (deadline 1100, never received by the evaluator)."""
+    from loader import cancel as cancel_module
+    clock = [1200.0]
+    runtime, _ = _queued(tmp_path, monkeypatch, 1100.0, forwarded=1, clock=clock)
+    body = _result('PASSED', finished)
+    monkeypatch.setattr(cancel_module, 'fence', lambda root, salt, job, b:
+                        {'fenced': True, 'drained': True, 'completed_response': json.loads(body)})
+    job = dict(runtime.job('q'), started=950, stage='compile', tier='T1')
+    timed_out = timeout_error(job, 'compile')
+    with runtime.db() as db:
+        db.execute("UPDATE jobs SET phase='fencing',started=950,stage='compile',tier='T1',response=?,"
+                   "response_type='application/json',error='EVALUATION_TIMEOUT'", (timed_out,))
+    return runtime, body, timed_out
+
+
+def test_cancel_resuming_a_failed_timeout_fence_keeps_the_timeout(tmp_path, monkeypatch):
+    # Codex verify r1 MF2: cf-cancel resumed a failed timeout fence and replaced it with the late success.
+    from loader.cancel import cancel
+    runtime, body, timed_out = _fencing_timeout(tmp_path, monkeypatch, 1150)
+    try:
+        code, out = cancel(runtime.root, tmp_path / 'salt', 'q', 'gave up', 'validator')
+        job = runtime.job('q')
+        assert (job['phase'], job['error'], job['response']) == ('done', 'EVALUATION_TIMEOUT', timed_out)
+        assert code == 0 and out['cancelled'] is False and out['code'] == 'EVALUATION_TIMEOUT'
+    finally:
+        runtime.close()
+
+
+def test_cancel_resuming_a_failed_timeout_fence_keeps_an_on_time_result(tmp_path, monkeypatch):
+    from loader.cancel import cancel
+    runtime, body, _ = _fencing_timeout(tmp_path, monkeypatch, 1050)
+    try:
+        code, out = cancel(runtime.root, tmp_path / 'salt', 'q', 'gave up', 'validator')
+        job = runtime.job('q')
+        assert job['phase'] == 'done' and job['error'] is None and json.loads(job['response']) == json.loads(body)
+        assert code == 0 and out['cancelled'] is False
+    finally:
+        runtime.close()
+
+
+def test_cancel_of_a_running_row_never_adopts_a_late_result(tmp_path, monkeypatch):
+    from loader import cancel as cancel_module
+    clock = [1200.0]
+    runtime, _ = _queued(tmp_path, monkeypatch, 1100.0, forwarded=1, clock=clock)
+    body = _result('PASSED', 1150)
+    monkeypatch.setattr(cancel_module, 'fence', lambda root, salt, job, b:
+                        {'fenced': True, 'drained': True, 'completed_response': json.loads(body)})
+    with runtime.db() as db:
+        db.execute("UPDATE jobs SET phase='running',started=950,stage='compile',tier='T1'")
+    try:
+        code, out = cancel_module.cancel(runtime.root, tmp_path / 'salt', 'q', 'gave up', 'validator')
+        job = runtime.job('q')
+        assert job['phase'] == 'done' and job['error'] == 'EVALUATION_CANCELLED'
+        assert json.loads(job['response'])['score'] is None and out['cancelled'] is True
+    finally:
+        runtime.close()
+
 def test_deadline_propagation_survives_a_restart(tmp_path, monkeypatch):
     # The tightened deadline is durable on the row; until a re-forward is answered 202 it counts as not received,
     # so a restart in between re-sends it (idempotent) and the backstop never grants grace on an unsent deadline.

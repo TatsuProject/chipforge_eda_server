@@ -24,7 +24,7 @@ import time
 
 from .install import environment, interpreter
 from .lifecycle import fence, ops_api, request_lock
-from .runtime import system_error
+from .runtime import admit_completed, system_error
 
 CODE = 'EVALUATION_CANCELLED'
 BY = ('operator', 'validator', 'kill_switch', 'watchdog')
@@ -108,15 +108,24 @@ def _cancel(root, salt, rid, reason, by='operator'):
         drained = fence(root, salt, job, body)
         if job['phase'] == 'done':
             return 0, {'request_id': rid, 'cancelled': False, 'drained': True, 'reason': 'already finished; its result stands'}
+        # The same deadline admission as the dispatcher's fence (runtime.admit_completed): a late recorded result
+        # never stands, and a fence already under way keeps its intent (a failed timeout fence still ends
+        # EVALUATION_TIMEOUT, never the late success). The evaluator's own cancellation record never replaces
+        # the loader's cancellation body (unchanged).
+        intent = (job['error'] if job['phase'] == 'fencing' else None) or CODE
         completed = (drained or {}).get('completed_response')
-        if completed and not any(p.get('code') == CODE for p in completed.get('problems', [])):
-            with loader_db(root) as db:
-                db.execute("UPDATE jobs SET phase='done',response=?,error=NULL,finished=? WHERE request_id=? AND phase='fencing'",
-                           (json.dumps(completed).encode(), time.time(), rid))
-            return 0, {'request_id': rid, 'cancelled': False, 'drained': True, 'reason': 'already finished; its result stands'}
+        if completed and any(p.get('code') == CODE for p in completed.get('problems', [])):
+            completed = None
+        body, ctype, error = admit_completed(job, completed, body, 'application/json', intent)
         with loader_db(root) as db:
-            db.execute("UPDATE jobs SET phase='done',finished=? WHERE request_id=? AND phase='fencing'", (time.time(), rid))
-        return 0, {'request_id': rid, 'cancelled': True, 'by': 'evaluator', 'drained': True, 'status': 'ERROR', 'code': CODE}
+            db.execute("UPDATE jobs SET phase='done',response=?,response_type=?,error=?,finished=? WHERE request_id=? AND phase='fencing'",
+                       (body, ctype, error, time.time(), rid))
+        if error is None:
+            return 0, {'request_id': rid, 'cancelled': False, 'drained': True, 'reason': 'already finished; its result stands'}
+        if error == CODE:
+            return 0, {'request_id': rid, 'cancelled': True, 'by': 'evaluator', 'drained': True, 'status': 'ERROR', 'code': CODE}
+        return 0, {'request_id': rid, 'cancelled': False, 'drained': True, 'status': 'ERROR', 'code': error,
+                   'reason': f'already ending with {error}; that outcome stands'}
     if job['phase'] == 'done':
         return 0, {'request_id': rid, 'cancelled': False, 'reason': 'already finished; its result stands'}
     if not (job.get('sent') or job['forwarded']):

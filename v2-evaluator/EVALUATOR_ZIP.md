@@ -314,7 +314,10 @@ receipt, projection, public report or score.
   goes through the evaluator's fence, and a request is only finished once the fence reports its work drained.
   An evaluator result is not accepted when the evaluator never acknowledged the deadline and the result's
   own finish time (`timing.finished_at`, else `created_at`) is at or after it: such a request ends
-  `EVALUATION_TIMEOUT`. A result that stands is passed on byte for byte. The deadline is checked again at
+  `EVALUATION_TIMEOUT`. The same rule applies to a result any fence finds already recorded (a timeout, a
+  system fault, a fence resumed after a restart, or `cf-cancel`); a cancellation keeps its
+  `EVALUATION_CANCELLED`, and a fence already under way keeps its code. A result that stands is passed on
+  byte for byte. The deadline is checked again at
   hand-over, under the request's lock and against its current (possibly tightened) value, and once more
   after the request body is written: a request is not sent once its deadline has passed.
 - **Restart.** At start the loader finishes, unstarted or fenced, every unfinished request past its

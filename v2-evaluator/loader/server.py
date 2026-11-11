@@ -128,6 +128,8 @@ class Handler(BaseHTTPRequestHandler):
         """v2.0.6 (cf-eval-ops/1): GET /jobs, POST /cancel/<id>, POST /cancel-all. With V2_ADMIN_TOKEN set they need
         `Authorization: Bearer <token>` (the gateway's rule: the list names the designs being evaluated, a cancel
         stops one); open when it is unset, like the gateway. Cancelling is cf-cancel's own code, in-process."""
+        # Admin routes never read a body (a chunked one would be left on a keep-alive connection): one per connection.
+        self.close_connection = True
         token = os.environ.get('V2_ADMIN_TOKEN', '')
         if token and not hmac.compare_digest(self.headers.get('Authorization', '').encode(), ('Bearer ' + token).encode()):
             raise HTTPError(401, 'ADMIN_TOKEN_REQUIRED', 'This needs the admin token.')

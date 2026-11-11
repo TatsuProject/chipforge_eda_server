@@ -364,9 +364,13 @@ class Runtime:
                 os.replace(design, old['design'])
                 with open(old['design'], 'rb') as f:
                     os.fsync(f.fileno())
+                # A retry keeps the tighten-only rule: the earlier of the stored and the re-sent deadline, so a
+                # deadline first sent with the retry is enforced (and forwarded to a cf-eval-ops service).
+                kept = [d for d in (old['deadline'], deadline) if d is not None]
                 with self.db() as db:
                     db.execute("UPDATE jobs SET attempt=?,phase='installing_evaluator',response=NULL,response_type=NULL,error=NULL,forwarded=0,"
-                               "started=NULL,finished=NULL,stage=NULL,tier=NULL,progress=NULL,queue_position=NULL WHERE request_id=?", (attempt, rid))
+                               "started=NULL,finished=NULL,stage=NULL,tier=NULL,progress=NULL,queue_position=NULL,deadline=? WHERE request_id=?",
+                               (attempt, min(kept) if kept else None, rid))
             else:
                 attempt = self.request_install(sha)
                 dest = self.root / 'loader/uploads' / (uuid.uuid4().hex + '.zip')

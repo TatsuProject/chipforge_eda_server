@@ -285,6 +285,56 @@ def test_uploads_deleted_retention_and_retry_restores_bytes(tmp_path, monkeypatc
         assert runtime.job('old-open') is not None
 
 
+def _install_failure_then_retry(runtime, request, archive, rid, **retry):
+    """First POST, no deadline: the evaluator install fails (a done, retryable system ERROR, never forwarded).
+    The operator repairs the cause and the validator retries the same ID with the given fields."""
+    assert request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=archive, request_id=rid))[0] == 202
+    first = json.loads(wait_until(lambda: terminal(request, rid), timeout=60)[2])
+    assert first['problems'][0]['fault'] == 'system' and first['problems'][0]['retryable'] is True
+    assert runtime.job(rid)['deadline'] is None and not runtime.job(rid)['forwarded']
+    (runtime.root / 'permit-preflight').write_text('')
+    return request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=archive, request_id=rid, **retry))
+
+
+def test_retry_after_system_failure_takes_the_deadline_it_is_resent_with(tmp_path):
+    # Review r1 MUST-FIX: a retry (same ID, after a done system ERROR) used to keep the first POST's deadline,
+    # so a first POST without one left the retried run with none at all.
+    archive = tmp_path / 'e.zip'; build_zip(archive, delay=60, fail_preflight=True)   # old zip: the loader enforces
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        dl = time.time() + 8
+        assert _install_failure_then_retry(runtime, request, archive, 'rt', deadline_unix=f'{dl:.3f}')[0] == 202
+        assert runtime.job('rt')['deadline'] == pytest.approx(dl, abs=0.001)
+        doc = json.loads(wait_until(lambda: terminal(request, 'rt'), timeout=40)[2])
+        assert doc['problems'][0]['code'] == 'EVALUATION_TIMEOUT'
+        assert doc['timing']['deadline_unix'] == pytest.approx(dl, abs=0.001)
+
+
+def test_retry_keeps_the_earlier_deadline_and_forwards_it_to_an_ops_evaluator(tmp_path):
+    archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=60, ops=True, fail_preflight=True)
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        dl = time.time() + 600
+        assert _install_failure_then_retry(runtime, request, archive, 'rto', deadline_unix=f'{dl:.3f}')[0] == 202
+        wait_until(lambda: runtime.job('rto')['phase'] == 'running', timeout=60)
+        assert float(stub_state(runtime, sha, 'rto')['deadline_unix']) == pytest.approx(dl, abs=0.001)
+        # tighten-only still holds for re-sends of the live retried job
+        request('POST', '/evaluate', dict(design_zip=b'a', evaluator_sha256=sha, request_id='rto', deadline_unix=f'{dl + 300:.3f}'))
+        assert runtime.job('rto')['deadline'] == pytest.approx(dl, abs=0.001)
+
+
+def test_retry_deadline_is_the_earlier_of_stored_and_resent(tmp_path):
+    archive = tmp_path / 'e.zip'; build_zip(archive, delay=60, fail_preflight=True)
+    with running(tmp_path, allow_unsigned=True) as (runtime, request):
+        dl = time.time() + 600
+        assert request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=archive, request_id='rte',
+                                                 deadline_unix=f'{dl:.3f}'))[0] == 202
+        assert json.loads(wait_until(lambda: terminal(request, 'rte'), timeout=60)[2])['problems'][0]['fault'] == 'system'
+        (runtime.root / 'permit-preflight').write_text('')
+        request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=archive, request_id='rte', deadline_unix=f'{dl + 300:.3f}'))
+        assert runtime.job('rte')['deadline'] == pytest.approx(dl, abs=0.001)            # looser: not taken
+        request('POST', '/evaluate', dict(design_zip=b'a', evaluator_zip=archive, request_id='rte'))
+        assert runtime.job('rte')['deadline'] == pytest.approx(dl, abs=0.001)            # absent: kept
+
+
 def test_old_evaluator_logs_are_capped(tmp_path, monkeypatch):
     monkeypatch.setenv('CF_V2_LOG_MAX_MIB', '1')
     archive = tmp_path / 'e.zip'; sha = build_zip(archive, delay=0.2)

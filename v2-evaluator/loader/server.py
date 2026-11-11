@@ -1,5 +1,6 @@
 """HTTP front end for automatic installation and durable evaluator jobs."""
 import argparse
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -13,7 +14,7 @@ from urllib.parse import urlsplit
 
 from .install import interpreter
 from .multipart import HTTPError, parse
-from .runtime import ID, Runtime
+from .runtime import ID, Runtime, iso
 from .security import SHA, PrivateModeError
 
 
@@ -78,7 +79,8 @@ class Handler(BaseHTTPRequestHandler):
                     with tempfile.TemporaryDirectory(dir=runtime.root / 'tmp') as d:
                         fields = parse(self.rfile, length, self.headers.get('Content-Type', ''), d, path == '/evaluate')
                         if path == '/evaluate':
-                            job = runtime.accept(fields)
+                            job = runtime.accept(fields, {k: self.headers.get(k) for k in ('X-CF-Deadline', 'X-CF-Request-Id')
+                                                          if self.headers.get(k) is not None})
                             # New jobs always receive immediate 202, including installing_evaluator.
                             self.job_response(job)
                         else:
@@ -88,6 +90,8 @@ class Handler(BaseHTTPRequestHandler):
                                       {'Location': '/v2/evaluator/' + sha, 'Retry-After': '5'})
                 finally:
                     self.server.upload_slots.release()
+            elif path in ('/jobs', '/cancel-all') or path.startswith('/cancel/'):
+                self.admin(post, path)
             elif not post and path == '/health':
                 health = runtime.health()
                 self.send(200 if health['ready'] else 503, health)
@@ -120,6 +124,42 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.send(503, {'error': {'code': 'LOADER_UNAVAILABLE', 'message': 'Retry the same request ID.'}})
 
+    def admin(self, post, path):
+        """v2.0.6 (cf-eval-ops/1): GET /jobs, POST /cancel/<id>, POST /cancel-all. With V2_ADMIN_TOKEN set they need
+        `Authorization: Bearer <token>` (the gateway's rule: the list names the designs being evaluated, a cancel
+        stops one); open when it is unset, like the gateway. Cancelling is cf-cancel's own code, in-process."""
+        token = os.environ.get('V2_ADMIN_TOKEN', '')
+        if token and not hmac.compare_digest(self.headers.get('Authorization', '').encode(), ('Bearer ' + token).encode()):
+            raise HTTPError(401, 'ADMIN_TOKEN_REQUIRED', 'This needs the admin token.')
+        runtime = self.server.runtime
+        if path == '/jobs':
+            if post:
+                raise HTTPError(405, 'METHOD_NOT_ALLOWED', 'Use GET /jobs.')
+            return self.send(200, dict(jobs=runtime.queue_view(), queue=runtime.queue_counts()))
+        if not post:
+            raise HTTPError(405, 'METHOD_NOT_ALLOWED', 'Use POST to cancel.')
+        from .cancel import cancel, cancel_all, clean_reason
+        if self.headers.get('Content-Length', '0') not in ('', '0'):
+            raise HTTPError(400, 'BAD_REQUEST', 'Cancel takes no body; the reason goes in X-CF-Reason.')
+        if path == '/cancel-all':
+            reason = clean_reason(self.headers.get('X-CF-Reason'), 'kill switch: every evaluation stopped')
+            code, out = cancel_all(runtime.root, runtime.installer.salt, reason, 'kill_switch')
+            runtime.wakeup.set()
+            return self.send(200 if code == 0 else 502, out)
+        rid = path.removeprefix('/cancel/')
+        if not ID.fullmatch(rid):
+            raise HTTPError(404, 'NOT_FOUND', 'Unknown request ID.')
+        reason = clean_reason(self.headers.get('X-CF-Reason'), 'the validator gave up on it')
+        try:
+            code, out = cancel(runtime.root, runtime.installer.salt, rid, reason, 'validator')
+        except SystemExit:
+            # cf-cancel's failure exit (evaluator cancel failed or the request kept changing state): retry it.
+            raise HTTPError(502, 'CANCEL_FAILED', 'Cancelling did not complete; send it again.') from None
+        runtime.wakeup.set()
+        if code == 3:
+            raise HTTPError(404, 'NOT_FOUND', 'Unknown request ID.')
+        return self.send(200, out)
+
     def install_body(self, sha):
         runtime = self.server.runtime
         row = runtime.install_status(sha)
@@ -136,8 +176,19 @@ class Handler(BaseHTTPRequestHandler):
             headers['Content-Type'] = job['response_type']
             return self.send(200, job['response'], headers)
         headers['Retry-After'] = '5'
+        # v2.0.6: where it is (stage and tier, never per-model scores) and its stage timeline.
+        view = next((v for v in runtime.queue_view(0) if v['request_id'] == job['request_id']), {})
+        stage = view.get('stage') or ('installing' if job['phase'] == 'installing_evaluator' else job['phase'])
+        headers['X-CF-Stage'] = stage
+        try:
+            progress = json.loads(job.get('progress') or '[]')
+        except ValueError:
+            progress = []
         self.send(202, dict(request_id=job['request_id'], evaluator_sha256=job['sha'], phase=job['phase'],
-                            status_url='/v2/status/' + job['request_id'], mode=job['mode']), headers)
+                            status_url='/v2/status/' + job['request_id'], mode=job['mode'], stage=stage,
+                            tier=job.get('tier'), queue_position=view.get('queue_position'),
+                            accepted_at=iso(job.get('created')), started_at=iso(job.get('started')),
+                            deadline_unix=job.get('deadline'), progress=progress), headers)
 
 
 def parse_cores(value, available):

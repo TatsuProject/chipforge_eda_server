@@ -528,7 +528,7 @@ def test_install_mismatch_before_submission_stays_terminal():
     def ensure(sha):
         raise InstallError('EVALUATOR_NOT_READY')
 
-    runtime = SimpleNamespace(service=SimpleNamespace(ensure=ensure), retry_after={}, start_failures={},
+    runtime = SimpleNamespace(service=SimpleNamespace(ensure=ensure), retry_after={}, poll_after={}, start_failures={},
                               fail=lambda *args: failed.append(args))
     job = {'sha': 'a' * 64, 'request_id': 'mismatch'}
     Runtime.tick(runtime, job)

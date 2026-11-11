@@ -41,6 +41,7 @@ def environment(root, sha, salt):
                CF_PLATFORM_SIM_CACHE=str(root / 'cache/platform-sim'),
                CF_DOCKER_RATE_FILE=str(root / 'locks/docker-rate.lock'), CF_DOCKER_REQUIRED_SERVICES='',
                CF_SCOPE_BACKEND='cfscope', PYTHONDONTWRITEBYTECODE='1')
+    env.pop('V2_ADMIN_TOKEN', None)      # the loader's HTTP admin token never reaches the evaluator or its boxes
     # The DRAM model library is linked into, and loaded by, simulators built in sibling RTL boxes:
     # it must be a same-path bind source, so the provisioned copy under tools/ is the one used.
     if (root / 'tools/platform').is_dir():

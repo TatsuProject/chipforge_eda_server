@@ -291,6 +291,43 @@ including HTTP dates, or 30 seconds when absent); they do not own the active slo
 design during backoff. Other ready modes can proceed, and the refused job is forwarded on a
 later retry once its mode is ready.
 
+### Operations (image 2.0.6, `cf-eval-ops/1`)
+
+All additive: a request without the new fields behaves as before, and nothing here enters a
+receipt, projection, public report or score.
+
+- **Deadline.** `POST /v2/evaluate` takes optional `deadline_unix` (absolute UNIX seconds) and
+  `time_limit_s` (seconds from the loader's acceptance), ASCII decimals of at most 32 characters, and the
+  header `X-CF-Deadline` (honoured when `X-CF-Request-Id` is absent or equals `request_id`; an unusable
+  header is ignored, a malformed field is 400 `INVALID_DEADLINE`). The earliest wins, never later than
+  acceptance + `CF_V2_MAX_JOB_SECONDS` (27600). Not part of request identity: a re-sent request may only
+  tighten it. A request not yet handed to its evaluator when its deadline passes, including one already
+  past at intake, ends ERROR `EVALUATION_TIMEOUT` at stage `queued` (or `installing`) and never starts. An
+  evaluator carrying `CF_EVAL_OPS_API = "cf-eval-ops/1"` in its `service.py` is sent `deadline_unix` and
+  `accepted_unix` and enforces the deadline itself; the loader stops it 90 s later if it has not. An older
+  evaluator is sent neither field and is stopped by the loader at the deadline through its fence.
+- **Restart.** At start the loader finishes, unstarted or fenced, every unfinished request past its
+  deadline, and one without a deadline older than `CF_V2_MAX_JOB_SECONDS`.
+- **Progress.** A 202 carries `stage` (also header `X-CF-Stage`), `tier`, `queue_position`, `accepted_at`,
+  `started_at`, `deadline_unix` and `progress` (stage names and times only, at most 200; never values or
+  scores). The loader polls its evaluator no faster than the evaluator's `Retry-After` (1-5 s).
+- **Admin routes** (`Authorization: Bearer $V2_ADMIN_TOKEN` when the token is set): `GET /jobs` (each
+  unfinished request in dispatch order plus those finished in the last hour: `request_id`, `phase`
+  queued/running/done, `queue_position`, `stage`, `sent_at`, `started_at`, `deadline`, `finished_at` and
+  their `_unix` forms), `POST /cancel/<request_id>` (200 cancelled or already finished, 404 unknown, 502 retry)
+  and `POST /cancel-all` (`{cancelled, already_finished, failed}`). Reason from `X-CF-Reason`. Same code as
+  `cf-cancel [--reason R] [--by WHO] -- <id>` and `cf-cancel --all`; the reason and who cancelled
+  (`validator`, `kill_switch`, `operator`, `watchdog`) are kept in the problem's metadata.
+- **Responses made by the loader** (install faults, cancels, timeouts) carry `outcome` {fault
+  system/timeout, code, stage, reason, started} and `timing` {accepted_at, started_at, finished_at,
+  queued_s, ran_s, deadline_unix}.
+- **Health** adds `api`, `features`, `disk` {path, free_gib, total_gib, used_gib} and `queue` {installing,
+  queued, running, oldest_queued_s}.
+- **Housekeeping** (every 60 s): uploaded designs are deleted once their request is finished;
+  finished requests are forgotten `CF_V2_REQUEST_RETENTION_DAYS` (7; 0 keeps them) after finishing, never
+  unfinished ones; an older evaluator's `service.log` / `workers.log` are copy-truncated at
+  `CF_V2_LOG_MAX_MIB` (64), one `.1` kept. `V2_ADMIN_TOKEN` is removed from the evaluator's environment.
+
 ## Minimal fixture compatibility
 
 The provisional `cf-evaluator/1` manifest remains supported: flat `service` and

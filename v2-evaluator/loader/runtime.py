@@ -7,16 +7,20 @@ import http.client
 import json
 import os
 from pathlib import Path
+import math
 import re
+import shutil
 import sys
 import sqlite3
 import threading
 import time
 import uuid
 
+_poll_clock = time.monotonic    # the status-poll pace: its own clock, separate from the 429/503 back-off
+
 from . import cgroups
 from .install import Installer, provision_tools
-from .lifecycle import fence, request_lock
+from .lifecycle import fence, ops_api, request_lock
 from .multipart import HTTPError
 from .security import InstallError, SHA, digest, private_locations, sync_dir
 from .supervisor import Service
@@ -34,22 +38,125 @@ CREATE TABLE IF NOT EXISTS jobs (
 '''
 
 
+# v2.0.6 ops columns (cf-eval-ops/1, INTERFACE.md). Added in place: older rows read NULL. Never part of a
+# request's identity. The gateway reads only request_id/phase/created/sha from this table.
+OPS_COLUMNS = (('deadline', 'REAL'), ('started', 'REAL'), ('finished', 'REAL'), ('stage', 'TEXT'),
+               ('tier', 'TEXT'), ('progress', 'TEXT'), ('queue_position', 'INTEGER'))
+
+
 # Evaluator progress states that can never become a response by waiting longer.
 TERMINAL_STATES = frozenset({'done', 'failed', 'cancelled', 'error'})
+TIMEOUT = 'EVALUATION_TIMEOUT'
+TIMEOUT_CHECKED = 'the request\'s deadline (deadline_unix / time_limit_s / X-CF-Deadline)'
+API = 'cf-eval-ops/1'
+FEATURES = ['deadline', 'cancel', 'jobs', 'progress', 'outcome', 'retention']
+STAGE = re.compile(r'[A-Za-z0-9_.:+/-]{1,96}\Z')
+DECIMAL = re.compile(r'[0-9]{1,20}(\.[0-9]{1,9})?\Z')
+
+
+def env_number(name, default):
+    try:
+        value = float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value >= 0 else default
+
+
+def max_job_seconds():
+    """The longest any evaluation may run from acceptance (the gateway's CF_V2_MAX_JOB_SECONDS rule)."""
+    return env_number('CF_V2_MAX_JOB_SECONDS', 27600) or 27600
+
+
+def iso(ts):
+    return None if ts is None else datetime.fromtimestamp(ts, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def decimal(text):
+    """ASCII decimal seconds (cf-eval-ops/1 form) -> float, or None."""
+    text = text.strip() if isinstance(text, str) else ''
+    return float(text) if len(text) <= 32 and DECIMAL.fullmatch(text) else None
+
+
+def deadline_of(fields, headers, rid, accepted, now=None):
+    """Effective deadline (UNIX seconds) of a request, or None (INTERFACE.md section 1).
+
+    Form fields deadline_unix / time_limit_s (from `accepted`, the loader's acceptance time) are an explicit
+    API: malformed -> 400 INVALID_DEADLINE. The X-CF-Deadline header is honoured only when X-CF-Request-Id is
+    absent or names this request, and only within (now - 1 d, now + 7 d) like the gateway; otherwise it is
+    ignored, never a refusal (validators already send it). The earliest wins, clamped to accepted +
+    CF_V2_MAX_JOB_SECONDS. A deadline already past is valid: the request is accepted and times out unstarted."""
+    now = time.time() if now is None else now
+    found = []
+    for name in ('deadline_unix', 'time_limit_s'):
+        if name not in fields:
+            continue
+        value = decimal(fields[name])
+        if value is None or value <= 0 or (name == 'deadline_unix' and value > now + 7 * 86400) or (
+                name == 'time_limit_s' and value > 7 * 86400):
+            raise HTTPError(400, 'INVALID_DEADLINE', 'deadline_unix / time_limit_s must be positive decimal '
+                            'seconds no more than 7 days ahead.')
+        found.append(value if name == 'deadline_unix' else accepted + value)
+    headers = headers or {}
+    header, owner = headers.get('X-CF-Deadline'), headers.get('X-CF-Request-Id')
+    if header is not None and (owner is None or owner.strip() == rid):
+        value = decimal(header)
+        if value is not None and now - 86400 < value < now + 7 * 86400:
+            found.append(value)
+    return min(min(found), accepted + max_job_seconds()) if found else None
 
 
 def system_error(job, code, detail='Evaluator infrastructure unavailable; retry this request.',
-                 title='Evaluator infrastructure failure'):
+                 title='Evaluator infrastructure failure', stage=None, retryable=True, metadata=None,
+                 checked='loader provisioning and service supervision', tier='T0'):
     # No scores for infrastructure/provisioning faults. Never include exception text or subprocess output.
     instance = 'urn:chipforge:eval:' + job['request_id']
+    now = time.time()
+    created, started, deadline = job.get('created'), job.get('started'), job.get('deadline')
+    reached = stage or (job.get('stage') if started else None) or ('evaluator_install' if not started else 'running')
+    timing = dict(accepted_at=iso(created), started_at=iso(started), finished_at=iso(now),
+                  queued_s=None if created is None else round(max(0.0, (started or now) - created), 3),
+                  ran_s=None if started is None else round(max(0.0, now - started), 3), deadline_unix=deadline)
+    outcome = dict(fault='timeout' if code == TIMEOUT else 'system', code=code, stage=reached,
+                   reason=detail[:160], started=bool(started))
     return json.dumps(dict(schema='cf-response/1', request_id=job['request_id'], instance=instance,
         created_at=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         submission={'submitter': job['submitter']}, mode=job['mode'], status='ERROR', score=None,
-        reward_eligible=False, pending=[], tier_reached='T0', summary=detail, stages=[], logs=[], receipt=None,
-        timing={}, problems=[dict(type='urn:chipforge:problem:npu-v2:' + code, title=title,
+        reward_eligible=False, pending=[], tier_reached=tier, summary=detail, stages=[], logs=[], receipt=None,
+        timing=timing, problems=[dict(type='urn:chipforge:problem:npu-v2:' + code, title=title,
         detail=detail, instance=instance + '#problem-1', code=code, category='infrastructure', fault='system',
-        exploit=False, retryable=True, severity='error', where={'tier': 'T0', 'stage': 'evaluator_install'},
-        checked='loader provisioning and service supervision', metadata={})])).encode()
+        exploit=False, retryable=retryable, severity='error', where={'tier': tier, 'stage': stage or 'evaluator_install'},
+        checked=checked, metadata=metadata or {})], outcome=outcome)).encode()
+
+
+def timeout_error(job, stage, why=None):
+    """The loader's own EVALUATION_TIMEOUT (same text as the evaluator's catalogue entry, INTERFACE.md 5)."""
+    started = bool(job.get('started'))
+    tier = job.get('tier') if started and job.get('tier') in ('T0', 'T1', 'T2') else 'T0'
+    metadata = dict(stage=stage, started=started, deadline_unix=job.get('deadline'))
+    if why:
+        metadata['reason'] = why
+    return system_error(job, TIMEOUT, title='Evaluation deadline reached', stage=stage, retryable=False,
+                        detail=f'The evaluation reached its deadline during the {stage} stage and was stopped. '
+                               'This is not a design fault: it is not scored.',
+                        metadata=metadata, checked=TIMEOUT_CHECKED, tier=tier)
+
+
+def clean_progress(doc):
+    """The evaluator's 202 progress, kept to stage names and times (never values, metrics or scores)."""
+    out = []
+    items = doc.get('progress') if isinstance(doc, dict) else None
+    for item in (items if isinstance(items, list) else [])[:200]:
+        if not isinstance(item, dict) or not isinstance(item.get('stage'), str) or not STAGE.fullmatch(item['stage']):
+            continue
+        entry = {'stage': item['stage']}
+        for key in ('started_unix', 'finished_unix'):
+            value = item.get(key)
+            entry[key] = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and math.isfinite(value) else None
+        attempt = item.get('attempt')
+        entry['attempt'] = attempt if isinstance(attempt, int) and not isinstance(attempt, bool) else None
+        out.append(entry)
+    return out
 
 
 class Runtime:
@@ -73,11 +180,19 @@ class Runtime:
         self.tools_error = None
         self.start_failures = {}
         self.retry_after = {}
+        self.poll_after = {}
         with self.db() as db:
             db.executescript(SCHEMA)
             # cf-chain-commit/1 (BEACON.md): forwarded verbatim to the evaluator, which validates it.
-            if 'chain_commit' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+            columns = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
+            if 'chain_commit' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN chain_commit TEXT')
+            for name, kind in OPS_COLUMNS:
+                if name not in columns:
+                    db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
+        self.startup_sweep = True          # first dispatch pass: stale requests left by a restart are not resumed
+        self.next_housekeeping = 0.0
+        self.sweep_uploads()               # before any request is accepted: uploads of finished/unknown jobs
 
     @contextmanager
     def db(self):
@@ -203,7 +318,7 @@ class Runtime:
         finally:
             self.wakeup.set()
 
-    def accept(self, fields):
+    def accept(self, fields, headers=None):
         rid, mode = fields.get('request_id'), fields.get('mode', 'T2')
         submitter = fields.get('submitter', rid)
         if not isinstance(rid, str) or not ID.fullmatch(rid) or not isinstance(submitter, str) or not ID.fullmatch(submitter):
@@ -225,6 +340,10 @@ class Runtime:
             if not isinstance(obj, dict):
                 raise HTTPError(400, 'INVALID_CHAIN_COMMIT', 'chain_commit must be a JSON object (cf-chain-commit/1).')
             chain = json.dumps(obj, sort_keys=True, separators=(',', ':'))
+        old = self.job(rid)
+        # Validated before anything is stored; not part of the request's identity (a re-sent request may only
+        # tighten its deadline, never loosen or conflict).
+        deadline = deadline_of(fields, headers, rid, old['created'] if old else time.time())
         sha = self.archive(fields)
         with self.mutex, request_lock(self.root, rid):
             old = self.job(rid)
@@ -232,12 +351,22 @@ class Runtime:
                 if (old['sha'], old['mode'], old['submitter'], old['design_hash'], old['chain_commit']) != (
                         sha, mode, submitter, design_hash, chain):
                     raise HTTPError(409, 'REQUEST_ID_CONFLICT', 'This request ID already names a different request.')
-                if old['phase'] == 'fencing' or old['forwarded'] or old['error'] in (None, 'EVALUATION_CANCELLED'):
+                if deadline is not None and old['phase'] != 'done' and (old['deadline'] is None or deadline < old['deadline']):
+                    with self.db() as db:
+                        db.execute("UPDATE jobs SET deadline=? WHERE request_id=? AND phase!='done'", (deadline, rid))
+                    old['deadline'] = deadline
+                    self.wakeup.set()
+                if old['phase'] == 'fencing' or old['forwarded'] or old['error'] in (None, 'EVALUATION_CANCELLED', TIMEOUT):
                     return old
-                # Explicit retries of a system failure may repair the install and resubmit.
+                # Explicit retries of a system failure may repair the install and resubmit. The finished job's
+                # upload was deleted: the same bytes (design_hash matched) take its place.
                 attempt = self.request_install(sha)
+                os.replace(design, old['design'])
+                with open(old['design'], 'rb') as f:
+                    os.fsync(f.fileno())
                 with self.db() as db:
-                    db.execute("UPDATE jobs SET attempt=?,phase='installing_evaluator',response=NULL,response_type=NULL,error=NULL,forwarded=0 WHERE request_id=?", (attempt, rid))
+                    db.execute("UPDATE jobs SET attempt=?,phase='installing_evaluator',response=NULL,response_type=NULL,error=NULL,forwarded=0,"
+                               "started=NULL,finished=NULL,stage=NULL,tier=NULL,progress=NULL,queue_position=NULL WHERE request_id=?", (attempt, rid))
             else:
                 attempt = self.request_install(sha)
                 dest = self.root / 'loader/uploads' / (uuid.uuid4().hex + '.zip')
@@ -247,8 +376,8 @@ class Runtime:
                     os.fsync(f.fileno())
                 sync_dir(dest.parent)
                 with self.db() as db:
-                    db.execute('INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,chain_commit) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                               (rid, sha, attempt, mode, submitter, design_hash, str(dest), 'installing_evaluator', time.time(), chain))
+                    db.execute('INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,chain_commit,deadline) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                               (rid, sha, attempt, mode, submitter, design_hash, str(dest), 'installing_evaluator', time.time(), chain, deadline))
         accepted = self.job(rid)
         # Installation can fail/complete before this handler returns. A new acceptance is
         # still 202; terminal state belongs to the subsequent status poll.
@@ -289,9 +418,10 @@ class Runtime:
 
     def _finish(self, job, body, content_type, error):
         self.retry_after.pop(job['request_id'], None)
+        self.poll_after.pop(job['request_id'], None)
         with self.db() as db:
-            db.execute("UPDATE jobs SET phase='done',response=?,response_type=?,error=? WHERE request_id=? AND phase!='done'",
-                       (body, content_type, error, job['request_id']))
+            db.execute("UPDATE jobs SET phase='done',response=?,response_type=?,error=?,finished=?,queue_position=NULL "
+                       "WHERE request_id=? AND phase!='done'", (body, content_type, error, time.time(), job['request_id']))
 
     def fail(self, job, code):
         self.finish(job, system_error(job, code), error=code)
@@ -314,6 +444,11 @@ class Runtime:
                     for job in fencing:
                         self.finish(job, job['response'], job['response_type'], job['error'])
                     continue
+                # Deadlines first: a request past its deadline is never forwarded (nor resumed after a restart).
+                if self.expire(jobs, self.startup_sweep):
+                    self.startup_sweep = False
+                    continue
+                self.startup_sweep = False
                 active = next((j for j in jobs if j['forwarded']), None)
                 hold = None     # a refused job keeps its evaluator: other evaluators' jobs wait (no service switching)
                 for job in jobs:
@@ -348,6 +483,9 @@ class Runtime:
                 if os.environ.get('CF_CGROUP_PARENT'):
                     cgroups.reap()
                 self.tools_error = None
+                if time.monotonic() >= self.next_housekeeping:
+                    self.next_housekeeping = time.monotonic() + 60
+                    self.housekeeping()
             except Exception:
                 # Do not log private paths, manifests, subprocess output or secrets.
                 self.tools_error = 'LOADER_INFRASTRUCTURE_UNAVAILABLE'
@@ -367,7 +505,8 @@ class Runtime:
             self.wakeup.clear()
 
     def tick(self, job):
-        if time.monotonic() < self.retry_after.get(job['request_id'], 0):
+        if time.monotonic() < self.retry_after.get(job['request_id'], 0) or \
+                _poll_clock() < self.poll_after.get(job['request_id'], 0):
             return
         self.retry_after.pop(job['request_id'], None)
         try:
@@ -408,8 +547,7 @@ class Runtime:
                                'resubmit under a new request ID.'), error='EVALUATOR_RESULT_MISSING')
                     return
                 phase = 'running' if state in ('running', 'leased') else 'queued'
-                with self.db() as db:
-                    db.execute("UPDATE jobs SET phase=?,forwarded=1 WHERE request_id=? AND phase NOT IN ('done','fencing')", (phase, job['request_id']))
+                self.note_progress(job, phase, json.loads(body), headers)
             elif status in (429, 503):
                 if submitting:
                     # A restarted evaluator has no accepted copy of this previously forwarded job.
@@ -449,6 +587,143 @@ class Runtime:
         except (OSError, http.client.HTTPException):
             pass  # Durable service status/idempotent submission recovers after restart.
 
+    def note_progress(self, job, phase, doc, headers):
+        """A 202 from the evaluator: phase, and (cf-eval-ops/1 evaluators) the current stage, tier, queue position,
+        start time and stage timeline, kept for /status and /jobs. Polled no faster than the evaluator's
+        Retry-After (at most 5 s): one poll per 0.25 s filled service.log with 1.25 M lines."""
+        number = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+        current = doc.get('current_stage')
+        stage = current if isinstance(current, str) and STAGE.fullmatch(current) else None
+        tier = doc.get('tier') if doc.get('tier') in ('T0', 'T1', 'T2') else (
+            doc.get('stage') if doc.get('stage') in ('T0', 'T1', 'T2') else None)
+        position = doc.get('queue_position')
+        position = position if isinstance(position, int) and not isinstance(position, bool) and position > 0 else None
+        started = number(doc.get('started_unix')) or job.get('started') or (time.time() if phase == 'running' else None)
+        progress = clean_progress(doc)
+        with self.db() as db:
+            db.execute("UPDATE jobs SET phase=?,forwarded=1,stage=?,tier=?,queue_position=?,started=?,progress=? "
+                       "WHERE request_id=? AND phase NOT IN ('done','fencing')",
+                       (phase, stage or ('running' if phase == 'running' else 'queued'), tier,
+                        None if phase == 'running' else position or 1, started,
+                        json.dumps(progress, separators=(',', ':')) if progress else None, job['request_id']))
+        value = next((v for k, v in headers.items() if k.lower() == 'retry-after'), None)
+        try:
+            delay = min(5.0, max(0.5, float(value))) if value is not None else 1.0
+        except ValueError:
+            delay = 1.0
+        self.poll_after[job['request_id']] = _poll_clock() + delay
+
+    def expire(self, jobs, startup=False):
+        """Deadline enforcement in the loader (INTERFACE.md section 2). Not yet forwarded and past its deadline:
+        terminal EVALUATION_TIMEOUT at stage queued/installing, never forwarded. Forwarded: an evaluator that
+        enforces deadlines itself (cf-eval-ops/1) is given 90 s to answer first; an older one is stopped at the
+        deadline through the fence (its boxes and stages killed). At start-up also the gateway's age rule:
+        an unfinished request without a deadline older than CF_V2_MAX_JOB_SECONDS is not resumed.
+        -> True when a job was finished (the caller re-reads the table)."""
+        now, changed = time.time(), False
+        for job in jobs:
+            if job['phase'] in ('done', 'fencing'):
+                continue
+            deadline, why = job.get('deadline'), None
+            if deadline is None:
+                if not (startup and now - job['created'] > max_job_seconds()):
+                    continue
+                why = 'stale after restart: no deadline and older than the longest evaluation'
+            elif now < deadline + (90 if job['forwarded'] and ops_api(self.root, job['sha']) else 0):
+                continue
+            if job['forwarded']:
+                stage = job.get('stage') if job.get('started') and job.get('stage') else 'queued'
+                self.finish(job, timeout_error(job, stage, why), error=TIMEOUT)
+                changed = True
+                continue
+            stage = 'installing' if job['phase'] == 'installing_evaluator' else 'queued'
+            with request_lock(self.root, job['request_id']):
+                with self.db() as db:
+                    n = db.execute("UPDATE jobs SET phase='done',response=?,response_type='application/json',error=?,"
+                                   "finished=?,queue_position=NULL WHERE request_id=? AND forwarded=0 AND phase NOT IN ('done','fencing')",
+                                   (timeout_error(job, stage, why), TIMEOUT, time.time(), job['request_id'])).rowcount
+            changed = changed or bool(n)
+            if n:
+                self.retry_after.pop(job['request_id'], None)
+                self.poll_after.pop(job['request_id'], None)
+                print(f'request {job["request_id"]} timed out unstarted ({stage})', file=sys.stderr, flush=True)
+        return changed
+
+    def sweep_uploads(self):
+        """Delete uploaded designs no unfinished request needs (finished, cancelled, timed out, or orphaned by a
+        crash between upload and acceptance). Under the acceptance mutex, so a request being accepted, or a
+        retried one getting its bytes back, is never touched."""
+        with self.mutex:
+            with self.db() as db:
+                keep = {Path(r[0]).name for r in db.execute("SELECT design FROM jobs WHERE phase!='done'")}
+            for path in (self.root / 'loader/uploads').iterdir():
+                if path.name not in keep and path.is_file() and not path.is_symlink():
+                    path.unlink(missing_ok=True)
+
+    def housekeeping(self):
+        """Every 60 s: uploads, request retention, and log caps. Best effort: never stops the dispatcher."""
+        try:
+            self.sweep_uploads()
+            days = env_number('CF_V2_REQUEST_RETENTION_DAYS', 7)
+            if days:
+                # Request IDs are kept for de-duplication, then expire; unfinished requests never do.
+                with self.mutex, self.db() as db:
+                    db.execute("DELETE FROM jobs WHERE phase='done' AND COALESCE(finished, created) < ?",
+                               (time.time() - days * 86400,))
+            self.cap_logs()
+        except Exception:
+            print('loader housekeeping pass failed; retried in 60 s', file=sys.stderr, flush=True)
+
+    def cap_logs(self):
+        """service.log and workers.log of the running evaluator: copy-truncated at CF_V2_LOG_MAX_MIB (64), one .1
+        kept (both are opened O_APPEND, so writers continue at the new end). A cf-eval-ops/1 evaluator caps its
+        own logs; this covers older ones."""
+        sha = self.service.sha
+        if not sha or ops_api(self.root, sha):
+            return
+        limit = int(env_number('CF_V2_LOG_MAX_MIB', 64) * (1 << 20)) or (64 << 20)
+        for name in ('service.log', 'workers.log'):
+            path = self.root / 'state' / sha / name
+            try:
+                if path.is_symlink() or path.stat().st_size <= limit:
+                    continue
+                shutil.copyfile(path, path.with_name(name + '.1'))
+                os.truncate(path, 0)
+            except OSError:
+                pass
+
+    def queue_view(self, recent=3600):
+        """Unfinished requests in dispatch order (plus those finished in the last `recent` s), the gateway's /jobs
+        `view` shape plus queue_position and stage. Phase: queued (installing or waiting), running, done."""
+        now = time.time()
+        with self.db() as db:
+            rows = [dict(r) for r in db.execute(
+                "SELECT request_id,phase,created,started,deadline,finished,stage,forwarded FROM jobs "
+                "WHERE phase!='done' OR COALESCE(finished, created) >= ? ORDER BY created", (now - recent,))]
+        out, position = [], 0
+        for r in rows:
+            if r['phase'] == 'done':
+                phase, where, stage = 'done', None, None
+            elif r['phase'] in ('running', 'fencing'):
+                phase, where, stage = 'running', None, r['stage'] or 'running'
+            else:
+                position += 1
+                phase, where = 'queued', position
+                stage = 'installing' if r['phase'] == 'installing_evaluator' else 'queued'
+            out.append(dict(request_id=r['request_id'], phase=phase, loader_phase=r['phase'], queue_position=where,
+                            stage=stage, sent_at=iso(r['created']), started_at=iso(r['started']),
+                            deadline=iso(r['deadline']), finished_at=iso(r['finished']), sent_unix=r['created'],
+                            started_unix=r['started'], deadline_unix=r['deadline'], finished_unix=r['finished']))
+        return out
+
+    def disk(self):
+        try:
+            usage = shutil.disk_usage(self.root)
+        except OSError:
+            return None
+        return dict(path=str(self.root), free_gib=round(usage.free / (1 << 30), 2),
+                    total_gib=round(usage.total / (1 << 30), 2), used_gib=round(usage.used / (1 << 30), 2))
+
     def health(self):
         with self.db() as db:
             ready = db.execute("SELECT COUNT(*) FROM installs WHERE phase='ready'").fetchone()[0]
@@ -466,4 +741,14 @@ class Runtime:
                     status='ok' if alive else 'degraded', active_evaluator=self.service.sha,
                     modes=list(self.installer.modes), allow_unsigned=self.allow_unsigned,
                     sandbox_override=self.installer.allow_runc, preflight_min_disk_gib=self.installer.min_disk_gib,
-                    scope_backend='cfscope', install_failures=install_failures)
+                    scope_backend='cfscope', install_failures=install_failures,
+                    api=API, features=FEATURES, disk=self.disk(), queue=self.queue_counts())
+
+    def queue_counts(self):
+        with self.db() as db:
+            rows = db.execute("SELECT phase, COUNT(*), MIN(created) FROM jobs WHERE phase!='done' GROUP BY phase").fetchall()
+        counts = {r[0]: (r[1], r[2]) for r in rows}
+        waiting = [counts[p][1] for p in ('installing_evaluator', 'queued') if p in counts]
+        return dict(installing=counts.get('installing_evaluator', (0,))[0], queued=counts.get('queued', (0,))[0],
+                    running=sum(counts.get(p, (0,))[0] for p in ('running', 'fencing')),
+                    oldest_queued_s=round(time.time() - min(waiting), 1) if waiting else None)

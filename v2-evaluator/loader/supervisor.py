@@ -13,6 +13,7 @@ import uuid
 
 from . import boxes, cgroups
 from .install import environment, interpreter
+from .lifecycle import ops_api
 from .security import InstallError, atomic_json
 
 LOG_ROTATE_BYTES = 64 << 20
@@ -177,10 +178,17 @@ class Service:
     def submit(self, job):
         boundary = 'cf-' + uuid.uuid4().hex
         with tempfile.NamedTemporaryFile(dir=self.installer.root / 'tmp') as f:
-            for key in ('request_id', 'mode', 'submitter', 'chain_commit'):
-                if key == 'chain_commit' and not job.get(key):
-                    continue          # only sent when the caller sent one (evaluators before BEACON refuse it)
-                f.write(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{job[key]}\r\n'.encode())
+            fields = {key: job[key] for key in ('request_id', 'mode', 'submitter')}
+            if job.get('chain_commit'):
+                fields['chain_commit'] = job['chain_commit']    # only when the caller sent one (pre-BEACON evaluators refuse it)
+            if ops_api(self.installer.root, job['sha']):
+                # cf-eval-ops/1 (v2.0.6+) evaluators enforce the deadline themselves and time their queue from the
+                # loader's acceptance; older ones refuse unknown fields, and the loader enforces it alone.
+                fields['accepted_unix'] = f"{float(job['created']):.3f}"
+                if job.get('deadline') is not None:
+                    fields['deadline_unix'] = f"{float(job['deadline']):.3f}"
+            for key, value in fields.items():
+                f.write(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
             f.write(f'--{boundary}\r\nContent-Disposition: form-data; name="design_zip"; filename="design.zip"\r\nContent-Type: application/zip\r\n\r\n'.encode())
             with open(job['design'], 'rb') as design:
                 while data := design.read(1 << 20):

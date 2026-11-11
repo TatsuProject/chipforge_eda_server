@@ -75,7 +75,30 @@ ThreadingHTTPServer((a.host,int(a.port)),H).serve_forever()
 '''
 
 
-def build_zip(path, *, assets=None, delay=0.6, preflight_delay=0, fail_preflight=False, post_install=False, extra=None, c7=True):
+def ops_stub(text):
+    """The synthetic service as a cf-eval-ops/1 (v2.0.6) evaluator: carries the marker, takes deadline_unix /
+    accepted_unix (kept in its state file), answers 202 with stage/tier/progress (names and times only), and
+    takes --by. Times out by itself at its deadline only when told to (self_timeout file in its state)."""
+    def rep(old, new):
+        assert text.count(old) == 1, old
+        return text.replace(old, new)
+    text = 'CF_EVAL_OPS_API = "cf-eval-ops/1"\n' + text
+    text = rep("ap.add_argument('--fence-request')", "ap.add_argument('--fence-request'); ap.add_argument('--by')")
+    text = rep("p.with_suffix('.cancelled').write_text(a.reason or '')",
+               "p.with_suffix('.cancelled').write_text(json.dumps(dict(reason=a.reason, by=a.by)))")
+    text = rep("assert set(fields) - {'chain_commit'} ==", "assert set(fields) - {'chain_commit', 'deadline_unix', 'accepted_unix'} ==")
+    text = rep("chain_commit=chain)))",
+               "chain_commit=chain, deadline_unix=fields.get('deadline_unix', b'').decode() or None, "
+               "accepted_unix=fields.get('accepted_unix', b'').decode() or None)))")
+    text = rep("return self.send(202,json.dumps(dict(state=phase)).encode())",
+               "return self.send(202,json.dumps(dict(state=phase, stage='T1', tier='T1', current_stage='compile' if phase == 'running' else 'queued', "
+               "queue_position=None if phase == 'running' else 1, started_unix=t + DELAY/2 if phase == 'running' else None, "
+               "progress=[dict(stage='admit', attempt=1, started_unix=t, finished_unix=t + 0.01, score=99.5), "
+               "dict(stage='bad stage!', attempt=1, started_unix=t, finished_unix=None)] if phase == 'running' else [])).encode())")
+    return text
+
+
+def build_zip(path, *, assets=None, delay=0.6, preflight_delay=0, fail_preflight=False, post_install=False, extra=None, c7=True, ops=False):
     manifest = dict(schema='cf-evaluator/1')
     preflight = f'''import os, pathlib, time
 root = pathlib.Path(os.environ['CF_V2_ROOT'])
@@ -94,7 +117,8 @@ assert {not fail_preflight!r} or (root/'permit-preflight').exists()
             dict(id=f'synthetic-{i}', url=a['url'], sha256=a['sha256'], bytes=a.get('size'),
                  dest=a['target'], unpack=a.get('unpack', 'none'), licence='synthetic fixture')
             for i, a in enumerate(assets)]}
-    files = {'v2/deploy/service.py': STUB.format(raw=RAW, delay=delay),
+    service = STUB.format(raw=RAW, delay=delay)
+    files = {'v2/deploy/service.py': ops_stub(service) if ops else service,
              'v2/deploy/preflight.py': preflight,
              policy_path: json.dumps({'T2': {}, 'DEV': {}, 'T1': {}}),
              'assets.json': json.dumps(asset_doc)}

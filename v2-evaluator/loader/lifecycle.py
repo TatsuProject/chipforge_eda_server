@@ -8,6 +8,25 @@ import subprocess
 from .install import environment, interpreter
 from .security import InstallError
 
+OPS_MARKER = b'CF_EVAL_OPS_API = "cf-eval-ops/1"'
+_ops_cache = {}
+
+
+def ops_api(root, sha):
+    """True when evaluator `sha`'s service.py speaks cf-eval-ops/1 (v2.0.6+: deadline_unix/accepted_unix fields,
+    202 progress, --cancel --by, --cancel-all). Older evaluators refuse unknown fields and flags, so the loader
+    sends them only to an evaluator carrying the marker (INTERFACE.md section 0). An install's tree never
+    changes under its sha, so a found answer is cached."""
+    key = (str(root), sha)
+    if key not in _ops_cache:
+        service = Path(root) / 'evaluators' / sha / 'v2/deploy/service.py'
+        try:
+            found = OPS_MARKER in service.read_bytes()
+        except OSError:
+            return False                 # not installed (yet): ask again next time
+        _ops_cache[key] = found
+    return _ops_cache[key]
+
 
 @contextmanager
 def request_lock(root, rid):

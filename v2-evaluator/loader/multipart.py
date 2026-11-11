@@ -75,7 +75,8 @@ def parse(stream, length, content_type, directory, evaluate=True):
         raise HTTPError(400, 'INVALID_MULTIPART', 'Invalid initial boundary.')
     allowed = {'evaluator_zip', 'evaluator_sha256', 'evaluator_sig', 'signature'}
     if evaluate:
-        allowed |= {'design_zip', 'request_id', 'mode', 'submitter', 'chain_commit'}
+        # v2.0.6 (cf-eval-ops/1): optional deadline, absolute UNIX seconds or seconds from acceptance.
+        allowed |= {'design_zip', 'request_id', 'mode', 'submitter', 'chain_commit', 'deadline_unix', 'time_limit_s'}
     while True:
         headers = Message()
         for _ in range(16):
@@ -97,7 +98,7 @@ def parse(stream, length, content_type, directory, evaluate=True):
         import os
         with os.fdopen(fd, 'wb') as out:
             reader.part(boundary, out, (256 << 20) if name.endswith('_zip') else (16 << 10) if name in ('evaluator_sig', 'signature')
-                        else 2048 if name == 'chain_commit' else 128)
+                        else 2048 if name == 'chain_commit' else 32 if name in ('deadline_unix', 'time_limit_s') else 128)
         p = Path(tmp)
         if name.endswith('_zip'):
             fields[name] = p

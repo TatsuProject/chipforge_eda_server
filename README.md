@@ -119,7 +119,7 @@ the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-
 
 ## Version and disk housekeeping
 
-- **EDA server version:** `gateway/VERSION` (now `1.0.3`) is the version of this code. Bump it one point with
+- **EDA server version:** `gateway/VERSION` (now `1.0.4`) is the version of this code. Bump it one point with
   every change to `main`. It is reported as `eda_version` in `GET /health` and `GET /v2/health`; validators send
   it to the challenge server and the website shows it on the validator's card.
 - **Old evaluator versions are deleted** by the gateway (`gateway/housekeeping.py`; it mounts the data root
@@ -200,6 +200,10 @@ Outbound HTTPS is used for: Docker Hub (images), the drand relays `api.drand.sh`
 `codeload.github.com`).
 
 ## Troubleshooting
+
+`sudo bash health-report.sh` writes a read-only health report (machine, EDA server, unfinished evaluations, how
+long each stage of the last evaluations took, validator neuron) to `chipforge-health-<time>.txt`; send it to the
+ChipForge team when something looks wrong. It prints no key, token or `.env` value.
 
 | Symptom | Fix |
 |---|---|

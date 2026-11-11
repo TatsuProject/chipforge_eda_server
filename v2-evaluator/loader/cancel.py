@@ -119,6 +119,21 @@ def _cancel(root, salt, rid, reason, by='operator'):
         return 0, {'request_id': rid, 'cancelled': True, 'by': 'evaluator', 'drained': True, 'status': 'ERROR', 'code': CODE}
     if job['phase'] == 'done':
         return 0, {'request_id': rid, 'cancelled': False, 'reason': 'already finished; its result stands'}
+    if not (job.get('sent') or job['forwarded']):
+        # Never handed to any evaluator (hand-over claims sent=1 under this same request lock): finished here,
+        # without asking the evaluator. Under a reused ID (CF_V2_REQUEST_RETENTION_DAYS) the evaluator may still
+        # hold an EARLIER request's record; its "already finished" is that request's, and its own retention
+        # sweep could later drop it and let this row be dispatched after a reported cancellation.
+        with loader_db(root) as db:
+            n = db.execute("UPDATE jobs SET phase='done',response=?,response_type='application/json',error=?,finished=?,"
+                           "queue_position=NULL WHERE request_id=? AND phase NOT IN ('done','fencing') AND forwarded=0 AND sent=0",
+                           (cancelled_error(job, reason, by), CODE, time.time(), rid)).rowcount
+        if n:
+            return 0, {'request_id': rid, 'cancelled': True, 'by': 'loader', 'status': 'ERROR', 'code': CODE}
+        with loader_db(root) as db:
+            job = dict(db.execute('SELECT * FROM jobs WHERE request_id=?', (rid,)).fetchone())
+        if job['phase'] == 'done':
+            return 0, {'request_id': rid, 'cancelled': False, 'reason': 'already finished; its result stands'}
     for _ in range(2):
         code, out = evaluator_cancel(root, salt, job, reason, by)
         if code == 0:

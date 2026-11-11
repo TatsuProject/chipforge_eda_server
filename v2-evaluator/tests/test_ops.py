@@ -512,6 +512,83 @@ def test_request_id_reused_after_retention_never_gets_the_earlier_result(tmp_pat
         assert wait_until(lambda: terminal(request, 'reuse-2'))[2] == RAW
 
 
+def _reused_and_queued(tmp_path, monkeypatch, rids):
+    """Never-sent rows under IDs whose earlier request the evaluator still holds (finished): its GET answers 200
+    and its --cancel answers exit 0 'already finished'. -> runtime, sent, asked, held (clear it = retention)."""
+    from loader import cancel as cancel_module
+    runtime, sent = _queued(tmp_path, monkeypatch, None, clock=[1000.0])
+    with runtime.db() as db:
+        for i, rid in enumerate(rids[1:]):
+            db.execute("INSERT INTO jobs(request_id,sha,attempt,mode,submitter,design_hash,design,phase,created,forwarded,sent) "
+                       "VALUES(?,?,1,'T2','miner','hash','unused','queued',?,0,0)", (rid, 'a' * 64, 901 + i))
+    held = set(rids)
+    monkeypatch.setattr(runtime.service, 'request', lambda method, path, *a, **k:
+                        (200, {}, RAW) if path.rsplit('/', 1)[-1] in held else (404, {}, b'{}'))
+    asked = []
+    monkeypatch.setattr(cancel_module, 'evaluator_cancel', lambda root, salt, job, reason, by='operator': asked.append(
+        job['request_id']) or (0, {'cancelled': False, 'reason': 'already finished; its result stands'}))
+    return runtime, sent, asked, held
+
+
+def _cancelled_by_loader(runtime, rid, by):
+    job = runtime.job(rid)
+    p = problem(job['response'])
+    assert (job['phase'], job['error'], job['sent'], job['forwarded']) == ('done', 'EVALUATION_CANCELLED', 0, 0)
+    assert p['code'] == 'EVALUATION_CANCELLED' and p['metadata'] == {'by': by, 'stage': 'queued'}
+    return job['response']
+
+
+def test_cancel_of_a_never_sent_row_is_final_whatever_the_evaluator_holds_under_its_id(tmp_path, monkeypatch):
+    # Codex r4 MF: the evaluator's 'already finished' for an EARLIER request under a reused ID was taken as the
+    # outcome; the new row stayed queued and, once the evaluator's retention dropped that record, was dispatched.
+    from loader.cancel import cancel
+    runtime, sent, asked, held = _reused_and_queued(tmp_path, monkeypatch, ['q'])
+    try:
+        stale = runtime.job('q')                                            # a dispatcher pass's snapshot
+        code, out = cancel(runtime.root, tmp_path / 'salt', 'q', 'gave up', 'validator')
+        assert code == 0 and (out['cancelled'], out['by'], out['code']) == (True, 'loader', 'EVALUATION_CANCELLED')
+        assert asked == []                                                  # the earlier record decides nothing
+        body = _cancelled_by_loader(runtime, 'q', 'validator')
+        held.clear()                                                        # backend retention: GET -> 404 now
+        runtime.tick(stale)
+        runtime.tick(runtime.job('q'))
+        assert sent == [] and runtime.job('q')['response'] == body          # never dispatched, outcome unchanged
+        code, out = cancel(runtime.root, tmp_path / 'salt', 'q', 'again', 'validator')
+        assert code == 0 and out['cancelled'] is False and out['reason'].startswith('already finished')
+    finally:
+        runtime.close()
+
+
+def test_cancel_all_finishes_never_sent_rows_under_reused_ids(tmp_path, monkeypatch):
+    from loader.cancel import cancel_all
+    runtime, sent, asked, held = _reused_and_queued(tmp_path, monkeypatch, ['q', 'q2'])
+    try:
+        stale = [runtime.job('q'), runtime.job('q2')]
+        code, out = cancel_all(runtime.root, tmp_path / 'salt', 'kill switch')
+        assert code == 0 and out == {'cancelled': ['q', 'q2'], 'already_finished': [], 'failed': []}
+        assert asked == []
+        bodies = [_cancelled_by_loader(runtime, rid, 'kill_switch') for rid in ('q', 'q2')]
+        held.clear()                                                        # backend retention
+        for job in stale:
+            runtime.tick(job)
+        assert sent == [] and [runtime.job(r)['response'] for r in ('q', 'q2')] == bodies
+    finally:
+        runtime.close()
+
+
+def test_cancel_of_a_sent_row_still_asks_its_evaluator(tmp_path, monkeypatch):
+    # The loader-side finish is only for rows never handed over: a sent row's evaluator decides (unchanged).
+    from loader.cancel import cancel
+    runtime, sent, asked, held = _reused_and_queued(tmp_path, monkeypatch, ['q'])
+    try:
+        with runtime.db() as db:
+            db.execute("UPDATE jobs SET sent=1 WHERE request_id='q'")
+        code, out = cancel(runtime.root, tmp_path / 'salt', 'q', 'x', 'operator')
+        assert code == 0 and asked == ['q'] and out['by'] == 'evaluator'
+    finally:
+        runtime.close()
+
+
 def test_rows_from_an_older_loader_count_as_sent(tmp_path):
     root = tmp_path / 'root'; (root / 'loader').mkdir(parents=True)
     db = sqlite3.connect(root / 'loader/http.sqlite')

@@ -78,7 +78,7 @@ services:
   v2-evaluator:
     platform: linux/amd64
     build: { context: ./v2-evaluator, dockerfile: Dockerfile.ship }
-    image: chipforge_eda_server-v2-evaluator:2.0.5-ship
+    image: chipforge_eda_server-v2-evaluator:2.0.6-rc2
     pull_policy: never
     depends_on:
       cf-compiler: { condition: service_completed_successfully }

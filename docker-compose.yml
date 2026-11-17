@@ -40,6 +40,7 @@ services:
       - CF_V2_WATCHDOG=${CF_V2_WATCHDOG:-1}
       - CF_V2_WATCHDOG_SECONDS=${CF_V2_WATCHDOG_SECONDS:-15}
       - CF_V2_MAX_JOB_SECONDS=${CF_V2_MAX_JOB_SECONDS:-27600}
+      - CF_V2_MAX_DEADLINE_SECONDS=${CF_V2_MAX_DEADLINE_SECONDS:-86400}
       - CF_V2_ABANDONED_GAP_SECONDS=${CF_V2_ABANDONED_GAP_SECONDS:-900}
       - CF_V2_DEADLINE_GRACE_SECONDS=${CF_V2_DEADLINE_GRACE_SECONDS:-30}
       - CF_V2_SWEEP_SECONDS=${CF_V2_SWEEP_SECONDS:-120}
@@ -111,6 +112,10 @@ services:
     environment:
       - CF_V2_ROOT=${CF_V2_ROOT:-/var/lib/chipforge-v2}
       - CF_EVALUATOR_SALT_FILE=/run/cf-secrets/evaluator-salt.bin
+      # The loader follows each request's deadline (the challenge server's evaluation window), bounded at this many
+      # seconds after acceptance. Its own default (27600) would cut a longer window short; requests without a
+      # deadline are cancelled by the gateway's watchdog (CF_V2_MAX_JOB_SECONDS) instead.
+      - CF_V2_MAX_JOB_SECONDS=${CF_V2_MAX_DEADLINE_SECONDS:-86400}
       # The sibling box images, by the tags the services above build.
       - CF_COMPILER_IMAGE=cf-compiler:v2.1-public
       - CF_RTL_IMAGE=cf-rtl:v2.0

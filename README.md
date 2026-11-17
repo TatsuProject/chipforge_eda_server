@@ -135,7 +135,8 @@ the old `chipforge_eda_server-verilator-api` and `chipforge_eda_server-openlane-
   restarted) used to keep the machine busy for hours while every later design waited behind it and timed out.
   Validators (neuron 1.0.8+) send each evaluation's deadline; the gateway keeps it on disk
   (`CF_V2_ROOT/gateway/jobs.json`) and, every 15 s and right after it starts, cancels an unfinished evaluation
-  whose deadline passed, one with no deadline older than 7 h 40 min (`CF_V2_MAX_JOB_SECONDS`), or one sent more
+  whose deadline passed (the challenge server's evaluation window decides it; only a nonsense deadline is bounded,
+  at 24 h, `CF_V2_MAX_DEADLINE_SECONDS`), one with no deadline older than 7 h 40 min (`CF_V2_MAX_JOB_SECONDS`), or one sent more
   than 15 min before a newer one (`CF_V2_ABANDONED_GAP_SECONDS`): a validator works on one design at a time. A
   validator's current evaluation matches none of these. Cancelling uses the evaluator's own `cf-cancel` (the
   gateway mounts the Docker socket for it). `GET /v2/jobs` lists unfinished evaluations, `POST

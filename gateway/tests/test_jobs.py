@@ -29,7 +29,8 @@ def root(tmp_path, monkeypatch):
                      "CREATE TABLE installs (sha TEXT, attempt INTEGER, phase TEXT, error TEXT, unsigned INTEGER);")
     db.commit(); db.close()
     monkeypatch.setenv("CF_V2_ROOT", str(r))
-    for k in ("CF_V2_WATCHDOG", "CF_V2_MAX_JOB_SECONDS", "CF_V2_ABANDONED_GAP_SECONDS", "CF_V2_DEADLINE_GRACE_SECONDS"):
+    for k in ("CF_V2_WATCHDOG", "CF_V2_MAX_JOB_SECONDS", "CF_V2_MAX_DEADLINE_SECONDS", "CF_V2_ABANDONED_GAP_SECONDS",
+              "CF_V2_DEADLINE_GRACE_SECONDS"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(jobs, "_store", None)
     monkeypatch.setattr(jobs, "_backend", jobs.RealBackend())
@@ -123,6 +124,28 @@ def test_a_deadline_overrides_the_age_cap(root, docker):
     job(root, "long", "running", now - 8 * H)
     jobs.note_deadline("long", str(now + 600))
     assert run(jobs.watch_once()) == []
+
+
+def test_the_challenge_servers_window_alone_decides(root, docker):
+    """A 9 h (or any) evaluation window needs no change on the EDA server: a deadline past the no-deadline age cap
+    (7 h 40 min) is kept as sent, and the evaluation is left running until it passes."""
+    now = time.time()
+    jobs.note_deadline("nine", str(now + 9 * H))
+    assert jobs.store().data["nine"]["deadline"] == now + 9 * H
+    job(root, "nine", "running", now)
+    assert run(jobs.watch_once(lambda: now + 8 * H)) == []                     # past 7 h 40 min: still running
+    assert docker == []
+    run(jobs.watch_once(lambda: now + 9 * H + 60))
+    assert docker and "nine" in docker[-1]                                     # cancelled once its own deadline passed
+
+
+def test_a_nonsense_deadline_is_bounded(root, monkeypatch):
+    now = time.time()
+    jobs.note_deadline("days", str(now + 5 * 86400))
+    assert jobs.store().data["days"]["deadline"] <= time.time() + 24 * H
+    monkeypatch.setenv("CF_V2_MAX_DEADLINE_SECONDS", "3600")
+    jobs.note_deadline("short", str(now + 9 * H))
+    assert jobs.store().data["short"]["deadline"] <= time.time() + H
 
 
 def test_switched_off(root, docker, monkeypatch):

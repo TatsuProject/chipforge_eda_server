@@ -7,12 +7,14 @@ the gateway (rebuilt on every `make start`; the evaluator image is pinned) watch
 
 - A validator (neuron 1.0.8+) sends its deadline with POST /v2/evaluate (headers X-CF-Request-Id and
   X-CF-Deadline, unix seconds). The gateway keeps it on disk (CF_V2_ROOT/gateway/jobs.json), so it holds across a
-  restart of the validator, the gateway or the evaluator.
+  restart of the validator, the gateway or the evaluator. The deadline comes from the challenge server's evaluation
+  window, so that window alone decides how long a design may run: a longer or shorter window needs no change here.
+  Only a nonsense deadline is bounded, at CF_V2_MAX_DEADLINE_SECONDS (86400 = 24 h) after it was sent.
 - Every CF_V2_WATCHDOG_SECONDS (15), and right after the gateway starts (so `make start` cleans up what an older
   version left behind), an unfinished evaluation is cancelled when
     1. its deadline passed (plus CF_V2_DEADLINE_GRACE_SECONDS, 30); or
     2. it has no deadline (sent by an older validator, or before this version) and is older than
-       CF_V2_MAX_JOB_SECONDS (27600 = 7 h 40 min; the challenge server gives up after 7 h 10 min); or
+       CF_V2_MAX_JOB_SECONDS (27600 = 7 h 40 min; a backstop: every current validator sends a deadline); or
     3. it has no deadline and was sent more than CF_V2_ABANDONED_GAP_SECONDS (900) before the newest unfinished
        one: an older validator works on one design at a time, so an older one is a design it gave up on. (An
        evaluation with a deadline is bounded by it alone: a batch's designs may be sent hours apart.)
@@ -115,8 +117,9 @@ def store() -> Store:
 
 def note_deadline(rid: Optional[str], deadline: Optional[str]) -> None:
     """From POST /v2/evaluate's X-CF-Request-Id / X-CF-Deadline headers (validators 1.0.8+). Called only once the
-    evaluator accepted the request under that same ID (so no request can set another one's deadline). Never more
-    than CF_V2_MAX_JOB_SECONDS ahead: no deadline lets an evaluation outlive the age cap."""
+    evaluator accepted the request under that same ID (so no request can set another one's deadline). The deadline
+    is the challenge server's (its evaluation window), bounded only at CF_V2_MAX_DEADLINE_SECONDS (24 h) ahead, so
+    a buggy deadline cannot keep the evaluator busy for days."""
     if not rid or not ID.match(rid) or not deadline:
         return
     try:
@@ -126,7 +129,7 @@ def note_deadline(rid: Optional[str], deadline: Optional[str]) -> None:
     now = time.time()
     if not (now - 86400 < dl < now + 7 * 86400):
         return
-    dl = min(dl, now + _env_float("CF_V2_MAX_JOB_SECONDS", 27600))
+    dl = min(dl, now + _env_float("CF_V2_MAX_DEADLINE_SECONDS", 86400))
     rec = store().get(rid)
     rec["deadline"] = dl
     rec["seen"] = time.time()

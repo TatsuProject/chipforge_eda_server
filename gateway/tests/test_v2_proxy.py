@@ -189,7 +189,7 @@ def test_a_deadline_is_kept_only_for_an_accepted_evaluation_under_the_same_id(cl
     assert jobs.store().data["r1"]["deadline"] == pytest.approx(future)
     client.post("/v2/evaluate", files={"design_zip": ("d.zip", b"x")}, data={"request_id": "r1"},
                 headers={"X-CF-Request-Id": "r1", "X-CF-Deadline": str(time.time() + 6 * 86400)})
-    assert jobs.store().data["r1"]["deadline"] < time.time() + 27700        # never beyond the age cap
+    assert jobs.store().data["r1"]["deadline"] < time.time() + 86500        # never beyond the 24 h bound
 
 
 def test_cancel_and_jobs_need_the_admin_token_when_set(client, monkeypatch):
